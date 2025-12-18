@@ -8,6 +8,9 @@ from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 # Low memory mode: block images, fonts, etc.
 LOW_MEMORY_MODE = os.getenv("LOW_MEMORY_MODE", "true").lower() == "true"
 
+# Slow VM mode: use JavaScript clicks instead of Playwright clicks (for e2-micro etc)
+SLOW_VM_MODE = os.getenv("SLOW_VM_MODE", "true").lower() == "true"
+
 class AIStudioAutomation:
     URL = "https://aistudio.google.com/"
     PLAYGROUND_URL = "https://aistudio.google.com/prompts/new_chat"
@@ -67,90 +70,70 @@ class AIStudioAutomation:
         except Exception as e:
             print(f"[AIStudio] ❌ Tab initialization failed (timeout/not logged in): {e}")
             return False
+    async def js_click(self, selector: str, description: str = "element") -> bool:
+        """Click an element using JavaScript - bypasses Playwright stability checks."""
+        try:
+            result = await self.page.evaluate(f'''
+                () => {{
+                    const el = document.querySelector('{selector}');
+                    if (el) {{
+                        el.click();
+                        return true;
+                    }}
+                    return false;
+                }}
+            ''')
+            if result:
+                print(f"[AIStudio] ✅ Clicked {description}")
+            return result
+        except Exception as e:
+            print(f"[AIStudio] ⚠️ JS click failed for {description}: {e}")
+            return False
 
     async def send_message(self, prompt: str, model: str = None, thinking_level: str = None, use_search: bool = False, images: List[str] = None) -> Dict:
         """
         Send a message to AI Studio.
-        Optimized for speed - minimal delays, keyboard shortcuts.
-        
-        Args:
-            prompt: Text prompt to send
-            model: Model ID (e.g. "gemini-3-flash-preview")
-            thinking_level: Thinking level ("Minimal", "Low", "Medium", "High")
-            use_search: Enable Google Search grounding
-            images: List of image file paths to paste via clipboard
+        Optimized for slow VMs - uses JavaScript clicks and longer delays.
         """
         if not self._initialized:
             return {"success": False, "error": "Automation not initialized"}
 
         try:
-            # 0. Dismiss any tour tooltips or popups
-            try:
-                # Try pressing Escape to dismiss any overlay
-                await self.page.keyboard.press("Escape")
-                await asyncio.sleep(0.2)
-                
-                # Look for common dismiss buttons
-                dismiss_selectors = [
-                    'button:has-text("Got it")',
-                    'button:has-text("Dismiss")',
-                    'button:has-text("Close")',
-                    'button[aria-label="Close"]',
-                    '.cdk-overlay-backdrop',
-                ]
-                for selector in dismiss_selectors:
-                    try:
-                        btn = self.page.locator(selector).first
-                        if await btn.count() > 0:
-                            await btn.click(timeout=1000)
-                            await asyncio.sleep(0.2)
-                    except:
-                        pass
-            except:
-                pass
+            # 0. Dismiss any popups/tooltips
+            await self.page.keyboard.press("Escape")
+            await asyncio.sleep(0.5)
             
-            # 1. New Chat (Playground link) - increased timeout for slow VMs
+            # 1. Navigate to new chat via URL (more reliable than clicking)
             print("[AIStudio] Creating new chat session...")
+            await self.page.goto(self.PLAYGROUND_URL, wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(2)  # Let page stabilize
+            
+            # 2. Wait for textarea to be ready
             try:
-                await self.page.click('.playground-link', timeout=10000)
+                await self.page.wait_for_selector('textarea[aria-label="Enter a prompt"]', timeout=15000)
             except:
-                # Force click via JavaScript if normal click fails
-                print("[AIStudio] Normal click failed, trying force click...")
-                await self.page.evaluate('''
-                    () => {
-                        const link = document.querySelector('.playground-link');
-                        if (link) link.click();
-                    }
-                ''')
-            await asyncio.sleep(0.5)  # Slightly longer for slow VMs
+                print("[AIStudio] ⚠️ Textarea not found, continuing anyway...")
             
-            # 2. Set Temporary Chat (quick check and toggle)
-            try:
-                temp_toggle = self.page.locator('button[aria-label="Temporary chat toggle"]')
-                await temp_toggle.click(timeout=3000)
-            except:
-                pass
+            # 3. Skip model/thinking config on slow VMs (use AI Studio defaults)
+            if not SLOW_VM_MODE:
+                if model:
+                    await self._select_model(model)
+                if thinking_level:
+                    await self._set_thinking_level(thinking_level)
+            else:
+                print("[AIStudio] ℹ️ SLOW_VM_MODE: Skipping model/thinking config (using defaults)")
             
-            # 3. Configure Model (only if specified)
-            if model:
-                await self._select_model(model)
-            
-            # 4. Configure Thinking Level (only if specified)
-            if thinking_level:
-                await self._set_thinking_level(thinking_level)
-            
-            # 5. Toggle Web Search
+            # 4. Toggle Web Search (if needed)
             if use_search:
                 await self._toggle_search(True)
             
-            # 6. Paste Images (if provided)
+            # 5. Paste Images (if provided)
             if images:
                 for img_path in images:
                     await self._paste_image(img_path)
             
-            # 7. Type Prompt
+            # 6. Type Prompt using JavaScript
             print(f"[AIStudio] Typing prompt ({len(prompt)} chars)...")
-            # Use JS for speed with large prompts (fill() is slow)
             await self.page.evaluate('''(text) => {
                 const textarea = document.querySelector('textarea[aria-label="Enter a prompt"]');
                 if (textarea) {
@@ -159,15 +142,20 @@ class AIStudioAutomation:
                     textarea.focus();
                 }
             }''', prompt)
+            await asyncio.sleep(1)  # Let UI update
             
-            # 8. Run - click the button since Ctrl+Enter might not work after JS paste
+            # 7. Click Run button using JavaScript
             print("[AIStudio] Generating response...")
-            await self.page.click('button[aria-label="Run"]', timeout=5000)
+            clicked = await self.js_click('button[aria-label="Run"]', "Run button")
+            if not clicked:
+                # Fallback: try keyboard shortcut
+                await self.page.keyboard.press("Control+Enter")
+            await asyncio.sleep(1)
             
-            # 9. Wait for Generation
+            # 8. Wait for Generation
             await self._wait_for_generation()
             
-            # 10. Extract Markdown
+            # 9. Extract Markdown
             markdown = await self._extract_markdown()
             
             if not markdown:
