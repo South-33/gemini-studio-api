@@ -350,7 +350,11 @@ class AIStudioAutomation:
         """Extract response as markdown via the 'Copy as markdown' button."""
         try:
             print("[AIStudio] Extracting response...")
-            # No sleep needed - generation complete means DOM is ready
+            
+            # On slow VMs, skip the clipboard method entirely (too many timeouts)
+            if SLOW_VM_MODE:
+                await asyncio.sleep(1)  # Brief wait for DOM to settle
+                return await self._extract_from_dom()
             
             # Scope to MODEL response containers only
             menus = self.page.locator('.chat-turn-container.model button[aria-label="Open options"]')
@@ -412,28 +416,46 @@ class AIStudioAutomation:
             return await self._extract_from_dom()
     
     async def _extract_from_dom(self) -> Optional[str]:
-        """Fallback: Extract plain text from DOM (only ms-text-chunk, skip thinking)."""
+        """Fallback: Extract text from DOM using pure JavaScript (fast, no timeouts)."""
         try:
             print("[AIStudio] Using DOM fallback...")
-            # Extract only from ms-text-chunk to skip thinking panel
-            text_chunks = self.page.locator('.chat-turn-container.model ms-text-chunk')
-            count = await text_chunks.count()
-            if count > 0:
-                # Get the last text chunk (latest response)
-                text = await text_chunks.nth(count - 1).inner_text()
-                if text:
-                    print(f"[AIStudio] ✅ Got {len(text)} chars via DOM (text-chunk only)")
-                    return text.strip()
+            
+            # Use JavaScript to extract text - much faster than Playwright locators
+            text = await self.page.evaluate('''
+                () => {
+                    // Try multiple selectors in order of preference
+                    const selectors = [
+                        '.chat-turn-container.model ms-text-chunk',
+                        '.chat-turn-container.model .response-content',
+                        '.chat-turn-container.model .markdown-content',
+                        '.chat-turn-container.model ms-prompt-chunk',
+                        '.chat-turn-container.model .text-content',
+                        '.chat-turn-container.model'
+                    ];
+                    
+                    for (const selector of selectors) {
+                        const elements = document.querySelectorAll(selector);
+                        if (elements.length > 0) {
+                            // Get the last element (latest response)
+                            const last = elements[elements.length - 1];
+                            const text = last.innerText || last.textContent;
+                            if (text && text.trim().length > 10) {
+                                return text.trim();
+                            }
+                        }
+                    }
+                    
+                    return null;
+                }
+            ''')
+            
+            if text:
+                print(f"[AIStudio] ✅ Got {len(text)} chars via DOM")
+                return text
             else:
-                # Fallback to ms-prompt-chunk but issue warning
-                print("[AIStudio] ⚠️ No ms-text-chunk found, trying ms-prompt-chunk")
-                chunks = self.page.locator('.chat-turn-container.model ms-prompt-chunk')
-                count = await chunks.count()
-                if count > 0:
-                    text = await chunks.nth(count - 1).inner_text()
-                    if text:
-                        print(f"[AIStudio] Got {len(text)} chars via prompt-chunk (may include thoughts)")
-                        return text.strip()
+                print("[AIStudio] ⚠️ No text found in any selector")
+                return None
+                
         except Exception as e:
             print(f"[AIStudio] DOM fallback failed: {e}")
         return None
