@@ -3,12 +3,16 @@ import asyncio
 import threading
 import base64
 import tempfile
-from typing import List, Optional, Dict, Union
+import json
+import time
+from typing import List, Optional, Dict, Union, AsyncGenerator
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
+
 
 # Load .env file
 load_dotenv()
@@ -181,17 +185,18 @@ async def list_models():
 
 @app.post("/v1/chat/completions")
 async def openai_chat(request: Request):
-    """OpenAI-compatible endpoint for Cursor and other tools."""
+    """OpenAI-compatible endpoint with SSE streaming support for Koyeb timeout handling."""
     # Check bandwidth limit FIRST
     bw_status = get_bandwidth_status()
     if bw_status["remaining_mb"] <= 0:
         raise HTTPException(
             status_code=503, 
-            detail=f"Bandwidth limit reached ({bw_status['limit_mb']}MB/month). Resets next month. Check /bandwidth for status."
+            detail=f"Bandwidth limit reached ({bw_status['limit_mb']}MB/month). Resets next month."
         )
     
     body = await request.json()
-    print(f"[DEBUG] Model: {body.get('model')} | Messages: {len(body.get('messages', []))} | BW: {bw_status['used_mb']}/{bw_status['limit_mb']}MB")
+    stream = body.get("stream", False)
+    print(f"[DEBUG] Model: {body.get('model')} | Messages: {len(body.get('messages', []))} | Stream: {stream}")
     
     if not worker_pool:
         raise HTTPException(status_code=503, detail="Worker pool not initialized")
@@ -215,50 +220,38 @@ async def openai_chat(request: Request):
         role = msg.get("role", "user")
         content = msg.get("content", "")
         
-        # Handle multipart content (Vision API format)
         if isinstance(content, list):
             for part in content:
                 part_type = part.get("type", "text")
-                
                 if part_type == "text":
-                    text = part.get("text", "")
-                    prompt += f"{role.capitalize()}: {text}\n"
-                
+                    prompt += f"{role.capitalize()}: {part.get('text', '')}\n"
                 elif part_type == "image_url":
-                    # Extract base64 image
                     image_url = part.get("image_url", {}).get("url", "")
-                    
                     if image_url.startswith("data:image/"):
-                        # Parse: data:image/png;base64,iVBORw0KG...
                         try:
                             header, base64_data = image_url.split(",", 1)
                             image_bytes = base64.b64decode(base64_data)
-                            
-                            # Determine extension from mime type
                             mime_type = header.split(";")[0].split(":")[1]
-                            ext = mime_type.split("/")[1]  # e.g. "png", "jpeg"
-                            
-                            # Save to temp file
+                            ext = mime_type.split("/")[1]
                             temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}")
                             temp_file.write(image_bytes)
                             temp_file.close()
-                            
                             image_paths.append(temp_file.name)
-                            print(f"[DEBUG] Saved image to {temp_file.name}")
                         except Exception as e:
                             print(f"[DEBUG] Failed to decode image: {e}")
         else:
-            # Simple text content
             prompt += f"{role.capitalize()}: {content}\n"
     
-    # Send to AI Studio
-    coro = worker_pool.send_message(
-        prompt, 
-        model=base_model, 
-        thinking_level=thinking_level, 
-        use_search=use_search,
-        images=image_paths
-    )
+    # If streaming requested, use SSE with heartbeat
+    if stream:
+        return StreamingResponse(
+            stream_with_heartbeat(prompt, base_model, thinking_level, use_search, image_paths, model),
+            media_type="text/event-stream"
+        )
+    
+    # Non-streaming: regular response
+    coro = worker_pool.send_message(prompt, model=base_model, thinking_level=thinking_level, 
+                                     use_search=use_search, images=image_paths)
     future = asyncio.run_coroutine_threadsafe(coro, browser_loop)
     
     try:
@@ -266,12 +259,9 @@ async def openai_chat(request: Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        # Clean up temp image files
         for img_path in image_paths:
-            try:
-                os.unlink(img_path)
-            except:
-                pass
+            try: os.unlink(img_path)
+            except: pass
 
     if not result["success"]:
         raise HTTPException(status_code=500, detail=result.get("error"))
@@ -281,18 +271,13 @@ async def openai_chat(request: Request):
     response_data = {
         "id": f"chatcmpl-studio-{id(result)}",
         "object": "chat.completion",
-        "created": int(__import__("time").time()),
+        "created": int(time.time()),
         "model": model,
-        "choices": [
-            {
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": content
-                },
-                "finish_reason": "stop"
-            }
-        ],
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": content},
+            "finish_reason": "stop"
+        }],
         "usage": {
             "prompt_tokens": len(prompt),
             "completion_tokens": len(content),
@@ -300,12 +285,105 @@ async def openai_chat(request: Request):
         }
     }
     
-    # Track bandwidth usage (estimate response size in bytes)
-    import json
     response_size = len(json.dumps(response_data).encode('utf-8'))
     add_bandwidth(response_size)
     
     return response_data
+
+
+async def stream_with_heartbeat(prompt: str, base_model: str, thinking_level: str, 
+                                 use_search: bool, image_paths: List[str], model: str) -> AsyncGenerator[str, None]:
+    """
+    Stream response with SSE heartbeat to keep Koyeb connection alive.
+    Sends empty comments every 15 seconds while waiting for generation.
+    """
+    HEARTBEAT_INTERVAL = 15  # seconds
+    
+    # Start generation in background
+    coro = worker_pool.send_message(prompt, model=base_model, thinking_level=thinking_level,
+                                     use_search=use_search, images=image_paths)
+    future = asyncio.run_coroutine_threadsafe(coro, browser_loop)
+    
+    result = None
+    start_time = time.time()
+    
+    try:
+        while result is None:
+            try:
+                # Check if result is ready (non-blocking with short timeout)
+                result = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: future.result(timeout=1)
+                )
+            except Exception as e:
+                if "timeout" in str(e).lower() or "TimeoutError" in str(type(e).__name__):
+                    # Not ready yet, send heartbeat
+                    elapsed = time.time() - start_time
+                    if int(elapsed) % HEARTBEAT_INTERVAL == 0 and int(elapsed) > 0:
+                        # Send SSE comment as heartbeat (keeps connection alive)
+                        yield ": heartbeat\n\n"
+                        print(f"[Stream] Heartbeat sent at {int(elapsed)}s")
+                    await asyncio.sleep(1)
+                else:
+                    # Real error
+                    error_chunk = {
+                        "id": f"chatcmpl-error",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": model,
+                        "choices": [{"index": 0, "delta": {"content": f"Error: {str(e)}"}, "finish_reason": "stop"}]
+                    }
+                    yield f"data: {json.dumps(error_chunk)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+    finally:
+        # Clean up temp files
+        for img_path in image_paths:
+            try: os.unlink(img_path)
+            except: pass
+    
+    # Got result, stream it
+    if result and result.get("success"):
+        content = result.get("response", "")
+        
+        # Send the content as a single chunk (AI Studio doesn't give us streaming)
+        chunk = {
+            "id": f"chatcmpl-studio-{id(result)}",
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": {"role": "assistant", "content": content},
+                "finish_reason": None
+            }]
+        }
+        yield f"data: {json.dumps(chunk)}\n\n"
+        
+        # Send finish chunk
+        finish_chunk = {
+            "id": f"chatcmpl-studio-{id(result)}",
+            "object": "chat.completion.chunk", 
+            "created": int(time.time()),
+            "model": model,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+        }
+        yield f"data: {json.dumps(finish_chunk)}\n\n"
+    else:
+        error_msg = result.get("error", "Unknown error") if result else "No result"
+        error_chunk = {
+            "id": "chatcmpl-error",
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [{"index": 0, "delta": {"content": f"Error: {error_msg}"}, "finish_reason": "stop"}]
+        }
+        yield f"data: {json.dumps(error_chunk)}\n\n"
+    
+    yield "data: [DONE]\n\n"
+    
+    # Track bandwidth
+    add_bandwidth(len(content) if result and result.get("success") else 100)
+
 
 @app.post("/v1/chat")
 async def direct_chat(request: ChatRequest):
