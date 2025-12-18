@@ -84,15 +84,50 @@ class AIStudioAutomation:
             return {"success": False, "error": "Automation not initialized"}
 
         try:
-            # 1. New Chat (Playground link)
+            # 0. Dismiss any tour tooltips or popups
+            try:
+                # Try pressing Escape to dismiss any overlay
+                await self.page.keyboard.press("Escape")
+                await asyncio.sleep(0.2)
+                
+                # Look for common dismiss buttons
+                dismiss_selectors = [
+                    'button:has-text("Got it")',
+                    'button:has-text("Dismiss")',
+                    'button:has-text("Close")',
+                    'button[aria-label="Close"]',
+                    '.cdk-overlay-backdrop',
+                ]
+                for selector in dismiss_selectors:
+                    try:
+                        btn = self.page.locator(selector).first
+                        if await btn.count() > 0:
+                            await btn.click(timeout=1000)
+                            await asyncio.sleep(0.2)
+                    except:
+                        pass
+            except:
+                pass
+            
+            # 1. New Chat (Playground link) - increased timeout for slow VMs
             print("[AIStudio] Creating new chat session...")
-            await self.page.click('.playground-link', timeout=5000)
-            await asyncio.sleep(0.3)  # Reduced from 1s
+            try:
+                await self.page.click('.playground-link', timeout=10000)
+            except:
+                # Force click via JavaScript if normal click fails
+                print("[AIStudio] Normal click failed, trying force click...")
+                await self.page.evaluate('''
+                    () => {
+                        const link = document.querySelector('.playground-link');
+                        if (link) link.click();
+                    }
+                ''')
+            await asyncio.sleep(0.5)  # Slightly longer for slow VMs
             
             # 2. Set Temporary Chat (quick check and toggle)
             try:
                 temp_toggle = self.page.locator('button[aria-label="Temporary chat toggle"]')
-                await temp_toggle.click(timeout=2000)
+                await temp_toggle.click(timeout=3000)
             except:
                 pass
             
