@@ -1,0 +1,20 @@
+# Session data (contains login cookies - NEVER commit!)
+.aistudio_data/
+
+# Python
+__pycache__/
+*.pyc
+venv/
+
+# Environment files with secrets
+.env
+
+# Bandwidth tracking
+.bandwidth_usage
+
+# Zip files
+*.zip
+
+# OS files
+.DS_Store
+Thumbs.db
