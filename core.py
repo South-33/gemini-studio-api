@@ -47,6 +47,9 @@ class AIStudioAutomation:
         self.page: Optional[Page] = None
         self._initialized = False
         self._owns_browser = False
+        # Pending generation tracking (for Koyeb 100s timeout handling)
+        self._generation_in_progress = False
+        self._pending_result: Optional[Dict] = None
 
     async def init_with_page(self, page: Page, context: BrowserContext) -> bool:
         """Initialize with externally provided page (multi-tab mode)."""
@@ -90,15 +93,61 @@ class AIStudioAutomation:
             print(f"[AIStudio] ⚠️ JS click failed for {description}: {e}")
             return False
 
+    async def _wait_and_extract_pending(self) -> Dict:
+        """
+        Handle retry after HTTP timeout - wait for any in-progress generation and extract result.
+        Called when client retries after Koyeb's 100s timeout.
+        """
+        try:
+            # Check if Run button shows "Stop" (still generating)
+            button = self.page.locator('button[aria-label="Run"]')
+            btn_text = await button.inner_text(timeout=2000)
+            
+            if "Stop" in btn_text or "progress_activity" in btn_text:
+                print("[AIStudio] Generation still in progress, waiting...")
+                await self._wait_for_generation()
+            else:
+                print("[AIStudio] Generation already complete, extracting...")
+            
+            # Extract the result
+            markdown = await self._extract_markdown()
+            self._generation_in_progress = False
+            
+            if not markdown:
+                return {"success": False, "error": "Failed to extract pending response"}
+            
+            result = {"success": True, "response": markdown}
+            self._pending_result = result
+            return result
+            
+        except Exception as e:
+            self._generation_in_progress = False
+            print(f"[AIStudio] Pending extraction error: {e}")
+            return {"success": False, "error": str(e)}
+
     async def send_message(self, prompt: str, model: str = None, thinking_level: str = None, use_search: bool = False, images: List[str] = None) -> Dict:
         """
         Send a message to AI Studio.
-        Optimized for slow VMs - uses JavaScript clicks and longer delays.
+        Handles Koyeb's 100s timeout - if generation is in progress, waits for it.
         """
         if not self._initialized:
             return {"success": False, "error": "Automation not initialized"}
 
+        # Check if there's a pending result from a previous timed-out request
+        if self._pending_result:
+            result = self._pending_result
+            self._pending_result = None
+            print("[AIStudio] ✅ Returning cached pending result")
+            return result
+        
+        # Check if generation is already in progress (client retried after timeout)
+        if self._generation_in_progress:
+            print("[AIStudio] ⏳ Generation already in progress, waiting for it...")
+            return await self._wait_and_extract_pending()
+
         try:
+            self._generation_in_progress = True
+            
             # 0. Dismiss any popups/tooltips
             await self.page.keyboard.press("Escape")
             await asyncio.sleep(0.5)
@@ -158,14 +207,21 @@ class AIStudioAutomation:
             # 9. Extract Markdown
             markdown = await self._extract_markdown()
             
+            self._generation_in_progress = False
+            
             if not markdown:
                 return {"success": False, "error": "Failed to extract markdown response"}
             
-            return {"success": True, "response": markdown}
+            result = {"success": True, "response": markdown}
+            # Cache result in case client timed out and retries
+            self._pending_result = result
+            return result
 
         except Exception as e:
+            self._generation_in_progress = False
             print(f"[AIStudio] Interaction error: {e}")
             return {"success": False, "error": str(e)}
+
 
     async def _select_model(self, model_id: str):
         """Open model selector and pick model - SKIP if already selected."""
@@ -498,6 +554,29 @@ class WorkerPool:
         self.shared_context = None
         self.playwright = None
         self._initialized = False
+        
+        # Request tracking for Koyeb timeout handling
+        self._active_requests: Dict[str, int] = {}  # prompt_hash -> worker_idx
+        self._pending_results: Dict[str, Dict] = {}  # prompt_hash -> result
+        self._result_timestamps: Dict[str, float] = {}  # prompt_hash -> timestamp
+        self._lock = asyncio.Lock()
+        self.RESULT_TTL = 120  # Results expire after 2 minutes
+
+    def _hash_prompt(self, prompt: str) -> str:
+        """Create a hash of the prompt for tracking."""
+        import hashlib
+        # Use first 1000 chars to avoid hashing huge prompts
+        return hashlib.md5(prompt[:1000].encode()).hexdigest()[:16]
+
+    async def _cleanup_stale(self):
+        """Remove expired results."""
+        now = time.time()
+        stale_keys = [k for k, ts in self._result_timestamps.items() 
+                      if now - ts > self.RESULT_TTL]
+        for key in stale_keys:
+            self._pending_results.pop(key, None)
+            self._result_timestamps.pop(key, None)
+            self._active_requests.pop(key, None)
 
     async def init(self, cookies: List[Dict]) -> bool:
         """Launch shared browser and N tabs."""
@@ -520,35 +599,24 @@ class WorkerPool:
                 args=browser_args,
                 user_agent=AIStudioAutomation.USER_AGENT,
                 viewport={"width": 1920, "height": 1080},
-                permissions=["clipboard-read", "clipboard-write"], # Critical for markdown copy
+                permissions=["clipboard-read", "clipboard-write"],
             )
             
             # Inject cookies once
             if cookies:
-                # Sanitize cookies for Playwright
                 sanitized_cookies = []
                 for cookie in cookies:
                     try:
-                        # Make a copy to avoid mutating original
                         c = dict(cookie)
-                        
-                        # Playwright expects sameSite to be 'Strict', 'Lax', or 'None'
-                        # Handle missing, null, empty, or non-standard values
                         same_site = c.get("sameSite", "")
                         if same_site is None or str(same_site).lower() not in ["strict", "lax", "none"]:
-                            c["sameSite"] = "Lax"  # Safe default
+                            c["sameSite"] = "Lax"
                         else:
-                            # Normalize case
                             c["sameSite"] = str(same_site).capitalize()
-                        
-                        # Remove fields Playwright doesn't understand
                         for field in ["id", "storeId", "session"]:
                             c.pop(field, None)
-                        
-                        # Map expirationDate to expires
                         if "expirationDate" in c:
                             c["expires"] = c.pop("expirationDate")
-                        
                         sanitized_cookies.append(c)
                     except Exception as e:
                         print(f"[WorkerPool] Skipping malformed cookie: {e}")
@@ -558,9 +626,8 @@ class WorkerPool:
                     await self.shared_context.add_cookies(sanitized_cookies)
                     print(f"[WorkerPool] ✅ Added {len(sanitized_cookies)} cookies")
                 except Exception as cookie_err:
-                    print(f"[WorkerPool] ⚠️ Cookie injection failed (continuing without): {cookie_err}")
+                    print(f"[WorkerPool] ⚠️ Cookie injection failed: {cookie_err}")
             
-            # Pre-block resources if needed
             if LOW_MEMORY_MODE:
                 await self.shared_context.route("**/*", self._block_resources)
 
@@ -571,14 +638,12 @@ class WorkerPool:
                 print(f"[WorkerPool] Opening tab {i + 1}...")
                 page = await self.shared_context.new_page()
                 
-                # Navigate to AI Studio
                 print(f"[WorkerPool] Navigating tab {i + 1} to AI Studio...")
                 try:
                     await page.goto(AIStudioAutomation.PLAYGROUND_URL, timeout=60000, wait_until="networkidle")
                     print(f"[WorkerPool] ✅ Tab {i + 1} loaded: {page.url}")
                 except Exception as nav_err:
                     print(f"[WorkerPool] ⚠️ Tab {i + 1} navigation warning: {nav_err}")
-                    # Still proceed, page may have loaded partially
                 
                 worker = AIStudioAutomation()
                 tasks.append(worker.init_with_page(page, self.shared_context))
@@ -603,11 +668,56 @@ class WorkerPool:
             await route.continue_()
 
     async def send_message(self, prompt: str, model: str = None, thinking_level: str = None, use_search: bool = False, images: List[str] = None) -> Dict:
-        """Acquire worker and send message."""
+        """
+        Send message with proper request tracking for Koyeb timeout handling.
+        If this prompt was already submitted and is pending, wait for that result.
+        """
+        prompt_hash = self._hash_prompt(prompt)
+        
+        async with self._lock:
+            await self._cleanup_stale()
+            
+            # Check if we have a cached result for this exact prompt
+            if prompt_hash in self._pending_results:
+                result = self._pending_results.pop(prompt_hash)
+                self._result_timestamps.pop(prompt_hash, None)
+                self._active_requests.pop(prompt_hash, None)
+                print(f"[WorkerPool] ✅ Returning cached result for {prompt_hash}")
+                return result
+            
+            # Check if this prompt is already being processed
+            if prompt_hash in self._active_requests:
+                worker_idx = self._active_requests[prompt_hash]
+                worker = self.workers[worker_idx]
+                print(f"[WorkerPool] ⏳ Request {prompt_hash} already in progress on worker {worker_idx}")
+                
+                # Wait for the existing generation
+                result = await worker._wait_and_extract_pending()
+                
+                # Cache it
+                self._pending_results[prompt_hash] = result
+                self._result_timestamps[prompt_hash] = time.time()
+                self._active_requests.pop(prompt_hash, None)
+                
+                return result
+        
+        # New request - get a worker
         worker_handle = await self.available_workers.get()
         idx, worker = worker_handle
+        
+        async with self._lock:
+            self._active_requests[prompt_hash] = idx
+        
         try:
-            return await worker.send_message(prompt, model, thinking_level, use_search, images)
+            result = await worker.send_message(prompt, model, thinking_level, use_search, images)
+            
+            async with self._lock:
+                # Cache the result in case HTTP timed out and client retries
+                self._pending_results[prompt_hash] = result
+                self._result_timestamps[prompt_hash] = time.time()
+                self._active_requests.pop(prompt_hash, None)
+            
+            return result
         finally:
             self.available_workers.put_nowait(worker_handle)
 
@@ -615,3 +725,4 @@ class WorkerPool:
         for w in self.workers: await w.close()
         if self.shared_context: await self.shared_context.close()
         if self.playwright: await self.playwright.stop()
+
