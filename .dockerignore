@@ -1,0 +1,34 @@
+# Docker ignore file for Gemini Studio API
+# Note: .aistudio_data/ is NOT ignored - it's needed for the session!
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+
+# Git
+.git/
+.gitignore
+
+# Environment files (use Docker ENV instead)
+.env
+.env.*
+
+# Bandwidth tracking (fresh start)
+.bandwidth_usage
+
+# Zip files
+*.zip
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Docs (not needed in container)
+*.md

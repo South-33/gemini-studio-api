@@ -420,45 +420,65 @@ class AIStudioAutomation:
         try:
             print("[AIStudio] Using DOM fallback...")
             
-            # Use JavaScript to extract text - much faster than Playwright locators
+            # Wait a moment for response to render
+            await asyncio.sleep(0.5)
+            
+            # Use JavaScript to extract text - specifically target markdown content
             text = await self.page.evaluate('''
                 () => {
-                    // Try multiple selectors in order of preference
-                    const selectors = [
-                        '.chat-turn-container.model ms-text-chunk',
-                        '.chat-turn-container.model .response-content',
-                        '.chat-turn-container.model .markdown-content',
-                        '.chat-turn-container.model ms-prompt-chunk',
-                        '.chat-turn-container.model .text-content',
-                        '.chat-turn-container.model'
-                    ];
+                    // Find model response containers
+                    const modelContainers = document.querySelectorAll('.chat-turn-container.model');
+                    if (modelContainers.length === 0) return null;
                     
-                    for (const selector of selectors) {
-                        const elements = document.querySelectorAll(selector);
-                        if (elements.length > 0) {
-                            // Get the last element (latest response)
-                            const last = elements[elements.length - 1];
-                            const text = last.innerText || last.textContent;
-                            if (text && text.trim().length > 10) {
-                                return text.trim();
-                            }
+                    // Get the last (most recent) model response
+                    const lastContainer = modelContainers[modelContainers.length - 1];
+                    
+                    // Try to find markdown-body first (contains actual formatted response)
+                    const markdownBody = lastContainer.querySelector('.markdown-body');
+                    if (markdownBody) {
+                        const text = markdownBody.innerText || markdownBody.textContent;
+                        if (text && text.trim().length > 20) {
+                            return text.trim();
                         }
+                    }
+                    
+                    // Try ms-text-chunk (the actual text content element)
+                    const textChunks = lastContainer.querySelectorAll('ms-text-chunk');
+                    if (textChunks.length > 0) {
+                        let fullText = '';
+                        textChunks.forEach(chunk => {
+                            const chunkText = chunk.innerText || chunk.textContent;
+                            if (chunkText) fullText += chunkText + ' ';
+                        });
+                        if (fullText.trim().length > 20) {
+                            return fullText.trim();
+                        }
+                    }
+                    
+                    // Last resort: get innerText but exclude buttons/menus
+                    const clone = lastContainer.cloneNode(true);
+                    // Remove menu buttons, icons, and toolbar elements
+                    clone.querySelectorAll('button, mat-icon, .toolbar, [aria-label]').forEach(el => el.remove());
+                    const cleanText = clone.innerText || clone.textContent;
+                    if (cleanText && cleanText.trim().length > 20) {
+                        return cleanText.trim();
                     }
                     
                     return null;
                 }
             ''')
             
-            if text:
+            if text and len(text) > 50:  # Ensure we got real content, not just UI garbage
                 print(f"[AIStudio] ✅ Got {len(text)} chars via DOM")
                 return text
             else:
-                print("[AIStudio] ⚠️ No text found in any selector")
+                print(f"[AIStudio] ⚠️ Response too short or empty ({len(text) if text else 0} chars)")
                 return None
                 
         except Exception as e:
             print(f"[AIStudio] DOM fallback failed: {e}")
         return None
+
 
     async def close(self):
         try:

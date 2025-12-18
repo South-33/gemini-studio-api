@@ -1,5 +1,6 @@
 # Session data (contains login cookies - NEVER commit!)
 .aistudio_data/
+cookies.json
 
 # Python
 __pycache__/

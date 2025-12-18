@@ -1,6 +1,6 @@
 # Gemini Studio API
 
-A local API that automates Google AI Studio to provide OpenAI-compatible endpoints. Use Gemini 3 Pro/Flash with thinking levels directly from Roo Code, Cursor, or any OpenAI-compatible tool.
+A lightweight API that automates Google AI Studio to provide OpenAI-compatible endpoints. Use Gemini 2.5 Pro/Flash with thinking levels directly from Roo Code, Cursor, or any OpenAI-compatible tool.
 
 ## Features
 
@@ -9,7 +9,7 @@ A local API that automates Google AI Studio to provide OpenAI-compatible endpoin
 - **Model Selection** - gemini-3-flash-preview, gemini-3-pro-preview
 - **Markdown Extraction** - Properly extracts formatted responses via clipboard
 - **Session Persistence** - Login once, stays authenticated
-- **Bandwidth Limiter** - Auto-stops at 900MB/month (configurable) to stay in GCP free tier
+- **Multi-Worker** - Handles concurrent requests with multiple browser tabs
 
 ---
 
@@ -28,116 +28,99 @@ python main.py
 
 ---
 
-## GCP Deployment (Free Tier)
+## 🚀 Koyeb Deployment (Recommended)
 
-### 1. Create VM (Free Tier Settings)
+Koyeb offers **4GB RAM / 4 CPU** instances which provide excellent performance for this API.
 
-| Setting | Value |
-|---------|-------|
-| **Region** | `us-west1 (Oregon)` ⭐ MUST be this for free |
-| **Machine type** | `e2-micro` ⭐ MUST be e2-micro |
-| **Boot disk** | Ubuntu 22.04, `Standard persistent disk`, 10GB |
-| **Firewall** | ✅ Allow HTTP, ✅ Allow HTTPS |
+### 1. Export Cookies from Browser
 
-### 2. Create Firewall Rule for Port 8001
+1. Go to **[aistudio.google.com](https://aistudio.google.com)** and make sure you're logged in
+2. Install **Cookie-Editor** extension:
+   - [Chrome](https://chrome.google.com/webstore/detail/cookie-editor/hlkenndednhfkekhgcdicdfddnkalmdm)
+   - [Firefox](https://addons.mozilla.org/en-US/firefox/addon/cookie-editor/)
+3. Click the extension icon → **Export** → **Export as JSON**
+4. Save the JSON (you'll need it for the environment variable)
 
-Go to: [VPC Network → Firewall](https://console.cloud.google.com/networking/firewalls)
-
-| Field | Value |
-|-------|-------|
-| Name | `allow-gemini-api` |
-| Direction | Ingress |
-| Targets | All instances |
-| Source IP | `0.0.0.0/0` |
-| TCP Ports | `8001` |
-
-### 3. SSH into VM and Setup
+### 2. Test Locally with Docker
 
 ```bash
-# Install dependencies
-sudo apt update && sudo apt install -y git unzip python3.11 python3.11-venv
+# Build the image
+docker build -t gemini-studio-api:test .
 
-# Install Playwright dependencies
-sudo apt install -y libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 \
-    libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 \
-    libxrandr2 libgbm1 libasound2 libpango-1.0-0 libcairo2 libatspi2.0-0
+# Run with your cookies (paste the JSON in quotes)
+docker run -p 8000:8000 \
+  -e GEMINI_COOKIES='[{"name":"__Secure-...","value":"..."}]' \
+  -e WORKER_COUNT=2 \
+  gemini-studio-api:test
 
-# Clone repo
-git clone https://github.com/South-33/gemini-studio-api.git
-cd gemini-studio-api
-
-# Create venv and install
-python3.11 -m venv venv
-source venv/bin/activate
-pip install fastapi uvicorn playwright python-dotenv pydantic
-playwright install chromium
+# Test the API
+curl http://localhost:8000/health
+curl -X POST http://localhost:8000/v1/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "Hello, say hi back"}'
 ```
 
-### 4. Upload Session Data
-
-The `.aistudio_data/` folder contains your Google login. Upload it via:
-- GCP SSH console → Gear icon → Upload file
-- Or use SCP: `scp -r .aistudio_data/ USER@VM_IP:~/gemini-studio-api/`
-
-### 5. Create Production .env
+### 3. Push to Docker Hub
 
 ```bash
-cat > .env << 'EOF'
-PORT=8001
-WORKER_COUNT=1
-HEADLESS=true
-LOW_MEMORY_MODE=true
-BANDWIDTH_LIMIT_MB=900
-EOF
+# Login to Docker Hub
+docker login
+
+# Tag and push
+docker tag gemini-studio-api:test YOUR_USERNAME/gemini-studio-api:latest
+docker push YOUR_USERNAME/gemini-studio-api:latest
 ```
 
-### 6. Run the API
+### 4. Deploy to Koyeb
+
+1. Go to [Koyeb Console](https://app.koyeb.com)
+2. **Create App** → **Docker**
+3. Image: `docker.io/YOUR_USERNAME/gemini-studio-api:latest`
+4. Instance: **Medium (4GB RAM / 4 vCPU)** or higher
+5. Port: `8000`
+6. Add environment variables:
+   ```
+   PORT=8000
+   WORKER_COUNT=4
+   HEADLESS=true
+   LOW_MEMORY_MODE=false
+   SLOW_VM_MODE=false
+   GEMINI_COOKIES=[paste your exported JSON here]
+   ```
+7. Deploy!
+
+### 5. Environment Variables
+
+| Variable | Value | Notes |
+|----------|-------|-------|
+| `PORT` | `8000` | Koyeb routes to this |
+| `WORKER_COUNT` | `4` | One per CPU core |
+| `HEADLESS` | `true` | Required for containers |
+| `GEMINI_COOKIES` | `[{...}]` | **Required** - JSON from Cookie-Editor |
+
+### 6. Updating & Redeploying
+
+**For code changes:**
 
 ```bash
-# Activate venv
-source venv/bin/activate
+# 1. Rebuild image
+docker build -t gemini-studio-api:test .
 
-# Run
-python main.py
+# 2. Tag for Docker Hub  
+docker tag gemini-studio-api:test YOUR_USERNAME/gemini-studio-api:latest
+
+# 3. Push to Docker Hub
+docker push YOUR_USERNAME/gemini-studio-api:latest
+
+# 4. In Koyeb dashboard: Redeploy your service (or it auto-pulls on restart)
 ```
 
-API available at: `http://YOUR_VM_IP:8001`
+**For cookie updates only:**
+- Just update `GEMINI_COOKIES` in Koyeb dashboard → Save → Redeploy
+- No rebuild needed!
 
-### 7. Run as Background Service (Optional)
 
-```bash
-# Copy service file
-sudo cp gemini-api.service /etc/systemd/system/
-sudo nano /etc/systemd/system/gemini-api.service  # Update YOUR_USERNAME
 
-# Enable and start
-sudo systemctl daemon-reload
-sudo systemctl enable gemini-api
-sudo systemctl start gemini-api
-
-# Check status
-sudo systemctl status gemini-api
-```
-
----
-
-## Updating Code
-
-After making changes locally:
-
-```bash
-# On your PC
-git add .
-git commit -m "Your changes"
-git push
-
-# On GCP VM
-cd ~/gemini-studio-api
-git pull
-sudo systemctl restart gemini-api  # If using systemd
-```
-
----
 
 ## Endpoints
 
@@ -147,14 +130,14 @@ sudo systemctl restart gemini-api  # If using systemd
 | `POST /v1/chat/completions` | OpenAI-compatible chat |
 | `POST /v1/chat` | Simple direct chat |
 | `GET /health` | Health check |
-| `GET /bandwidth` | Check bandwidth usage vs limit |
+| `GET /bandwidth` | Check bandwidth usage |
 
 ---
 
 ## Roo Code / Cursor Setup
 
 1. **Provider**: OpenAI Compatible
-2. **Base URL**: `http://YOUR_VM_IP:8001/v1`
+2. **Base URL**: `https://your-app.koyeb.app/v1`
 3. **API Key**: `anything` (ignored)
 4. **Model**: `gemini-3-flash-preview-minimal`
 5. **IMPORTANT**: Disable "Enable streaming" ⚠️
@@ -175,30 +158,24 @@ sudo systemctl restart gemini-api  # If using systemd
 
 ## Configuration (.env)
 
+### For Koyeb (4GB/4CPU)
+
 ```env
-PORT=8001                  # API port
-WORKER_COUNT=1             # Browser tabs (1 for e2-micro)
-HEADLESS=true              # Must be true on server
-LOW_MEMORY_MODE=true       # Blocks images/fonts to save RAM
-BANDWIDTH_LIMIT_MB=900     # Monthly limit (stops API when reached)
+PORT=8000
+WORKER_COUNT=4              # One per CPU (max concurrency)
+HEADLESS=true               # Must be true on server
+LOW_MEMORY_MODE=false       # Not needed with 4GB RAM
+SLOW_VM_MODE=false          # Not needed with 4 CPUs
 ```
 
----
+### For Local Development
 
-## Bandwidth Protection
-
-The API tracks outbound data and blocks requests at 900MB/month to stay within GCP free tier (1GB limit).
-
-Check usage: `GET /bandwidth`
-```json
-{
-  "status": "ok",
-  "month": "2025-12",
-  "used_mb": 45.32,
-  "limit_mb": 900,
-  "remaining_mb": 854.68,
-  "percent_used": 5.0
-}
+```env
+PORT=8001
+WORKER_COUNT=2
+HEADLESS=false              # See the browser
+LOW_MEMORY_MODE=false
+SLOW_VM_MODE=false
 ```
 
 ---
@@ -209,7 +186,7 @@ Google login sessions typically last **3-6 months** with regular use. If expired
 
 1. Run locally with `HEADLESS=false`
 2. Log in when browser opens
-3. Re-upload `.aistudio_data/` folder to GCP
+3. Re-upload `.aistudio_data/` folder to your deployment
 
 ---
 
@@ -217,19 +194,76 @@ Google login sessions typically last **3-6 months** with regular use. If expired
 
 | Issue | Solution |
 |-------|----------|
-| "Worker pool not initialized" | Check if Chromium installed: `playwright install chromium` |
-| "Bandwidth limit reached" | Wait until next month or increase `BANDWIDTH_LIMIT_MB` |
-| API not accessible | Check firewall rule (port 8001) and VM external IP |
+| "Worker pool not initialized" | Check if Chromium installed: `playwright install chromium --with-deps` |
+| API not accessible | Check Koyeb deployment logs and health checks |
 | Login expired | Re-run locally, login, upload `.aistudio_data/` |
+| Timeouts on generation | Check network and try `-minimal` thinking level |
+| Container OOM | Reduce `WORKER_COUNT` to 2 |
 
 ---
 
-## Cost Summary (GCP Free Tier)
+## GCP Deployment (Legacy - Free Tier)
 
-| Resource | Free Limit | Your Usage |
-|----------|------------|------------|
-| e2-micro VM | 1 in US region | ✅ |
-| Standard disk | 30 GB | 10 GB ✅ |
-| Egress | 1 GB/month | Capped at 900MB ✅ |
+<details>
+<summary>Click to expand GCP e2-micro instructions (limited resources)</summary>
 
-**Total monthly cost: $0.00** (if you stay in limits)
+The GCP free tier uses e2-micro (1GB RAM) which requires heavy optimizations:
+
+### Settings for GCP e2-micro
+
+```env
+PORT=8001
+WORKER_COUNT=1           # Only 1 tab due to memory limits
+HEADLESS=true
+LOW_MEMORY_MODE=true     # Block images/fonts
+SLOW_VM_MODE=true        # Use JS clicks, longer delays
+BANDWIDTH_LIMIT_MB=900   # Stay under 1GB free tier
+```
+
+### Setup Steps
+
+1. Create VM: `e2-micro` in `us-west1` region
+2. Allow port 8001 in firewall
+3. Install dependencies: `sudo apt install python3.11 python3.11-venv`
+4. Run `setup-gcp.sh` script
+5. Upload `.aistudio_data/` folder
+6. Run with systemd service (see `gemini-api.service`)
+
+**Note**: GCP e2-micro has severe memory limitations. Response times are ~10-30s. Consider Koyeb for better performance.
+
+</details>
+
+---
+
+## Docker Build (Local Testing)
+
+```bash
+# Build
+docker build -t gemini-studio-api .
+
+# Run (mount session data)
+docker run -p 8000:8000 -v $(pwd)/.aistudio_data:/app/.aistudio_data gemini-studio-api
+```
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    FastAPI Server                       │
+├─────────────────────────────────────────────────────────┤
+│                     WorkerPool                          │
+│  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐       │
+│  │ Worker 1│ │ Worker 2│ │ Worker 3│ │ Worker 4│       │
+│  │ (Tab 1) │ │ (Tab 2) │ │ (Tab 3) │ │ (Tab 4) │       │
+│  └────┬────┘ └────┬────┘ └────┬────┘ └────┬────┘       │
+│       └───────────┴───────────┴───────────┘             │
+│                        │                                │
+│              Shared Browser Context                     │
+│                   (Chromium)                            │
+└─────────────────────────────────────────────────────────┘
+                         │
+                         ▼
+              Google AI Studio (Web)
+```
