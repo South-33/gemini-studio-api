@@ -3,11 +3,15 @@ import asyncio
 import time
 import json
 from typing import List, Optional, Dict, Union
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 from playwright.async_api import async_playwright, BrowserContext, Page
+
+# Load .env file
+load_dotenv()
 
 
 # Configuration
