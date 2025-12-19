@@ -700,6 +700,19 @@ class GeminiWebAutomation(BaseAutomation):
             if not copy_btn:
                  return {"success": False, "error": "Timeout waiting for copy button"}
 
+            # Auto-scroll to ensure copy button is visible
+            print("[GeminiWeb] Scrolling to copy button...")
+            await self.page.evaluate('''
+                () => {
+                    const copyButtons = document.querySelectorAll('button[aria-label="Copy"]');
+                    if (copyButtons.length > 0) {
+                        const lastBtn = copyButtons[copyButtons.length - 1];
+                        lastBtn.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    }
+                }
+            ''')
+            await asyncio.sleep(0.5)  # Wait for scroll to complete
+
             # 6. Extraction via Copy Button
             print("[GeminiWeb] Extracting markdown...")
             await copy_btn.click()

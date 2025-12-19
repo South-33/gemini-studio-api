@@ -398,9 +398,16 @@
         <div class="config-group">
             <label>Model</label>
             <select id="model-select">
-                <option value="gemini-3-pro-preview">Gemini 3.0 Pro</option>
-                <option value="gemini-3-flash-preview" selected>Gemini 3.0 Flash</option>
-                <option value="gemini-2.5-flash">2.5 Flash</option>
+                <optgroup label="Gemini Web">
+                    <option value="thinking">Gemini Thinking (2.0)</option>
+                    <option value="pro">Gemini Pro</option>
+                    <option value="fast">Gemini Fast</option>
+                </optgroup>
+                <optgroup label="AI Studio">
+                    <option value="gemini-3-pro-preview">Gemini 3.0 Pro</option>
+                    <option value="gemini-3-flash-preview" selected>Gemini 3.0 Flash</option>
+                    <option value="gemini-2.5-flash">2.5 Flash</option>
+                </optgroup>
             </select>
         </div>
 
@@ -588,22 +595,35 @@
             attachedImages = [];
             renderPreviews();
 
+            // Handle message content (Vision API support)
+            let messageContent;
+            if (imagesCopy.length > 0) {
+                messageContent = [{ type: 'text', text: text || 'Analyze this image.' }];
+                imagesCopy.forEach(img => {
+                    messageContent.push({
+                        type: 'image_url',
+                        image_url: { url: img }
+                    });
+                });
+            } else {
+                messageContent = text;
+            }
+
+            const messages = [{ role: 'user', content: messageContent }];
+
+            const payload = {
+                model: model,
+                messages: messages,
+                stream: useStream,
+                thinking_level: thinkingLevel,
+                use_search: useSearch
+            };
+
             // Prepare Assistant response placeholder
             const botMsgDiv = addMessage('assistant', 'Thinking...');
             const contentDiv = botMsgDiv.querySelector('.content') || botMsgDiv;
 
             try {
-                // For main_bridge.py: content must be a plain string
-                // For main.py: content can be array (Vision API format)
-                // We'll send plain string for compatibility with main_bridge.py
-                const messages = [{ role: 'user', content: text }];
-
-                const payload = {
-                    model: model,
-                    messages: messages,
-                    stream: useStream
-                };
-
                 console.log('[Debug] Sending payload:', JSON.stringify(payload, null, 2));
 
                 if (useStream) {
@@ -696,9 +716,12 @@
             div.className = `message ${role}`;
 
             if (role === 'assistant') {
-                const model = document.getElementById('model-select').options[document.getElementById('model-select').selectedIndex].text;
+                const modelOption = document.getElementById('model-select').options[document.getElementById('model-select').selectedIndex];
+                const modelText = modelOption.text;
+                const isGeminiWeb = modelOption.parentElement.label === "Gemini Web";
                 const tl = document.getElementById('thinking-select').value;
-                div.innerHTML = `<div class="thinking">✦ ${model} (${tl})</div><div class="content">${text}</div>`;
+                const badges = isGeminiWeb ? `✦ ${modelText}` : `✦ ${modelText} (${tl})`;
+                div.innerHTML = `<div class="thinking">${badges}</div><div class="content">${text}</div>`;
             } else {
                 div.innerText = text;
                 images.forEach(img => {

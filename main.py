@@ -157,7 +157,9 @@ async def openai_chat(request: Request):
             for part in content:
                 part_type = part.get("type", "text")
                 if part_type == "text":
-                    prompt += f"{role.capitalize()}: {part.get('text', '')}\n"
+                    text_content = part.get('text', '')
+                    if text_content:
+                        prompt += text_content + "\n"
                 elif part_type == "image_url":
                     image_url = part.get("image_url", {}).get("url", "")
                     if image_url.startswith("data:image/"):
@@ -173,7 +175,8 @@ async def openai_chat(request: Request):
                         except Exception as e:
                             print(f"[API] Failed to decode image: {e}")
         else:
-            prompt += f"{role.capitalize()}: {content}\n"
+            if content:
+                prompt += content + "\n"
     
     # Send to worker
     coro = worker_pool.send_message(
