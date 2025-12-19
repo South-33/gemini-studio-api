@@ -176,6 +176,8 @@ async def chat_completions(request: OpenAIChatRequest):
         for _ in range(300):  # 5 min max
             btn_text = await page.evaluate('''() => {
                 const btn = document.querySelector('button[aria-label="Run"]');
+                // Scroll to bottom on every poll
+                window.scrollTo(0, document.body.scrollHeight);
                 return btn ? btn.innerText : '';
             }''')
             if "Stop" not in btn_text:
