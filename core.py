@@ -50,6 +50,13 @@ class AIStudioAutomation:
         # Pending generation tracking (for Koyeb 100s timeout handling)
         self._generation_in_progress = False
         self._pending_result: Optional[Dict] = None
+        self._last_activity = time.time()
+        self._is_sleeping = False
+        self._wake_lock = asyncio.Lock()
+        self._idle_lock = asyncio.Lock()
+        self._keepalive_task = None
+        self._idle_task = None
+        self._stop_tasks = False
 
     async def init_with_page(self, page: Page, context: BrowserContext) -> bool:
         """Initialize with externally provided page (multi-tab mode)."""
@@ -561,6 +568,17 @@ class WorkerPool:
         self._result_timestamps: Dict[str, float] = {}  # prompt_hash -> timestamp
         self._lock = asyncio.Lock()
         self.RESULT_TTL = 120  # Results expire after 2 minutes
+        
+        # Idle/Keepalive settings
+        self.IDLE_TIMEOUT_MINUTES = int(os.getenv("IDLE_TIMEOUT_MINUTES", "30"))
+        self.KEEPALIVE_HOURS = float(os.getenv("KEEPALIVE_HOURS", "4"))
+        self._last_activity = time.time()
+        self._is_sleeping = False
+        self._wake_lock = asyncio.Lock()
+        self._idle_lock = asyncio.Lock()
+        self._tasks_started = False
+        self._keepalive_task = None
+        self._idle_task = None
 
     def _hash_prompt(self, prompt: str) -> str:
         """Create a hash of the prompt for tracking."""
@@ -578,6 +596,103 @@ class WorkerPool:
             self._result_timestamps.pop(key, None)
             self._active_requests.pop(key, None)
 
+    async def _keepalive_loop(self):
+        """Background task to visit Google occasionally to keep session alive."""
+        print(f"[WorkerPool] 🕒 Keepalive background task started (every {self.KEEPALIVE_HOURS}h)")
+        while not self._tasks_started: await asyncio.sleep(1) # Wait for init
+        
+        while True:
+            try:
+                await asyncio.sleep(self.KEEPALIVE_HOURS * 3600)
+                
+                # Check if we are busy
+                async with self._lock:
+                    if len(self._active_requests) > 0:
+                        print("[WorkerPool] ⏳ Skipping keepalive, system busy")
+                        continue
+                
+                print("[WorkerPool] 💤 Visiting Google for session keepalive...")
+                async with self._wake_lock: # Ensure we don't clash with wake/sleep
+                    temp_page = await self.shared_context.new_page()
+                    try:
+                        await temp_page.goto("https://www.google.com", timeout=30000)
+                        await asyncio.sleep(2)
+                        print("[WorkerPool] ✅ Keepalive visit complete")
+                    finally:
+                        await temp_page.close()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                print(f"[WorkerPool] ⚠️ Keepalive error: {e}")
+                await asyncio.sleep(60)
+
+    async def _idle_monitor(self):
+        """Background task to close tabs when idle."""
+        print(f"[WorkerPool] 💤 Idle monitor started (timeout: {self.IDLE_TIMEOUT_MINUTES}m)")
+        while True:
+            try:
+                await asyncio.sleep(60) # Check every minute
+                
+                now = time.time()
+                idle_time = (now - self._last_activity) / 60
+                
+                if idle_time >= self.IDLE_TIMEOUT_MINUTES and not self._is_sleeping:
+                    async with self._idle_lock:
+                        # Double check under lock
+                        async with self._lock:
+                            if len(self._active_requests) > 0:
+                                continue
+                        
+                        print(f"[WorkerPool] 🛌 System idle for {idle_time:.1f}m. Entering sleep mode...")
+                        
+                        # Close all worker pages but keep context (and cookies) alive
+                        for w in self.workers:
+                            try:
+                                if w.page:
+                                    await w.page.close()
+                                    w.page = None
+                                    w._initialized = False
+                            except: pass
+                        
+                        self._is_sleeping = True
+                        print("[WorkerPool] ✅ Sleep mode active (tabs closed)")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                print(f"[WorkerPool] ⚠️ Idle monitor error: {e}")
+
+    async def _wake_up(self):
+        """Re-open worker pages if sleeping."""
+        async with self._wake_lock:
+            if not self._is_sleeping:
+                return
+            
+            print("[WorkerPool] ☕ Waking up from sleep mode...")
+            tasks = []
+            for i, worker in enumerate(self.workers):
+                print(f"[WorkerPool] Re-opening tab {i + 1}...")
+                page = await self.shared_context.new_page()
+                try:
+                    await page.goto(AIStudioAutomation.PLAYGROUND_URL, timeout=60000, wait_until="networkidle")
+                except Exception as e:
+                    print(f"[WorkerPool] ⚠️ Wake-up tab {i+1} warning: {e}")
+                
+                tasks.append(worker.init_with_page(page, self.shared_context))
+            
+            results = await asyncio.gather(*tasks)
+            
+            # Reset queue with initialized workers
+            while not self.available_workers.empty():
+                self.available_workers.get_nowait()
+                
+            for i, success in enumerate(results):
+                if success:
+                    self.available_workers.put_nowait((i, self.workers[i]))
+            
+            self._is_sleeping = False
+            self._last_activity = time.time()
+            print("[WorkerPool] ✅ System fully awake")
+
     async def init(self, cookies: List[Dict]) -> bool:
         """Launch shared browser and N tabs."""
         try:
@@ -591,7 +706,8 @@ class WorkerPool:
             if LOW_MEMORY_MODE:
                 browser_args.extend(AIStudioAutomation.LOW_MEMORY_ARGS)
             
-            user_data_dir = os.path.join(os.path.dirname(__file__), ".aistudio_data")
+            # Use .browser_session as requested for persistence
+            user_data_dir = os.path.join(os.path.dirname(__file__), ".browser_session")
             
             self.shared_context = await self.playwright.chromium.launch_persistent_context(
                 user_data_dir,
@@ -677,6 +793,14 @@ class WorkerPool:
         async with self._lock:
             await self._cleanup_stale()
             
+            # Update activity
+            self._last_activity = time.time()
+            
+            # Handle sleep mode
+            if self._is_sleeping:
+                print("[WorkerPool] 🛌 System is sleeping, triggering wake up...")
+                await self._wake_up()
+
             # Check if we have a cached result for this exact prompt
             if prompt_hash in self._pending_results:
                 result = self._pending_results.pop(prompt_hash)
@@ -719,9 +843,14 @@ class WorkerPool:
             
             return result
         finally:
+            self._last_activity = time.time()
             self.available_workers.put_nowait(worker_handle)
 
     async def close(self):
+        # Cancel background tasks
+        if self._idle_task: self._idle_task.cancel()
+        if self._keepalive_task: self._keepalive_task.cancel()
+        
         for w in self.workers: await w.close()
         if self.shared_context: await self.shared_context.close()
         if self.playwright: await self.playwright.stop()
