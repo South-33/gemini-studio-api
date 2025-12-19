@@ -24,6 +24,12 @@ class BaseAutomation:
         self._pending_result: Optional[Dict] = None
         self._last_activity = time.time()
 
+    @staticmethod
+    async def _human_delay(min_ms: int = 100, max_ms: int = 400):
+        """Add random delay to simulate human interaction."""
+        delay = random.uniform(min_ms, max_ms) / 1000
+        await asyncio.sleep(delay)
+
     async def init_with_page(self, page: Page, context: BrowserContext) -> bool:
         raise NotImplementedError
 
@@ -94,6 +100,7 @@ class AIStudioAutomation(BaseAutomation):
                 print("[AIStudio] ℹ️ Non-headless mode: If you are not logged in, please log in now in the browser window.")
 
             await self.page.wait_for_selector('textarea[aria-label="Enter a prompt"]', timeout=timeout)
+            await self._human_delay(500, 1000) # Wait after selector appears
             print("[AIStudio] ✅ Tab initialized and logged in")
             self._initialized = True
             return True
@@ -115,6 +122,7 @@ class AIStudioAutomation(BaseAutomation):
             ''')
             if result:
                 print(f"[AIStudio] ✅ Clicked {description}")
+                await self._human_delay() # Add delay after click
             return result
         except Exception as e:
             print(f"[AIStudio] ⚠️ JS click failed for {description}: {e}")
@@ -155,17 +163,9 @@ class AIStudioAutomation(BaseAutomation):
     async def send_message(self, prompt: str, model: str = None, thinking_level: str = None, use_search: bool = False, images: List[str] = None) -> Dict:
         """
         Send a message to AI Studio.
-        Handles Koyeb's 100s timeout - if generation is in progress, waits for it.
         """
         if not self._initialized:
             return {"success": False, "error": "Automation not initialized"}
-
-        # Check if there's a pending result from a previous timed-out request
-        if self._pending_result:
-            result = self._pending_result
-            self._pending_result = None
-            print("[AIStudio] ✅ Returning cached pending result")
-            return result
         
         # Check if generation is already in progress (client retried after timeout)
         if self._generation_in_progress:
@@ -177,16 +177,17 @@ class AIStudioAutomation(BaseAutomation):
             
             # 0. Dismiss any popups/tooltips
             await self.page.keyboard.press("Escape")
-            await asyncio.sleep(0.5)
+            await self._human_delay(400, 800)
             
             # 1. Navigate to new chat via URL (more reliable than clicking)
             print("[AIStudio] Creating new chat session...")
             await self.page.goto(self.PLAYGROUND_URL, wait_until="domcontentloaded", timeout=30000)
-            await asyncio.sleep(2)  # Let page stabilize
+            await self._human_delay(1500, 2500)  # Let page stabilize
             
             # 2. Wait for textarea to be ready
             try:
                 await self.page.wait_for_selector('textarea[aria-label="Enter a prompt"]', timeout=15000)
+                await self._human_delay(200, 500)
             except:
                 print("[AIStudio] ⚠️ Textarea not found, continuing anyway...")
             
@@ -207,6 +208,7 @@ class AIStudioAutomation(BaseAutomation):
             if images:
                 for img_path in images:
                     await self._paste_image(img_path)
+                    await self._human_delay(200, 500)
             
             # 6. Type Prompt using JavaScript
             print(f"[AIStudio] Typing prompt ({len(prompt)} chars)...")
@@ -218,7 +220,7 @@ class AIStudioAutomation(BaseAutomation):
                     textarea.focus();
                 }
             }''', prompt)
-            await asyncio.sleep(1)  # Let UI update
+            await self._human_delay(800, 1200)  # Let UI update
             
             # 7. Click Run button using JavaScript
             print("[AIStudio] Generating response...")
@@ -226,7 +228,8 @@ class AIStudioAutomation(BaseAutomation):
             if not clicked:
                 # Fallback: try keyboard shortcut
                 await self.page.keyboard.press("Control+Enter")
-            await asyncio.sleep(1)
+                await self._human_delay(200, 500)
+            await self._human_delay(800, 1200)
             
             # 8. Wait for Generation
             await self._wait_for_generation()
@@ -239,10 +242,7 @@ class AIStudioAutomation(BaseAutomation):
             if not markdown:
                 return {"success": False, "error": "Failed to extract markdown response"}
             
-            result = {"success": True, "response": markdown}
-            # Cache result in case client timed out and retries
-            self._pending_result = result
-            return result
+            return {"success": True, "response": markdown}
 
         except Exception as e:
             self._generation_in_progress = False
@@ -272,15 +272,15 @@ class AIStudioAutomation(BaseAutomation):
                 selector = 'mat-drawer[position="end"] button:has-text("Gemini")'
             
             await self.page.click(selector)
-            await asyncio.sleep(0.3)  # Reduced
+            await self._human_delay(200, 400)
             
             search_input = self.page.locator('input[placeholder*="Search"], input[aria-label*="Search"]')
             await search_input.fill(model_id)
-            await asyncio.sleep(0.3)  # Reduced
+            await self._human_delay(200, 400)
             
             model_btn = self.page.locator(f'button:has-text("{model_id}"), button[id*="{model_id}"]').first
             await model_btn.click(timeout=3000)
-            await asyncio.sleep(0.2)
+            await self._human_delay(100, 300)
             print(f"[AIStudio] ✅ Model {model_id} selected")
         except Exception as e:
             print(f"[AIStudio] ⚠️ Model selection warning: {e}")
@@ -290,9 +290,9 @@ class AIStudioAutomation(BaseAutomation):
         try:
             print(f"[AIStudio] Setting thinking level: {level}")
             await self.page.click('mat-select[aria-label="Thinking Level"]', timeout=3000)
-            await asyncio.sleep(0.3)  # Reduced from 0.5s
+            await self._human_delay(200, 400)
             await self.page.click(f'mat-option:has-text("{level}")', timeout=3000)
-            await asyncio.sleep(0.2)  # Reduced from 0.5s
+            await self._human_delay(100, 300)
         except Exception as e:
             print(f"[AIStudio] Thinking level warning: {e}")
 
@@ -322,7 +322,7 @@ class AIStudioAutomation(BaseAutomation):
             # Focus textarea first
             textarea = self.page.locator('textarea[aria-label="Enter a prompt"]')
             await textarea.click()
-            await asyncio.sleep(0.1)
+            await self._human_delay(50, 150)
             
             # Write image to clipboard using JavaScript
             await self.page.evaluate(f'''
@@ -347,10 +347,9 @@ class AIStudioAutomation(BaseAutomation):
             
             # Use Playwright's keyboard to paste (Ctrl+V)
             await self.page.keyboard.press("Control+v")
+            await self._human_delay(800, 1200) # Give time for upload
             
             # Wait for image to appear in the prompt area
-            await asyncio.sleep(1.0)  # Give time for upload
-            
             # Check if image preview appeared (look for img or media indicators)
             try:
                 # AI Studio shows uploaded images in the prompt area
@@ -371,7 +370,7 @@ class AIStudioAutomation(BaseAutomation):
             is_checked = await btn.get_attribute("aria-checked") == "true"
             if is_checked != enabled:
                 await btn.click()
-                await asyncio.sleep(0.5)
+                await self._human_delay(400, 600)
         except Exception as e:
             print(f"[AIStudio] Search toggle warning: {e}")
 
@@ -401,7 +400,7 @@ class AIStudioAutomation(BaseAutomation):
                         break
                 except:
                     pass
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.1) # Keep this as a short, consistent poll
             
             if not generation_started:
                 print("[AIStudio] Generation may have finished instantly or failed to start")
@@ -453,7 +452,7 @@ class AIStudioAutomation(BaseAutomation):
                 except:
                     pass
                 
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.1) # Keep this as a short, consistent poll
             
         except Exception as e:
             print(f"[AIStudio] Wait warning: {e}")
@@ -466,7 +465,7 @@ class AIStudioAutomation(BaseAutomation):
             
             # On slow VMs, skip the clipboard method entirely (too many timeouts)
             if SLOW_VM_MODE:
-                await asyncio.sleep(1)  # Brief wait for DOM to settle
+                await self._human_delay(800, 1200) # Brief wait for DOM to settle
                 return await self._extract_from_dom()
             
             # Scope to MODEL response containers only
@@ -482,7 +481,7 @@ class AIStudioAutomation(BaseAutomation):
                     if container_count > 0:
                         last_container = model_containers.nth(container_count - 1)
                         await last_container.hover(timeout=2000)
-                        await asyncio.sleep(0.2)  # Minimal time for button to appear
+                        await self._human_delay(100, 300) # Minimal time for button to appear
                     
                     # Now click the button
                     last_menu = menus.nth(menu_count - 1)
@@ -492,14 +491,26 @@ class AIStudioAutomation(BaseAutomation):
                     print(f"[AIStudio] Click failed, trying JS: {click_err}")
                     # Force via JavaScript (hover + click)
                     try:
-                        await self.page.evaluate('''\n                            (() => {\n                                const containers = document.querySelectorAll('.chat-turn-container.model');\n                                if (containers.length > 0) {\n                                    const last = containers[containers.length - 1];\n                                    last.dispatchEvent(new MouseEvent('mouseenter', {bubbles: true}));\n                                    setTimeout(() => {\n                                        const btn = last.querySelector('button[aria-label=\"Open options\"]');\n                                        if (btn) btn.click();\n                                    }, 200);\n                                }\n                            })()\n                        ''')
-                        await asyncio.sleep(0.3)
+                        await self.page.evaluate('''
+                            (() => {
+                                const containers = document.querySelectorAll('.chat-turn-container.model');
+                                if (containers.length > 0) {
+                                    const last = containers[containers.length - 1];
+                                    last.dispatchEvent(new MouseEvent('mouseenter', {bubbles: true}));
+                                    setTimeout(() => {
+                                        const btn = last.querySelector('button[aria-label="Open options"]');
+                                        if (btn) btn.click();
+                                    }, 200);
+                                }
+                            })()
+                        ''')
+                        await self._human_delay(200, 400)
                         print("[AIStudio] Clicked via JS")
                     except Exception as js_err:
                         print(f"[AIStudio] JS also failed: {js_err}")
                         return await self._extract_from_dom()
                 
-                await asyncio.sleep(0.2)  # Wait for menu to appear
+                await self._human_delay(100, 300)  # Wait for menu to appear
                 
                 # Find and click "Copy as markdown"
                 copy_btn = self.page.locator('button:has-text("Copy as markdown")')
@@ -507,7 +518,7 @@ class AIStudioAutomation(BaseAutomation):
                     if await copy_btn.count() > 0:
                         await copy_btn.first.click(timeout=3000)
                         print("[AIStudio] Clicked 'Copy as markdown'")
-                        await asyncio.sleep(0.15)  # Minimal time for clipboard
+                        await self._human_delay(100, 200)  # Minimal time for clipboard
                         
                         # Read from clipboard
                         markdown = await self.page.evaluate("navigator.clipboard.readText()")
@@ -517,9 +528,11 @@ class AIStudioAutomation(BaseAutomation):
                     else:
                         print("[AIStudio] 'Copy as markdown' not found, pressing Escape")
                         await self.page.keyboard.press("Escape")
+                        await self._human_delay(100, 300)
                 except Exception as copy_err:
                     print(f"[AIStudio] Copy failed: {copy_err}")
                     await self.page.keyboard.press("Escape")
+                    await self._human_delay(100, 300)
             
             # Fallback to DOM
             return await self._extract_from_dom()
@@ -534,7 +547,7 @@ class AIStudioAutomation(BaseAutomation):
             print("[AIStudio] Using DOM fallback...")
             
             # Wait a moment for response to render
-            await asyncio.sleep(0.5)
+            await self._human_delay(400, 800)
             
             # Use JavaScript to extract text - specifically target markdown content
             text = await self.page.evaluate('''
@@ -617,10 +630,12 @@ class GeminiWebAutomation(BaseAutomation):
         try:
             # Wait for input to be ready (login check)
             await self.page.wait_for_selector(self.SELECTORS["input"], timeout=30000)
+            await self._human_delay(500, 1000)
             print("[GeminiWeb] ✅ Logged in and ready")
             
             # Default to Temporary Chat if possible for clean sessions
             await self._enable_temp_chat()
+            await self._human_delay(200, 500)
             
             self._initialized = True
             return True
@@ -636,17 +651,14 @@ class GeminiWebAutomation(BaseAutomation):
             temp_btn = self.page.locator(self.SELECTORS["temp_chat"])
             if await temp_btn.is_visible():
                 await temp_btn.click()
+                await self._human_delay(200, 500)
                 print("[GeminiWeb] ✅ Enabled Temporary Chat")
         except:
             pass
 
     async def send_message(self, prompt: str, model: str = None, thinking_level: str = None, use_search: bool = False, images: List[str] = None) -> Dict:
-        if not self._initialized: return {"success": False, "error": "Not initialized"}
-        
-        if self._pending_result:
-            res = self._pending_result
-            self._pending_result = None
-            return res
+        if not self._initialized: 
+            return {"success": False, "error": "Not initialized"}
 
         try:
             self._generation_in_progress = True
@@ -656,11 +668,12 @@ class GeminiWebAutomation(BaseAutomation):
             new_chat_btn = self.page.locator(self.SELECTORS["new_chat"]).first
             if await new_chat_btn.is_visible():
                 await new_chat_btn.click()
-                await asyncio.sleep(1)
+                await self._human_delay(800, 1200)  # Wait for page to settle
             
             # 1.5 Enable Temporary Chat
             print("[GeminiWeb] Enabling temporary chat...")
             await self._enable_temp_chat()
+            await self._human_delay()
 
             # 2. Select Model
             if model:
@@ -670,23 +683,26 @@ class GeminiWebAutomation(BaseAutomation):
             print(f"[GeminiWeb] Entering prompt...")
             input_area = self.page.locator(self.SELECTORS["input"])
             await input_area.click()
+            await self._human_delay()
             
             # 3.5 Paste Images (if provided)
             if images:
                 for img_path in images:
                     await self._paste_image(img_path)
+                    await self._human_delay(200, 500)
             
             await input_area.fill(prompt)
-            await asyncio.sleep(0.5)
+            await self._human_delay(300, 600)
 
             # 4. Click Send
             await self.page.click(self.SELECTORS["send_btn"])
+            await self._human_delay(200, 500)
             
             # 5. Wait for Response (Copy button to appear)
             print("[GeminiWeb] Waiting for response...")
             # We wait for the Copy button of the LAST message to be visible
             # but usually it's better to wait for the generation to stop (no more loading states)
-            await asyncio.sleep(2) # Initial wait
+            await self._human_delay(1500, 2500) # Initial wait
             
             # Polling for copy button
             start_time = time.time()
@@ -699,7 +715,7 @@ class GeminiWebAutomation(BaseAutomation):
                     copy_btn = btns.nth(count - 1)
                     if await copy_btn.is_visible():
                         break
-                await asyncio.sleep(1)
+                await asyncio.sleep(1) # Keep this as a short, consistent poll
             
             if not copy_btn:
                  return {"success": False, "error": "Timeout waiting for copy button"}
@@ -715,12 +731,12 @@ class GeminiWebAutomation(BaseAutomation):
                     }
                 }
             ''')
-            await asyncio.sleep(0.5)  # Wait for scroll to complete
+            await self._human_delay(400, 800)  # Wait for scroll to complete
 
             # 6. Extraction via Copy Button
             print("[GeminiWeb] Extracting markdown...")
             await copy_btn.click()
-            await asyncio.sleep(0.5) # Wait for clipboard
+            await self._human_delay(400, 800) # Wait for clipboard
             
             markdown = await self.page.evaluate("navigator.clipboard.readText()")
             self._generation_in_progress = False
@@ -728,9 +744,7 @@ class GeminiWebAutomation(BaseAutomation):
             if not markdown:
                 return {"success": False, "error": "Clipboard empty after copy"}
 
-            result = {"success": True, "response": markdown.strip()}
-            self._pending_result = result
-            return result
+            return {"success": True, "response": markdown.strip()}
 
         except Exception as e:
             self._generation_in_progress = False
@@ -741,6 +755,7 @@ class GeminiWebAutomation(BaseAutomation):
     async def _fallback_extract(self) -> Dict:
         """Fallback extraction via DOM if copy button fails."""
         try:
+            await self._human_delay(400, 800) # Give DOM a moment to settle
             text = await self.page.evaluate('''
                 () => {
                     const responses = document.querySelectorAll('[data-content-type="response"]');
@@ -765,7 +780,7 @@ class GeminiWebAutomation(BaseAutomation):
                 return
             
             await btn.click()
-            await asyncio.sleep(0.5)
+            await self._human_delay(400, 600)
             
             # Select from menu
             items = self.page.locator(self.SELECTORS["menu_item"])
@@ -775,10 +790,11 @@ class GeminiWebAutomation(BaseAutomation):
                 if model_name.lower() in text.lower():
                     await item.click()
                     print(f"[GeminiWeb] ✅ Selected model: {model_name}")
-                    await asyncio.sleep(0.5)
+                    await self._human_delay(300, 600)
                     return
             # If not found, close menu
             await self.page.keyboard.press("Escape")
+            await self._human_delay(100, 300)
         except Exception as e:
             print(f"[GeminiWeb] ⚠️ Model selection failed: {e}")
 
@@ -870,7 +886,7 @@ class WorkerPool:
         self._pending_results: Dict[str, Dict] = {}  # prompt_hash -> result
         self._result_timestamps: Dict[str, float] = {}  # prompt_hash -> timestamp
         self._lock = asyncio.Lock()
-        self.RESULT_TTL = 120  # Results expire after 2 minutes
+        self.RESULT_TTL = 10  # Results expire after 10 seconds (just for timeout retries)
         
         # Idle/Keepalive settings
         self.IDLE_TIMEOUT_MINUTES = int(os.getenv("IDLE_TIMEOUT_MINUTES", "30"))
