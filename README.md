@@ -90,6 +90,7 @@ HEADLESS=true              # false to see the browser
 | File | Purpose |
 |------|---------|
 | `main_bridge.py` | Main API server (uses persistent session) |
+| `test_api.html` | Premium UI for testing the API (OpenAI format) |
 | `setup_session.py` | One-time Google login script |
 | `autostart.bat` | Auto-start on Windows boot |
 | `DEPLOY_LOCAL.md` | Full headless server setup guide |

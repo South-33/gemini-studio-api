@@ -173,16 +173,38 @@ async def chat_completions(request: OpenAIChatRequest):
                 break
             await asyncio.sleep(0.5)
         
-        for _ in range(300):  # 5 min max
+        for i in range(300):  # 5 min max
             btn_text = await page.evaluate('''() => {
                 const btn = document.querySelector('button[aria-label="Run"]');
                 return btn ? btn.innerText : '';
             }''')
             if "Stop" not in btn_text:
                 break
+            
+            # Auto-scroll every 2 seconds to ensure content renders
+            if i % 2 == 0:
+                await page.evaluate('''() => {
+                    const chatContainer = document.querySelector('.chat-window') || 
+                                         document.querySelector('[class*="chat"]') ||
+                                         document.querySelector('ms-autoscroll-container') ||
+                                         document.documentElement;
+                    if (chatContainer) chatContainer.scrollTop = chatContainer.scrollHeight;
+                    window.scrollTo(0, document.body.scrollHeight);
+                }''')
+            
             await asyncio.sleep(1)
         
         await asyncio.sleep(1)  # DOM settle
+        
+        # Final scroll to ensure all content is rendered
+        await page.evaluate('''() => {
+            window.scrollTo(0, document.body.scrollHeight);
+            const containers = document.querySelectorAll('.chat-turn-container.model');
+            if (containers.length > 0) {
+                containers[containers.length - 1].scrollIntoView({ behavior: 'instant', block: 'end' });
+            }
+        }''')
+        await asyncio.sleep(0.5)
         
         # Extract response
         content = await page.evaluate('''() => {
@@ -199,6 +221,7 @@ async def chat_completions(request: OpenAIChatRequest):
             }
             return last.innerText.trim();
         }''')
+
         
         if not content:
             raise HTTPException(status_code=500, detail="Failed to extract response")
