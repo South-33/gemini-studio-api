@@ -657,6 +657,10 @@ class GeminiWebAutomation(BaseAutomation):
             if await new_chat_btn.is_visible():
                 await new_chat_btn.click()
                 await asyncio.sleep(1)
+            
+            # 1.5 Enable Temporary Chat
+            print("[GeminiWeb] Enabling temporary chat...")
+            await self._enable_temp_chat()
 
             # 2. Select Model
             if model:

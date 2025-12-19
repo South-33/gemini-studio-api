@@ -78,6 +78,10 @@ This API is fully **OpenAI-compatible** and can be used from any programming lan
 > - Your Cloudflare Tunnel URL: `https://your-tunnel-url.trycloudflare.com`
 > - Or your deployed API URL (if hosted on Convex, Railway, etc.)
 
+> **Model Routing**: The API automatically routes to the correct provider based on the model name:
+> - Use `thinking`, `pro`, or `fast` → Routes to **Gemini Web**
+> - Use `gemini-3-*` models → Routes to **AI Studio**
+
 ### Basic Chat Request (curl)
 
 ```bash
