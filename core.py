@@ -388,26 +388,56 @@ class AIStudioAutomation:
                 return
             
             # Wait for button text to return to "Run" (generation complete)
+            # Also scroll on every poll to ensure content renders
             start_time = asyncio.get_event_loop().time()
             max_wait = 300  # 5 minutes max
             
             while (asyncio.get_event_loop().time() - start_time) < max_wait:
                 try:
+                    # Scroll to bottom on every poll to ensure content renders
+                    await self.page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+                    
                     btn_text = await button.inner_text(timeout=1000)
                     
                     # Check if "Stop" is gone and we're back to "Run"
                     if "Stop" not in btn_text and "progress_activity" not in btn_text:
                         print("[AIStudio] Generation complete (button shows Run)")
-                        await asyncio.sleep(0.3)  # Brief buffer for DOM stability
-                        return
+                        break
                 except:
                     pass
                 
-                await asyncio.sleep(0.2)  # Poll every 200ms
+                await asyncio.sleep(1)  # Poll every 1 second
             
-            print("[AIStudio] Generation timeout")
+            # Content stability check - wait until text stops changing
+            print("[AIStudio] Waiting for content to stabilize...")
+            last_length = 0
+            stable_count = 0
+            for _ in range(50):  # Max 5 seconds
+                try:
+                    length = await self.page.evaluate('''() => {
+                        const containers = document.querySelectorAll('.chat-turn-container.model');
+                        if (containers.length === 0) return 0;
+                        const last = containers[containers.length - 1];
+                        last.scrollIntoView({ behavior: 'instant', block: 'end' });
+                        return last.innerText.length;
+                    }''')
+                    
+                    if length > 0 and length == last_length:
+                        stable_count += 1
+                        if stable_count >= 3:  # Stable for 300ms
+                            print(f"[AIStudio] Content stable at {length} chars")
+                            break
+                    else:
+                        stable_count = 0
+                        last_length = length
+                except:
+                    pass
+                
+                await asyncio.sleep(0.1)
+            
         except Exception as e:
             print(f"[AIStudio] Wait warning: {e}")
+
 
     async def _extract_markdown(self) -> Optional[str]:
         """Extract response as markdown via the 'Copy as markdown' button."""
