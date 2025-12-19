@@ -16,7 +16,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from core import WorkerPool
-from cookie_loader import get_cookies
 
 # Configuration
 WORKER_COUNT = int(os.getenv("WORKER_COUNT", "1"))
@@ -30,24 +29,20 @@ def run_browser_loop(loop):
     asyncio.set_event_loop(loop)
     loop.run_forever()
 
-async def init_browser_thread(cookies):
+async def init_browser_thread():
     global worker_pool, browser_loop, browser_thread
     browser_loop = asyncio.ProactorEventLoop() if os.name == "nt" else asyncio.new_event_loop()
     browser_thread = threading.Thread(target=run_browser_loop, args=(browser_loop,), daemon=True)
     browser_thread.start()
     
     worker_pool = WorkerPool(worker_count=WORKER_COUNT)
-    future = asyncio.run_coroutine_threadsafe(worker_pool.init(cookies), browser_loop)
+    # Empty cookies - we use persistent browser session instead
+    future = asyncio.run_coroutine_threadsafe(worker_pool.init([]), browser_loop)
     return future.result(timeout=120)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    cookies, error = get_cookies()
-    if error:
-        print(f"[Server] ⚠️ Cookie warning: {error}")
-        print("[Server] Proceeding without cookies (manual login might be required).")
-    
-    success = await init_browser_thread(cookies or [])
+    success = await init_browser_thread()
     if success:
         print("[Server] ✅ AI Studio Worker Pool Ready")
     
@@ -55,6 +50,7 @@ async def lifespan(app: FastAPI):
     if worker_pool:
         future = asyncio.run_coroutine_threadsafe(worker_pool.close(), browser_loop)
         future.result(timeout=10)
+
 
 app = FastAPI(title="Gemini Studio API", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
