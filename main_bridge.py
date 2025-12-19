@@ -173,38 +173,39 @@ async def chat_completions(request: OpenAIChatRequest):
                 break
             await asyncio.sleep(0.5)
         
-        for i in range(300):  # 5 min max
+        for _ in range(300):  # 5 min max
             btn_text = await page.evaluate('''() => {
                 const btn = document.querySelector('button[aria-label="Run"]');
                 return btn ? btn.innerText : '';
             }''')
             if "Stop" not in btn_text:
                 break
-            
-            # Auto-scroll every 2 seconds to ensure content renders
-            if i % 2 == 0:
-                await page.evaluate('''() => {
-                    const chatContainer = document.querySelector('.chat-window') || 
-                                         document.querySelector('[class*="chat"]') ||
-                                         document.querySelector('ms-autoscroll-container') ||
-                                         document.documentElement;
-                    if (chatContainer) chatContainer.scrollTop = chatContainer.scrollHeight;
-                    window.scrollTo(0, document.body.scrollHeight);
-                }''')
-            
             await asyncio.sleep(1)
         
-        await asyncio.sleep(1)  # DOM settle
+        # Generation done - now wait for content to finish populating
+        # Fast 100ms polling until content stops changing
+        print("[API] Generation done, waiting for content to populate...")
         
-        # Final scroll to ensure all content is rendered
-        await page.evaluate('''() => {
-            window.scrollTo(0, document.body.scrollHeight);
-            const containers = document.querySelectorAll('.chat-turn-container.model');
-            if (containers.length > 0) {
-                containers[containers.length - 1].scrollIntoView({ behavior: 'instant', block: 'end' });
-            }
-        }''')
-        await asyncio.sleep(0.5)
+        last_length = 0
+        stable_count = 0
+        for _ in range(50):  # Max 5 seconds
+            length = await page.evaluate('''() => {
+                const containers = document.querySelectorAll('.chat-turn-container.model');
+                if (containers.length === 0) return 0;
+                const last = containers[containers.length - 1];
+                last.scrollIntoView({ behavior: 'instant', block: 'end' });
+                return last.innerText.length;
+            }''')
+            
+            if length > 0 and length == last_length:
+                stable_count += 1
+                if stable_count >= 3:  # Stable for 300ms
+                    break
+            else:
+                stable_count = 0
+                last_length = length
+            
+            await asyncio.sleep(0.1)
         
         # Extract response
         content = await page.evaluate('''() => {
@@ -221,6 +222,7 @@ async def chat_completions(request: OpenAIChatRequest):
             }
             return last.innerText.trim();
         }''')
+
 
         
         if not content:
