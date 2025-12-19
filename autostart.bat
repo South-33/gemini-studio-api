@@ -1,7 +1,7 @@
 @echo off
 title Gemini Studio API - Auto Start
 echo ==========================================
-echo   Gemini Studio - Local Bridge Starter
+echo   Gemini Studio API Starter
 echo ==========================================
 
 :: Navigate to script directory
@@ -11,12 +11,13 @@ cd /d "%~dp0"
 echo [1/3] Waiting for network...
 timeout /t 10 /nobreak >nul
 
-:: Start the API in background
+:: Activate virtual environment and start API
 echo [2/3] Starting API server...
-start /min "GeminiAPI" cmd /c "python main.py"
+start "GeminiAPI" cmd /k "cd /d %~dp0 && call ..\..\..\env\Scripts\activate.bat && python main.py"
 
 :: Wait for API to initialize
-timeout /t 15 /nobreak >nul
+echo Waiting 20 seconds for API to start...
+timeout /t 20 /nobreak >nul
 
 :: Start Cloudflare Tunnel
 echo [3/3] Starting Cloudflare Tunnel...
