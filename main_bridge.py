@@ -34,17 +34,20 @@ class OpenAIChatRequest(BaseModel):
 
 
 async def init_browser():
-    """Initialize browser with persistent session (works headlessly)."""
+    """Initialize browser with persistent session."""
     global playwright_instance, browser_context, page, initialized
     
-    print(f"[Server] Starting browser with session from: {SESSION_DIR}")
+    # Read headless setting from environment
+    is_headless = os.getenv("HEADLESS", "true").lower() == "true"
+    
+    print(f"[Server] Starting browser (headless={is_headless}) with session from: {SESSION_DIR}")
     
     playwright_instance = await async_playwright().start()
     
-    # Use persistent context (headless by default)
+    # Use persistent context
     browser_context = await playwright_instance.chromium.launch_persistent_context(
         SESSION_DIR,
-        headless=True,
+        headless=is_headless,
         args=[
             "--disable-blink-features=AutomationControlled",
             "--no-sandbox",
