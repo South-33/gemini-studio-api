@@ -219,12 +219,13 @@ print(response.choices[0].message.content)
 | `gemini-3-pro-preview` | More capable model |
 
 ### Gemini Web Models (gemini.google.com)
-Set `PROVIDER=gemini-web` in your `.env`.
 | Model | Description |
 |-------|-------------|
 | `fast` | Quick responses |
 | `thinking` | Complex problem solving |
 | `pro` | Advanced math & reasoning |
+
+> **Auto-Routing**: By default (`PROVIDER=auto`), the API automatically routes requests to the correct provider based on model name. Use `thinking`, `pro`, or `fast` to hit Gemini Web; use `gemini-3-*` models to hit AI Studio.
 
 ---
 
@@ -232,9 +233,15 @@ Set `PROVIDER=gemini-web` in your `.env`.
 
 ```env
 HEADLESS=true      # false to see the browser
-WORKER_COUNT=1     # Number of concurrent browser tabs
-PROVIDER=aistudio  # "aistudio" or "gemini-web"
+WORKER_COUNT=1     # Ignored in dual-provider mode
+PROVIDER=auto      # "auto" (default), "aistudio", or "gemini-web"
 ```
+
+| Provider Mode | Behavior |
+|---------------|----------|
+| `auto` | Opens both tabs, routes by model name |
+| `aistudio` | Only uses AI Studio |
+| `gemini-web` | Only uses Gemini Web |
 
 ---
 

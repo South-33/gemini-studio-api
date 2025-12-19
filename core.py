@@ -831,17 +831,25 @@ class GeminiWebAutomation(BaseAutomation):
         await super().close()
 
 class WorkerPool:
-    def __init__(self, worker_count: int = 1, provider: str = "aistudio"):
+    """Dual-provider worker pool with auto-routing based on model name."""
+    
+    # Models that route to Gemini Web
+    GEMINI_WEB_MODELS = ["thinking", "pro", "fast"]
+    
+    def __init__(self, worker_count: int = 1, provider: str = "auto"):
         self.worker_count = worker_count
-        self.provider = provider.lower()
-        self.workers: List[BaseAutomation] = []  # Can be AIStudio or GeminiWeb
-        self.available_workers = asyncio.Queue()
+        self.provider = provider.lower()  # "auto", "aistudio", or "gemini-web"
+        
+        # Separate workers for each provider
+        self.aistudio_worker: Optional[AIStudioAutomation] = None
+        self.geminiweb_worker: Optional[GeminiWebAutomation] = None
+        
         self.shared_context = None
         self.playwright = None
         self._initialized = False
         
         # Request tracking for Koyeb timeout handling
-        self._active_requests: Dict[str, int] = {}  # prompt_hash -> worker_idx
+        self._active_requests: Dict[str, str] = {}  # prompt_hash -> provider
         self._pending_results: Dict[str, Dict] = {}  # prompt_hash -> result
         self._result_timestamps: Dict[str, float] = {}  # prompt_hash -> timestamp
         self._lock = asyncio.Lock()
@@ -857,6 +865,19 @@ class WorkerPool:
         self._tasks_started = False
         self._keepalive_task = None
         self._idle_task = None
+
+    def _route_model(self, model: str) -> str:
+        """Determine which provider to use based on model name."""
+        if self.provider in ["aistudio", "gemini-web"]:
+            return self.provider  # Fixed provider mode
+        
+        # Auto-routing based on model name
+        if model:
+            model_lower = model.lower()
+            for gw_model in self.GEMINI_WEB_MODELS:
+                if gw_model in model_lower:
+                    return "gemini-web"
+        return "aistudio"  # Default
 
     def _hash_prompt(self, prompt: str) -> str:
         """Create a hash of the prompt for tracking."""
@@ -972,6 +993,20 @@ class WorkerPool:
             self._last_activity = time.time()
             print("[WorkerPool] ✅ System fully awake")
 
+    async def _wake_up_worker(self, provider: str):
+        """Wake up a specific provider's worker."""
+        async with self._wake_lock:
+            if provider == "aistudio" and self.aistudio_worker:
+                if self.aistudio_worker.page is None:
+                    page = await self.shared_context.new_page()
+                    await page.goto(AIStudioAutomation.PLAYGROUND_URL, timeout=60000, wait_until="networkidle")
+                    await self.aistudio_worker.init_with_page(page, self.shared_context)
+            elif provider == "gemini-web" and self.geminiweb_worker:
+                if self.geminiweb_worker.page is None:
+                    page = await self.shared_context.new_page()
+                    await page.goto(GeminiWebAutomation.URL, timeout=60000, wait_until="networkidle")
+                    await self.geminiweb_worker.init_with_page(page, self.shared_context)
+
     async def init(self, cookies: List[Dict]) -> bool:
         """Launch shared browser and N tabs."""
         try:
@@ -1026,33 +1061,37 @@ class WorkerPool:
             if LOW_MEMORY_MODE:
                 await self.shared_context.route("**/*", self._block_resources)
 
-            # Create tabs
-            print(f"[WorkerPool] Creating {self.worker_count} {self.provider} worker tabs...")
-            tasks = []
-            for i in range(self.worker_count):
-                print(f"[WorkerPool] Opening tab {i + 1}...")
-                page = await self.shared_context.new_page()
-                
-                print(f"[WorkerPool] Navigating tab {i + 1} to {self.provider}...")
-                target_url = AIStudioAutomation.PLAYGROUND_URL if self.provider == "aistudio" else GeminiWebAutomation.URL
-                try:
-                    await page.goto(target_url, timeout=60000, wait_until="networkidle")
-                    print(f"[WorkerPool] ✅ Tab {i + 1} loaded: {page.url}")
-                except Exception as nav_err:
-                    print(f"[WorkerPool] ⚠️ Tab {i + 1} navigation warning: {nav_err}")
-                
-                worker = AIStudioAutomation() if self.provider == "aistudio" else GeminiWebAutomation()
-                tasks.append(worker.init_with_page(page, self.shared_context))
-                self.workers.append(worker)
+            # Create dual-provider tabs
+            print("[WorkerPool] Creating dual-provider workers (AI Studio + Gemini Web)...")
             
-            results = await asyncio.gather(*tasks)
+            # Tab 1: AI Studio
+            print("[WorkerPool] Opening AI Studio tab...")
+            page1 = await self.shared_context.new_page()
+            try:
+                await page1.goto(AIStudioAutomation.PLAYGROUND_URL, timeout=60000, wait_until="networkidle")
+                print(f"[WorkerPool] ✅ AI Studio tab loaded: {page1.url}")
+            except Exception as e:
+                print(f"[WorkerPool] ⚠️ AI Studio navigation warning: {e}")
             
-            for i, success in enumerate(results):
-                if success:
-                    self.available_workers.put_nowait((i, self.workers[i]))
+            self.aistudio_worker = AIStudioAutomation()
+            aistudio_ok = await self.aistudio_worker.init_with_page(page1, self.shared_context)
+            
+            # Tab 2: Gemini Web
+            print("[WorkerPool] Opening Gemini Web tab...")
+            page2 = await self.shared_context.new_page()
+            try:
+                await page2.goto(GeminiWebAutomation.URL, timeout=60000, wait_until="networkidle")
+                print(f"[WorkerPool] ✅ Gemini Web tab loaded: {page2.url}")
+            except Exception as e:
+                print(f"[WorkerPool] ⚠️ Gemini Web navigation warning: {e}")
+            
+            self.geminiweb_worker = GeminiWebAutomation()
+            geminiweb_ok = await self.geminiweb_worker.init_with_page(page2, self.shared_context)
+            
+            print(f"[WorkerPool] Workers ready - AI Studio: {aistudio_ok}, Gemini Web: {geminiweb_ok}")
             
             self._initialized = True
-            return True
+            return aistudio_ok or geminiweb_ok  # Success if at least one works
         except Exception as e:
             print(f"[WorkerPool] Init error: {e}")
             return False
@@ -1104,19 +1143,32 @@ class WorkerPool:
                 self._active_requests.pop(prompt_hash, None)
                 
                 return result
+        # Route to correct provider based on model
+        target_provider = self._route_model(model)
+        print(f"[WorkerPool] Routing to {target_provider} for model '{model}'")
         
-        # New request - get a worker
-        worker_handle = await self.available_workers.get()
-        idx, worker = worker_handle
+        # Get the appropriate worker
+        if target_provider == "gemini-web":
+            worker = self.geminiweb_worker
+            if not worker or not worker._initialized:
+                await self._wake_up_worker("gemini-web")
+                worker = self.geminiweb_worker
+        else:
+            worker = self.aistudio_worker
+            if not worker or not worker._initialized:
+                await self._wake_up_worker("aistudio")
+                worker = self.aistudio_worker
+        
+        if not worker:
+            return {"success": False, "error": f"Worker for {target_provider} not available"}
         
         async with self._lock:
-            self._active_requests[prompt_hash] = idx
+            self._active_requests[prompt_hash] = target_provider
         
         try:
             result = await worker.send_message(prompt, model, thinking_level, use_search, images)
             
             async with self._lock:
-                # Cache the result in case HTTP timed out and client retries
                 self._pending_results[prompt_hash] = result
                 self._result_timestamps[prompt_hash] = time.time()
                 self._active_requests.pop(prompt_hash, None)
@@ -1124,14 +1176,14 @@ class WorkerPool:
             return result
         finally:
             self._last_activity = time.time()
-            self.available_workers.put_nowait(worker_handle)
 
     async def close(self):
         # Cancel background tasks
         if self._idle_task: self._idle_task.cancel()
         if self._keepalive_task: self._keepalive_task.cancel()
         
-        for w in self.workers: await w.close()
+        if self.aistudio_worker: await self.aistudio_worker.close()
+        if self.geminiweb_worker: await self.geminiweb_worker.close()
         if self.shared_context: await self.shared_context.close()
         if self.playwright: await self.playwright.stop()
 

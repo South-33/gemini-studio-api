@@ -19,7 +19,7 @@ from core import WorkerPool
 
 # Configuration
 WORKER_COUNT = int(os.getenv("WORKER_COUNT", "1"))
-PROVIDER = os.getenv("PROVIDER", "aistudio").lower() # aistudio or gemini-web
+PROVIDER = os.getenv("PROVIDER", "auto").lower()  # "auto", "aistudio", or "gemini-web"
 
 # Global State
 worker_pool: Optional[WorkerPool] = None
@@ -45,7 +45,7 @@ async def init_browser_thread():
 async def lifespan(app: FastAPI):
     success = await init_browser_thread()
     if success:
-        print("[Server] ✅ AI Studio Worker Pool Ready")
+        print(f"[Server] ✅ Dual-Provider Worker Pool Ready (Provider mode: {PROVIDER})")
     
     yield
     if worker_pool:
@@ -81,18 +81,19 @@ class OpenAIChatRequest(BaseModel):
 def parse_model_and_thinking(model_name: str) -> tuple:
     """
     Parse thinking level from model name suffix.
-    Examples:
-        gemini-3-flash-preview -> (gemini-3-flash-preview, High)
-        gemini-3-flash-preview-minimal -> (gemini-3-flash-preview, Minimal)
+    Returns (model_for_provider, thinking_level)
+    
+    Gemini Web models: thinking, pro, fast
+    AI Studio models: gemini-3-flash-preview, gemini-3-pro-preview, etc.
     """
-    if PROVIDER == "gemini-web":
-        # Gemini Web uses simplified names: Fast, Thinking, Pro
-        if "thinking" in model_name.lower():
-            return "Thinking", "High"
-        if "pro" in model_name.lower():
-            return "Pro", "High"
-        return "Fast", "High"
-
+    # Check if it's a Gemini Web model
+    gemini_web_models = ["thinking", "pro", "fast"]
+    for gw_model in gemini_web_models:
+        if gw_model in model_name.lower():
+            # Gemini Web - capitalize the model name
+            return model_name.capitalize() if model_name.lower() in gemini_web_models else model_name, "High"
+    
+    # AI Studio model parsing
     thinking_levels = ["minimal", "low", "medium", "high"]
     
     for level in thinking_levels:
@@ -106,22 +107,20 @@ def parse_model_and_thinking(model_name: str) -> tuple:
 
 @app.get("/v1/models")
 async def list_models():
-    if PROVIDER == "gemini-web":
-        return {
-            "data": [
-                {"id": "fast", "object": "model"},
-                {"id": "thinking", "object": "model"},
-                {"id": "pro", "object": "model"},
-            ]
-        }
+    """List available models for both providers."""
     return {
         "data": [
-            {"id": "gemini-3-pro-preview", "object": "model"},
-            {"id": "gemini-3-flash-preview", "object": "model"},
-            {"id": "gemini-3-flash-preview-minimal", "object": "model"},
-            {"id": "gemini-3-flash-preview-low", "object": "model"},
-            {"id": "gemini-3-flash-preview-medium", "object": "model"},
-            {"id": "gemini-3-flash-preview-high", "object": "model"},
+            # AI Studio models
+            {"id": "gemini-3-pro-preview", "object": "model", "provider": "aistudio"},
+            {"id": "gemini-3-flash-preview", "object": "model", "provider": "aistudio"},
+            {"id": "gemini-3-flash-preview-minimal", "object": "model", "provider": "aistudio"},
+            {"id": "gemini-3-flash-preview-low", "object": "model", "provider": "aistudio"},
+            {"id": "gemini-3-flash-preview-medium", "object": "model", "provider": "aistudio"},
+            {"id": "gemini-3-flash-preview-high", "object": "model", "provider": "aistudio"},
+            # Gemini Web models
+            {"id": "fast", "object": "model", "provider": "gemini-web"},
+            {"id": "thinking", "object": "model", "provider": "gemini-web"},
+            {"id": "pro", "object": "model", "provider": "gemini-web"},
         ]
     }
 
