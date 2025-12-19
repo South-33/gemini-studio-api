@@ -2,11 +2,11 @@
 
 A lightweight API that automates Google AI Studio to provide OpenAI-compatible endpoints. Use Gemini 2.5 Pro/Flash with thinking levels directly from Roo Code, Cursor, or any OpenAI-compatible tool.
 
-## Features
-
+- **Multi-Provider** - Supports both **Google AI Studio** and **Gemini Web** (gemini.google.com)
 - **OpenAI Compatible** - Works with Cursor, Roo Code, Continue, etc.
 - **Thinking Levels** - Control via model name suffix: `-minimal`, `-low`, `-medium`, `-high`
-- **Image Upload** - Send images via OpenAI Vision API format
+- **Simplified Models** - Use `pro`, `thinking`, or `fast` with Gemini Web
+- **Image Upload** - Send images via OpenAI Vision API format (Supported on both providers)
 - **Session Persistence** - Login once via Chrome, stays authenticated forever
 - **Cloudflare Tunnel** - Expose your local API to the internet for free
 
@@ -70,8 +70,145 @@ See [DEPLOY_LOCAL.md](DEPLOY_LOCAL.md) for full headless server setup guide.
 
 ---
 
-## Model Names
+## How to Use as an API
 
+This API is fully **OpenAI-compatible** and can be used from any programming language or tool that supports OpenAI's chat completions endpoint.
+
+> **Note**: Replace `http://localhost:8001` in the examples below with:
+> - Your Cloudflare Tunnel URL: `https://your-tunnel-url.trycloudflare.com`
+> - Or your deployed API URL (if hosted on Convex, Railway, etc.)
+
+### Basic Chat Request (curl)
+
+```bash
+curl -X POST http://localhost:8001/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer anything" \
+  -d '{
+    "model": "gemini-3-flash-preview",
+    "messages": [
+      {"role": "user", "content": "Hello, how are you?"}
+    ]
+  }'
+```
+
+### Python Example
+
+```python
+import requests
+
+response = requests.post(
+    "http://localhost:8001/v1/chat/completions",
+    headers={"Authorization": "Bearer anything"},
+    json={
+        "model": "gemini-3-flash-preview",
+        "messages": [
+            {"role": "user", "content": "Explain quantum computing"}
+        ]
+    }
+)
+print(response.json()["choices"][0]["message"]["content"])
+```
+
+### Using OpenAI Python SDK
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8001/v1",
+    api_key="anything"  # API key is ignored but required by SDK
+)
+
+response = client.chat.completions.create(
+    model="gemini-3-flash-preview",
+    messages=[
+        {"role": "user", "content": "Write a poem about coding"}
+    ]
+)
+print(response.choices[0].message.content)
+```
+
+### JavaScript/TypeScript Example
+
+```javascript
+const response = await fetch('http://localhost:8001/v1/chat/completions', {
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json',
+    'Authorization': 'Bearer anything'
+  },
+  body: JSON.stringify({
+    model: 'gemini-3-flash-preview',
+    messages: [
+      { role: 'user', content: 'Hello!' }
+    ]
+  })
+});
+
+const data = await response.json();
+console.log(data.choices[0].message.content);
+```
+
+### Image Upload (Vision API)
+
+```python
+import base64
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8001/v1", api_key="anything")
+
+# Read and encode image
+with open("image.png", "rb") as f:
+    image_b64 = base64.b64encode(f.read()).decode()
+
+response = client.chat.completions.create(
+    model="gemini-3-flash-preview",
+    messages=[
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "What's in this image?"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{image_b64}"}
+                }
+            ]
+        }
+    ]
+)
+print(response.choices[0].message.content)
+```
+
+### Response Format
+
+```json
+{
+  "id": "chatcmpl-1234567890",
+  "object": "chat.completion",
+  "created": 1766152800,
+  "model": "gemini-3-flash-preview",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Hello! I'm doing well, thank you for asking..."
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 12,
+    "completion_tokens": 45,
+    "total_tokens": 57
+  }
+}
+```
+
+---
+
+### AI Studio Models
 | Model | Description |
 |-------|-------------|
 | `gemini-3-flash-preview` | Fast responses (default: High thinking) |
@@ -81,6 +218,14 @@ See [DEPLOY_LOCAL.md](DEPLOY_LOCAL.md) for full headless server setup guide.
 | `gemini-3-flash-preview-high` | High thinking |
 | `gemini-3-pro-preview` | More capable model |
 
+### Gemini Web Models (gemini.google.com)
+Set `PROVIDER=gemini-web` in your `.env`.
+| Model | Description |
+|-------|-------------|
+| `fast` | Quick responses |
+| `thinking` | Complex problem solving |
+| `pro` | Advanced math & reasoning |
+
 ---
 
 ## Configuration (.env)
@@ -88,6 +233,7 @@ See [DEPLOY_LOCAL.md](DEPLOY_LOCAL.md) for full headless server setup guide.
 ```env
 HEADLESS=true      # false to see the browser
 WORKER_COUNT=1     # Number of concurrent browser tabs
+PROVIDER=aistudio  # "aistudio" or "gemini-web"
 ```
 
 ---

@@ -19,6 +19,7 @@ from core import WorkerPool
 
 # Configuration
 WORKER_COUNT = int(os.getenv("WORKER_COUNT", "1"))
+PROVIDER = os.getenv("PROVIDER", "aistudio").lower() # aistudio or gemini-web
 
 # Global State
 worker_pool: Optional[WorkerPool] = None
@@ -35,7 +36,7 @@ async def init_browser_thread():
     browser_thread = threading.Thread(target=run_browser_loop, args=(browser_loop,), daemon=True)
     browser_thread.start()
     
-    worker_pool = WorkerPool(worker_count=WORKER_COUNT)
+    worker_pool = WorkerPool(worker_count=WORKER_COUNT, provider=PROVIDER)
     # Empty cookies - we use persistent browser session instead
     future = asyncio.run_coroutine_threadsafe(worker_pool.init([]), browser_loop)
     return future.result(timeout=120)
@@ -84,6 +85,14 @@ def parse_model_and_thinking(model_name: str) -> tuple:
         gemini-3-flash-preview -> (gemini-3-flash-preview, High)
         gemini-3-flash-preview-minimal -> (gemini-3-flash-preview, Minimal)
     """
+    if PROVIDER == "gemini-web":
+        # Gemini Web uses simplified names: Fast, Thinking, Pro
+        if "thinking" in model_name.lower():
+            return "Thinking", "High"
+        if "pro" in model_name.lower():
+            return "Pro", "High"
+        return "Fast", "High"
+
     thinking_levels = ["minimal", "low", "medium", "high"]
     
     for level in thinking_levels:
@@ -97,6 +106,14 @@ def parse_model_and_thinking(model_name: str) -> tuple:
 
 @app.get("/v1/models")
 async def list_models():
+    if PROVIDER == "gemini-web":
+        return {
+            "data": [
+                {"id": "fast", "object": "model"},
+                {"id": "thinking", "object": "model"},
+                {"id": "pro", "object": "model"},
+            ]
+        }
     return {
         "data": [
             {"id": "gemini-3-pro-preview", "object": "model"},

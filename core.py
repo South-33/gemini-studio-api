@@ -11,7 +11,36 @@ LOW_MEMORY_MODE = os.getenv("LOW_MEMORY_MODE", "true").lower() == "true"
 # Slow VM mode: use JavaScript clicks instead of Playwright clicks (for e2-micro etc)
 SLOW_VM_MODE = os.getenv("SLOW_VM_MODE", "true").lower() == "true"
 
-class AIStudioAutomation:
+class BaseAutomation:
+    """Base class for browser-based AI automation."""
+    def __init__(self):
+        self.playwright = None
+        self.browser: Optional[Browser] = None
+        self.context: Optional[BrowserContext] = None
+        self.page: Optional[Page] = None
+        self._initialized = False
+        self._owns_browser = False
+        self._generation_in_progress = False
+        self._pending_result: Optional[Dict] = None
+        self._last_activity = time.time()
+
+    async def init_with_page(self, page: Page, context: BrowserContext) -> bool:
+        raise NotImplementedError
+
+    async def send_message(self, prompt: str, **kwargs) -> Dict:
+        raise NotImplementedError
+
+    async def close(self):
+        try:
+            if self.page: await self.page.close()
+            if self._owns_browser:
+                if self.context: await self.context.close()
+                if self.browser: await self.browser.close()
+                if self.playwright: await self.playwright.stop()
+        except:
+            pass
+
+class AIStudioAutomation(BaseAutomation):
     URL = "https://aistudio.google.com/"
     PLAYGROUND_URL = "https://aistudio.google.com/prompts/new_chat"
     
@@ -41,16 +70,7 @@ class AIStudioAutomation:
     ]
 
     def __init__(self):
-        self.playwright = None
-        self.browser: Optional[Browser] = None
-        self.context: Optional[BrowserContext] = None
-        self.page: Optional[Page] = None
-        self._initialized = False
-        self._owns_browser = False
-        # Pending generation tracking (for Koyeb 100s timeout handling)
-        self._generation_in_progress = False
-        self._pending_result: Optional[Dict] = None
-        self._last_activity = time.time()
+        super().__init__()
         self._is_sleeping = False
         self._wake_lock = asyncio.Lock()
         self._idle_lock = asyncio.Lock()
@@ -574,19 +594,247 @@ class AIStudioAutomation:
 
 
     async def close(self):
+        await super().close()
+
+class GeminiWebAutomation(BaseAutomation):
+    URL = "https://gemini.google.com/"
+    
+    # Selectors discovered during research
+    SELECTORS = {
+        "input": 'div[role="textbox"][aria-label="Enter a prompt here"]',
+        "send_btn": 'button[aria-label="Send message"]',
+        "model_btn": 'button.input-area-switch',
+        "new_chat": 'button[aria-label="New chat"]',
+        "temp_chat": 'button[aria-label="Temporary chat"]',
+        "copy_btn": 'button[aria-label="Copy"]',
+        "menu_panel": '.mat-mdc-menu-panel',
+        "menu_item": 'button.mat-mdc-menu-item'
+    }
+
+    async def init_with_page(self, page: Page, context: BrowserContext) -> bool:
+        self.page = page
+        self.context = context
         try:
-            if self.page: await self.page.close()
-            if self._owns_browser:
-                if self.context: await self.context.close()
-                if self.browser: await self.browser.close()
-                if self.playwright: await self.playwright.stop()
+            # Wait for input to be ready (login check)
+            await self.page.wait_for_selector(self.SELECTORS["input"], timeout=30000)
+            print("[GeminiWeb] ✅ Logged in and ready")
+            
+            # Default to Temporary Chat if possible for clean sessions
+            await self._enable_temp_chat()
+            
+            self._initialized = True
+            return True
+        except Exception as e:
+            print(f"[GeminiWeb] ❌ Init failed: {e}")
+            return False
+
+    async def _enable_temp_chat(self):
+        """Try to enable temporary chat if it's not already on."""
+        try:
+            # First check if sidebar is open or needs opening
+            # For now, just try to click if visible
+            temp_btn = self.page.locator(self.SELECTORS["temp_chat"])
+            if await temp_btn.is_visible():
+                await temp_btn.click()
+                print("[GeminiWeb] ✅ Enabled Temporary Chat")
         except:
             pass
 
+    async def send_message(self, prompt: str, model: str = None, thinking_level: str = None, use_search: bool = False, images: List[str] = None) -> Dict:
+        if not self._initialized: return {"success": False, "error": "Not initialized"}
+        
+        if self._pending_result:
+            res = self._pending_result
+            self._pending_result = None
+            return res
+
+        try:
+            self._generation_in_progress = True
+            
+            # 1. New Chat (starts fresh)
+            print("[GeminiWeb] Starting new chat...")
+            new_chat_btn = self.page.locator(self.SELECTORS["new_chat"]).first
+            if await new_chat_btn.is_visible():
+                await new_chat_btn.click()
+                await asyncio.sleep(1)
+
+            # 2. Select Model
+            if model:
+                await self._select_model(model)
+
+            # 3. Enter Prompt
+            print(f"[GeminiWeb] Entering prompt...")
+            input_area = self.page.locator(self.SELECTORS["input"])
+            await input_area.click()
+            
+            # 3.5 Paste Images (if provided)
+            if images:
+                for img_path in images:
+                    await self._paste_image(img_path)
+            
+            await input_area.fill(prompt)
+            await asyncio.sleep(0.5)
+
+            # 4. Click Send
+            await self.page.click(self.SELECTORS["send_btn"])
+            
+            # 5. Wait for Response (Copy button to appear)
+            print("[GeminiWeb] Waiting for response...")
+            # We wait for the Copy button of the LAST message to be visible
+            # but usually it's better to wait for the generation to stop (no more loading states)
+            await asyncio.sleep(2) # Initial wait
+            
+            # Polling for copy button
+            start_time = time.time()
+            max_wait = 120
+            copy_btn = None
+            while (time.time() - start_time) < max_wait:
+                btns = self.page.locator(self.SELECTORS["copy_btn"])
+                count = await btns.count()
+                if count > 0:
+                    copy_btn = btns.nth(count - 1)
+                    if await copy_btn.is_visible():
+                        break
+                await asyncio.sleep(1)
+            
+            if not copy_btn:
+                 return {"success": False, "error": "Timeout waiting for copy button"}
+
+            # 6. Extraction via Copy Button
+            print("[GeminiWeb] Extracting markdown...")
+            await copy_btn.click()
+            await asyncio.sleep(0.5) # Wait for clipboard
+            
+            markdown = await self.page.evaluate("navigator.clipboard.readText()")
+            self._generation_in_progress = False
+            
+            if not markdown:
+                return {"success": False, "error": "Clipboard empty after copy"}
+
+            result = {"success": True, "response": markdown.strip()}
+            self._pending_result = result
+            return result
+
+        except Exception as e:
+            self._generation_in_progress = False
+            print(f"[GeminiWeb] Error: {e}")
+            # Retry extraction once via DOM fallback
+            return await self._fallback_extract()
+
+    async def _fallback_extract(self) -> Dict:
+        """Fallback extraction via DOM if copy button fails."""
+        try:
+            text = await self.page.evaluate('''
+                () => {
+                    const responses = document.querySelectorAll('[data-content-type="response"]');
+                    if (responses.length === 0) return null;
+                    const last = responses[responses.length - 1];
+                    return last.innerText;
+                }
+            ''')
+            if text and len(text) > 20:
+                return {"success": True, "response": text.strip()}
+        except:
+            pass
+        return {"success": False, "error": "Extraction failed"}
+
+    async def _select_model(self, model_name: str):
+        """Select model from dropdown (Fast, Thinking, Pro)."""
+        try:
+            # Click the pill
+            btn = self.page.locator(self.SELECTORS["model_btn"])
+            current = await btn.inner_text()
+            if model_name.lower() in current.lower():
+                return
+            
+            await btn.click()
+            await asyncio.sleep(0.5)
+            
+            # Select from menu
+            items = self.page.locator(self.SELECTORS["menu_item"])
+            for i in range(await items.count()):
+                item = items.nth(i)
+                text = await item.inner_text()
+                if model_name.lower() in text.lower():
+                    await item.click()
+                    print(f"[GeminiWeb] ✅ Selected model: {model_name}")
+                    await asyncio.sleep(0.5)
+                    return
+            # If not found, close menu
+            await self.page.keyboard.press("Escape")
+        except Exception as e:
+            print(f"[GeminiWeb] ⚠️ Model selection failed: {e}")
+
+    async def _wait_and_extract_pending(self) -> Dict:
+        # Simplified for web: just try to extract if button exists
+        btns = self.page.locator(self.SELECTORS["copy_btn"])
+        count = await btns.count()
+        if count > 0:
+            copy_btn = btns.nth(count - 1)
+            await copy_btn.click()
+            await asyncio.sleep(0.5)
+            markdown = await self.page.evaluate("navigator.clipboard.readText()")
+            if markdown:
+                return {"success": True, "response": markdown.strip()}
+        return {"success": False, "error": "Still generating or failed"}
+
+    async def _paste_image(self, image_path: str):
+        """Paste an image via clipboard into Gemini Web."""
+        try:
+            print(f"[GeminiWeb] Pasting image: {image_path}")
+            
+            with open(image_path, 'rb') as f:
+                image_data = f.read()
+            
+            import base64
+            base64_image = base64.b64encode(image_data).decode('utf-8')
+            
+            ext = image_path.split('.')[-1].lower()
+            mime_map = {
+                'png': 'image/png',
+                'jpg': 'image/jpeg',
+                'jpeg': 'image/jpeg',
+                'gif': 'image/gif',
+                'webp': 'image/webp'
+            }
+            mime_type = mime_map.get(ext, 'image/png')
+            
+            # Focus input first
+            input_area = self.page.locator(self.SELECTORS["input"])
+            await input_area.click()
+            await asyncio.sleep(0.1)
+            
+            # Write image to clipboard
+            await self.page.evaluate(f'''
+                async () => {{
+                    const base64 = "{base64_image}";
+                    const mimeType = "{mime_type}";
+                    const byteCharacters = atob(base64);
+                    const byteNumbers = new Array(byteCharacters.length);
+                    for (let i = 0; i < byteCharacters.length; i++) {{
+                        byteNumbers[i] = byteCharacters.charCodeAt(i);
+                    }}
+                    const byteArray = new Uint8Array(byteNumbers);
+                    const blob = new Blob([byteArray], {{ type: mimeType }});
+                    const item = new ClipboardItem({{ [mimeType]: blob }});
+                    await navigator.clipboard.write([item]);
+                }}
+            ''')
+            
+            await self.page.keyboard.press("Control+v")
+            await asyncio.sleep(1.0)
+            print(f"[GeminiWeb] ✅ Image pasted")
+        except Exception as e:
+            print(f"[GeminiWeb] ⚠️ Image paste warning: {e}")
+
+    async def close(self):
+        await super().close()
+
 class WorkerPool:
-    def __init__(self, worker_count: int = 2):
+    def __init__(self, worker_count: int = 1, provider: str = "aistudio"):
         self.worker_count = worker_count
-        self.workers: List[AIStudioAutomation] = []
+        self.provider = provider.lower()
+        self.workers: List[BaseAutomation] = []  # Can be AIStudio or GeminiWeb
         self.available_workers = asyncio.Queue()
         self.shared_context = None
         self.playwright = None
@@ -703,7 +951,8 @@ class WorkerPool:
                 print(f"[WorkerPool] Re-opening tab {i + 1}...")
                 page = await self.shared_context.new_page()
                 try:
-                    await page.goto(AIStudioAutomation.PLAYGROUND_URL, timeout=60000, wait_until="networkidle")
+                    target_url = AIStudioAutomation.PLAYGROUND_URL if self.provider == "aistudio" else GeminiWebAutomation.URL
+                    await page.goto(target_url, timeout=60000, wait_until="networkidle")
                 except Exception as e:
                     print(f"[WorkerPool] ⚠️ Wake-up tab {i+1} warning: {e}")
                 
@@ -778,20 +1027,21 @@ class WorkerPool:
                 await self.shared_context.route("**/*", self._block_resources)
 
             # Create tabs
-            print(f"[WorkerPool] Creating {self.worker_count} worker tabs...")
+            print(f"[WorkerPool] Creating {self.worker_count} {self.provider} worker tabs...")
             tasks = []
             for i in range(self.worker_count):
                 print(f"[WorkerPool] Opening tab {i + 1}...")
                 page = await self.shared_context.new_page()
                 
-                print(f"[WorkerPool] Navigating tab {i + 1} to AI Studio...")
+                print(f"[WorkerPool] Navigating tab {i + 1} to {self.provider}...")
+                target_url = AIStudioAutomation.PLAYGROUND_URL if self.provider == "aistudio" else GeminiWebAutomation.URL
                 try:
-                    await page.goto(AIStudioAutomation.PLAYGROUND_URL, timeout=60000, wait_until="networkidle")
+                    await page.goto(target_url, timeout=60000, wait_until="networkidle")
                     print(f"[WorkerPool] ✅ Tab {i + 1} loaded: {page.url}")
                 except Exception as nav_err:
                     print(f"[WorkerPool] ⚠️ Tab {i + 1} navigation warning: {nav_err}")
                 
-                worker = AIStudioAutomation()
+                worker = AIStudioAutomation() if self.provider == "aistudio" else GeminiWebAutomation()
                 tasks.append(worker.init_with_page(page, self.shared_context))
                 self.workers.append(worker)
             
