@@ -15,8 +15,9 @@ timeout /t 10 /nobreak >nul
 echo [2/3] Starting API server...
 start "GeminiAPI" cmd /c "python main.py"
 
-:: Wait for API to initialize
-timeout /t 15 /nobreak >nul
+:: Wait for API to initialize (dual-provider takes longer)
+echo Waiting for dual-provider initialization...
+timeout /t 45 /nobreak >nul
 
 :: Start Cloudflare Tunnel
 echo [3/3] Starting Cloudflare Tunnel...
