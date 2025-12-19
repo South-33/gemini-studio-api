@@ -13,7 +13,7 @@ timeout /t 10 /nobreak >nul
 
 :: Start the API in background
 echo [2/3] Starting API server...
-start /min "GeminiAPI" cmd /c "python main_bridge.py"
+start /min "GeminiAPI" cmd /c "python main.py"
 
 :: Wait for API to initialize
 timeout /t 15 /nobreak >nul
