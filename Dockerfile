@@ -1,5 +1,5 @@
-# Gemini Studio API - Dockerfile for Koyeb
-# Optimized for 4GB RAM / 4 CPU instances
+# Gemini Studio API - Dockerfile
+# For local server deployment with Cloudflare Tunnel
 
 FROM python:3.11-slim-bookworm
 
@@ -40,7 +40,7 @@ RUN playwright install chromium --with-deps
 # Copy application code
 COPY . .
 
-# Default environment variables (optimized for Koyeb 4GB/4CPU)
+# Default environment variables
 ENV PORT=8000 \
     WORKER_COUNT=4 \
     HEADLESS=true \

@@ -131,7 +131,7 @@ class AIStudioAutomation(BaseAutomation):
     async def _wait_and_extract_pending(self) -> Dict:
         """
         Handle retry after HTTP timeout - wait for any in-progress generation and extract result.
-        Called when client retries after Koyeb's 100s timeout.
+        Called when client retries after a timeout.
         """
         try:
             # Check if Run button shows "Stop" (still generating)
@@ -881,11 +881,12 @@ class WorkerPool:
         self.playwright = None
         self._initialized = False
         
-        # Request tracking for Koyeb timeout handling
+        # Request tracking for timeout/retry handling
         self._active_requests: Dict[str, str] = {}  # prompt_hash -> provider
         self._pending_results: Dict[str, Dict] = {}  # prompt_hash -> result
         self._result_timestamps: Dict[str, float] = {}  # prompt_hash -> timestamp
         self._lock = asyncio.Lock()
+        self._browser_semaphore = asyncio.Semaphore(1)  # Serialize browser access
         self.RESULT_TTL = 10  # Results expire after 10 seconds (just for timeout retries)
         
         # Idle/Keepalive settings
@@ -1153,21 +1154,21 @@ class WorkerPool:
 
     async def send_message(self, prompt: str, model: str = None, thinking_level: str = None, use_search: bool = False, images: List[str] = None) -> Dict:
         """
-        Send message with proper request tracking for Koyeb timeout handling.
-        If this prompt was already submitted and is pending, wait for that result.
+        Send message with proper request serialization.
+        Requests are processed sequentially to prevent browser automation conflicts.
         """
         prompt_hash = self._hash_prompt(prompt)
+        
+        # Check sleep mode and wake up OUTSIDE the lock (wake-up can take 60s+)
+        if self._is_sleeping:
+            print("[WorkerPool] 🛌 System is sleeping, triggering wake up...")
+            await self._wake_up()
         
         async with self._lock:
             await self._cleanup_stale()
             
             # Update activity
             self._last_activity = time.time()
-            
-            # Handle sleep mode
-            if self._is_sleeping:
-                print("[WorkerPool] 🛌 System is sleeping, triggering wake up...")
-                await self._wake_up()
 
             # Check if we have a cached result for this exact prompt
             if prompt_hash in self._pending_results:
@@ -1178,13 +1179,28 @@ class WorkerPool:
                 return result
             
             # Check if this prompt is already being processed
-            if prompt_hash in self._active_requests:
-                # Just wait - the result will come from the active worker
+            is_duplicate = prompt_hash in self._active_requests
+            if is_duplicate:
                 print(f"[WorkerPool] ⏳ Request {prompt_hash} already in progress, waiting...")
-                await asyncio.sleep(5)  # Wait for active request
-                if prompt_hash in self._pending_results:
-                    result = self._pending_results.pop(prompt_hash)
-                    return result
+        
+        # If duplicate detected, wait outside the lock for result
+        if is_duplicate:
+            wait_start = time.time()
+            max_wait = 300  # 5 minute timeout for duplicate requests
+            while time.time() - wait_start < max_wait:
+                await asyncio.sleep(2)  # Poll every 2 seconds
+                async with self._lock:
+                    if prompt_hash in self._pending_results:
+                        result = self._pending_results.pop(prompt_hash)
+                        self._result_timestamps.pop(prompt_hash, None)
+                        print(f"[WorkerPool] ✅ Got result for duplicate request {prompt_hash}")
+                        return result
+                    if prompt_hash not in self._active_requests:
+                        # Original request finished but result was already consumed
+                        break
+            # Timeout or result consumed - let this request proceed (will re-run prompt)
+            print(f"[WorkerPool] ⚠️ Duplicate wait timeout/consumed for {prompt_hash}, proceeding")
+        
         # Route to correct provider based on model
         target_provider = self._route_model(model)
         print(f"[WorkerPool] Routing to {target_provider} for model '{model}'")
@@ -1204,20 +1220,23 @@ class WorkerPool:
         if not worker:
             return {"success": False, "error": f"Worker for {target_provider} not available"}
         
-        async with self._lock:
-            self._active_requests[prompt_hash] = target_provider
-        
-        try:
-            result = await worker.send_message(prompt, model, thinking_level, use_search, images)
-            
+        # Serialize browser access - only one request can use the browser at a time
+        async with self._browser_semaphore:
             async with self._lock:
-                self._pending_results[prompt_hash] = result
-                self._result_timestamps[prompt_hash] = time.time()
-                self._active_requests.pop(prompt_hash, None)
+                self._active_requests[prompt_hash] = target_provider
             
-            return result
-        finally:
-            self._last_activity = time.time()
+            try:
+                result = await worker.send_message(prompt, model, thinking_level, use_search, images)
+                
+                async with self._lock:
+                    self._pending_results[prompt_hash] = result
+                    self._result_timestamps[prompt_hash] = time.time()
+                    self._active_requests.pop(prompt_hash, None)
+                
+                return result
+            finally:
+                self._last_activity = time.time()
+
 
     async def close(self):
         # Cancel background tasks
