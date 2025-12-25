@@ -8,7 +8,7 @@ import time
 from typing import List, Optional, Dict, Union
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 
@@ -59,22 +59,20 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 # --- Models ---
 
 class OpenAIMessage(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    
     role: str
     content: Union[str, List[Dict]]  # Support both text and multipart (Vision API)
-    
-    class Config:
-        extra = "allow"
 
 class OpenAIChatRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    
     model: str
     messages: List[OpenAIMessage]
     temperature: Optional[float] = 1.0
     stream: bool = False  # Ignored, but accepted for compatibility
     thinking_level: Optional[str] = None
     use_search: Optional[bool] = False
-    
-    class Config:
-        extra = "allow"
 
 # --- Helpers ---
 
@@ -227,7 +225,7 @@ async def health():
 if __name__ == "__main__":
     import uvicorn
     import sys
-    if sys.platform == 'win32':
-        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    # Note: Windows event loop policy is set automatically in Python 3.8+
+    # The deprecated set_event_loop_policy warning can be ignored
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port)

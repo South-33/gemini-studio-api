@@ -619,6 +619,8 @@ class GeminiWebAutomation(BaseAutomation):
         "model_btn": 'button.input-area-switch',
         "new_chat": 'button[aria-label="New chat"]',
         "temp_chat": 'button[aria-label="Temporary chat"]',
+        "temp_chat_active": 'button[aria-label="Temporary chat"].temp-chat-on',
+        "sidebar_toggle": 'button[aria-label="Main menu"]',
         "copy_btn": 'button[aria-label="Copy"]',
         "menu_panel": '.mat-mdc-menu-panel',
         "menu_item": 'button.mat-mdc-menu-item'
@@ -644,17 +646,63 @@ class GeminiWebAutomation(BaseAutomation):
             return False
 
     async def _enable_temp_chat(self):
-        """Try to enable temporary chat if it's not already on."""
+        """
+        Enable temporary chat mode. 
+        The temp chat button is only visible when sidebar is expanded.
+        We need to expand sidebar -> click temp chat -> collapse sidebar.
+        """
         try:
-            # First check if sidebar is open or needs opening
-            # For now, just try to click if visible
             temp_btn = self.page.locator(self.SELECTORS["temp_chat"])
+            sidebar_expanded = False
+            
+            # Check if temp chat is already enabled (has temp-chat-on class)
+            temp_active = self.page.locator(self.SELECTORS["temp_chat_active"])
+            if await temp_active.count() > 0:
+                print("[GeminiWeb] ✅ Temporary chat already enabled")
+                return
+            
+            # Check if button is visible (sidebar expanded)
+            if not await temp_btn.is_visible():
+                print("[GeminiWeb] 🔍 Temp chat button not visible, expanding sidebar...")
+                sidebar_btn = self.page.locator(self.SELECTORS["sidebar_toggle"])
+                if await sidebar_btn.is_visible():
+                    await sidebar_btn.click()
+                    await self._human_delay(300, 500)
+                    sidebar_expanded = True
+                    print("[GeminiWeb] 📂 Sidebar expanded")
+                else:
+                    print("[GeminiWeb] ⚠️ Sidebar toggle button not found")
+                    return
+            
+            # Now try to click temp chat button
             if await temp_btn.is_visible():
-                await temp_btn.click()
-                await self._human_delay(200, 500)
-                print("[GeminiWeb] ✅ Enabled Temporary Chat")
-        except:
-            pass
+                # Check if already active before clicking
+                temp_active = self.page.locator(self.SELECTORS["temp_chat_active"])
+                if await temp_active.count() > 0:
+                    print("[GeminiWeb] ✅ Temporary chat already enabled (after expand)")
+                else:
+                    await temp_btn.click()
+                    await self._human_delay(200, 400)
+                    
+                    # Verify it worked
+                    temp_active = self.page.locator(self.SELECTORS["temp_chat_active"])
+                    if await temp_active.count() > 0:
+                        print("[GeminiWeb] ✅ Temporary chat enabled successfully")
+                    else:
+                        print("[GeminiWeb] ⚠️ Clicked temp chat but state unclear")
+            else:
+                print("[GeminiWeb] ❌ Temp chat button still not visible after expanding sidebar")
+            
+            # Collapse sidebar back to keep UI clean
+            if sidebar_expanded:
+                sidebar_btn = self.page.locator(self.SELECTORS["sidebar_toggle"])
+                if await sidebar_btn.is_visible():
+                    await sidebar_btn.click()
+                    await self._human_delay(200, 400)
+                    print("[GeminiWeb] 📁 Sidebar collapsed")
+                    
+        except Exception as e:
+            print(f"[GeminiWeb] ❌ Temp chat error: {e}")
 
     async def send_message(self, prompt: str, model: str = None, thinking_level: str = None, use_search: bool = False, images: List[str] = None) -> Dict:
         if not self._initialized: 
