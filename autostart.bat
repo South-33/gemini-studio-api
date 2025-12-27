@@ -13,7 +13,7 @@ timeout /t 10 /nobreak >nul
 
 :: Start the API in background
 echo [2/3] Starting API server...
-start "GeminiAPI" cmd /c "python main.py"
+start "GeminiAPI" /min cmd /c "python main.py"
 
 :: Wait for API with timeout (max 60 seconds)
 echo Waiting for API to be ready (max 60s)...
@@ -24,7 +24,6 @@ set /a max_tries=20
 set /a counter+=1
 echo   Attempt %counter%/%max_tries%...
 
-:: Simple curl-style check using PowerShell
 powershell -Command "(Invoke-WebRequest -Uri 'http://localhost:8000/health' -UseBasicParsing -TimeoutSec 3).StatusCode" 2>nul | findstr "200" >nul
 
 if %errorlevel% equ 0 (
@@ -41,19 +40,40 @@ timeout /t 3 /nobreak >nul
 goto check_api
 
 :api_ready
-:: Extra wait for browser to fully initialize
-echo Waiting 10s for browser to stabilize...
+echo [3/3] Waiting 10s for browser to stabilize...
 timeout /t 10 /nobreak >nul
 
-:: Start Cloudflare Tunnel with auto-restart
-:tunnel_start
+:: Start Cloudflare Tunnel in BACKGROUND (minimized)
 echo.
-echo [3/3] Starting Cloudflare Tunnel...
 echo ==========================================
-cloudflared tunnel --url http://localhost:8000
+echo   Starting Cloudflare Tunnel + Keepalive
+echo ==========================================
+start "CloudflareTunnel" /min cmd /c "cloudflared tunnel --url http://localhost:8000"
 
-:: If cloudflared exits, restart it
-echo.
-echo [Tunnel] ⚠️ Tunnel exited. Restarting in 5s...
+:: Give tunnel time to register
 timeout /t 5 /nobreak >nul
-goto tunnel_start
+
+:: Keepalive loop (runs forever, keeps tunnel warm)
+echo [Keepalive] Pinging every 2 minutes to prevent idle timeout...
+echo.
+
+:keepalive
+:: Check if cloudflared process is still running
+tasklist /FI "IMAGENAME eq cloudflared.exe" 2>nul | find /I "cloudflared.exe" >nul
+if %errorlevel% neq 0 (
+    echo [Tunnel] ⚠️ Tunnel process died! Restarting...
+    start "CloudflareTunnel" /min cmd /c "cloudflared tunnel --url http://localhost:8000"
+    timeout /t 5 /nobreak >nul
+)
+
+:: Ping health endpoint to keep tunnel warm
+powershell -Command "(Invoke-WebRequest -Uri 'http://localhost:8000/health' -UseBasicParsing -TimeoutSec 5).StatusCode" 2>nul | findstr "200" >nul
+if %errorlevel% equ 0 (
+    echo [%time%] ✅ Keepalive OK
+) else (
+    echo [%time%] ⚠️ Keepalive failed (API might be busy)
+)
+
+:: Wait 5 minutes (well under ~16 min idle timeout)
+timeout /t 300 /nobreak >nul
+goto keepalive
