@@ -1,14 +1,17 @@
 # Gemini Studio API
 
-A lightweight API that automates Google AI Studio to provide OpenAI-compatible endpoints. Use Gemini 2.5 Pro/Flash with thinking levels directly from Roo Code, Cursor, or any OpenAI-compatible tool.
+A lightweight API that automates Google AI Studio to provide OpenAI-compatible endpoints. Use Gemini Pro/Flash with thinking levels directly from Roo Code, Cursor, or any OpenAI-compatible tool.
 
 - **Multi-Provider** - Supports both **Google AI Studio** and **Gemini Web** (gemini.google.com)
 - **OpenAI Compatible** - Works with Cursor, Roo Code, Continue, etc.
 - **Thinking Levels** - Control via model name suffix: `-minimal`, `-low`, `-medium`, `-high`
-- **Simplified Models** - Use `pro`, `thinking`, or `fast` with Gemini Web
-- **Image Upload** - Send images via OpenAI Vision API format (Supported on both providers)
+- **Simplified Models** - Use `thinking`, `pro`, or `fast` with Gemini Web (recommended)
+- **Image Upload** - Send images via OpenAI Vision API format
 - **Session Persistence** - Login once via Chrome, stays authenticated forever
 - **Cloudflare Tunnel** - Expose your local API to the internet for free
+- **Self-Healing** - Auto-recovers from stuck UI states and errors
+
+> ⚠️ **Note**: AI Studio has bot detection that may block automation. **Gemini Web models (`thinking`, `pro`, `fast`) are recommended** for reliable operation.
 
 ---
 
@@ -66,7 +69,7 @@ See [DEPLOY_LOCAL.md](DEPLOY_LOCAL.md) for full headless server setup guide.
 | **Provider** | OpenAI Compatible |
 | **Base URL** | `https://your-tunnel-url.trycloudflare.com/v1` |
 | **API Key** | `anything` (ignored) |
-| **Model** | `gemini-3-flash-preview` |
+| **Model** | `thinking` (recommended) or `pro`, `fast` |
 
 ---
 
@@ -212,7 +215,7 @@ print(response.choices[0].message.content)
 
 ---
 
-### AI Studio Models
+### AI Studio Models (⚠️ May be blocked by bot detection)
 | Model | Description |
 |-------|-------------|
 | `gemini-3-flash-preview` | Fast responses (default: High thinking) |
@@ -222,7 +225,9 @@ print(response.choices[0].message.content)
 | `gemini-3-flash-preview-high` | High thinking |
 | `gemini-3-pro-preview` | More capable model |
 
-### Gemini Web Models (gemini.google.com)
+> ⚠️ AI Studio has aggressive bot detection. These models may fail frequently. Use Gemini Web models below for reliability.
+
+### Gemini Web Models ✅ (Recommended)
 | Model | Description |
 |-------|-------------|
 | `fast` | Quick responses |
@@ -268,6 +273,18 @@ PROVIDER=auto      # "auto" (default), "aistudio", or "gemini-web"
 | Session expired | Run `python setup_session.py` and login again |
 | 502 Bad Gateway | Make sure API is running (`python main.py`) |
 | Cloudflare can't connect | Use `http://` not `https://` in tunnel command |
+| Extraction failed (500 errors) | Usually auto-recovers. If persistent, restart the API |
+| High CPU usage | Normal during generation. Polling is optimized to reduce load |
+| Stuck overlay/modal | Auto-dismissed on next request. Hard refresh every 10 requests |
+
+### Automatic Recovery Features
+
+The API includes several self-healing mechanisms:
+
+- **Overlay Dismissal**: Automatically clears stuck Angular Material modals/menus before each request
+- **Periodic Hard Refresh**: Browser tab refreshes every 10 requests to clear memory/cache buildup
+- **Error Recovery**: On failure, the page automatically refreshes to reset state for the next request
+- **Optimized Polling**: Reduced polling frequency to minimize CPU pressure on low-resource hosts
 
 ---
 

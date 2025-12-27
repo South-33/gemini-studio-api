@@ -75,6 +75,9 @@ class AIStudioAutomation(BaseAutomation):
         "--disable-component-extensions-with-background-pages",
     ]
 
+    # Hard refresh every N requests to clear browser cache/memory
+    REFRESH_EVERY_N_REQUESTS = 10
+    
     def __init__(self):
         super().__init__()
         self._is_sleeping = False
@@ -83,6 +86,7 @@ class AIStudioAutomation(BaseAutomation):
         self._keepalive_task = None
         self._idle_task = None
         self._stop_tasks = False
+        self._request_count = 0
 
     async def init_with_page(self, page: Page, context: BrowserContext) -> bool:
         """Initialize with externally provided page (multi-tab mode)."""
@@ -174,12 +178,20 @@ class AIStudioAutomation(BaseAutomation):
 
         try:
             self._generation_in_progress = True
+            self._request_count += 1
             
-            # 0. Dismiss any popups/tooltips
+            # 0. Periodic hard refresh to clear browser cache/memory
+            if self._request_count >= self.REFRESH_EVERY_N_REQUESTS:
+                print(f"[AIStudio] 🔄 Hard refresh (clearing cache after {self._request_count} requests)...")
+                await self.page.reload(wait_until="domcontentloaded", timeout=30000)
+                await self._human_delay(1000, 1500)
+                self._request_count = 0
+            
+            # 1. Dismiss any popups/tooltips
             await self.page.keyboard.press("Escape")
             await self._human_delay(400, 800)
             
-            # 1. Navigate to new chat via URL (more reliable than clicking)
+            # 2. Navigate to new chat via URL (more reliable than clicking)
             print("[AIStudio] Creating new chat session...")
             await self.page.goto(self.PLAYGROUND_URL, wait_until="domcontentloaded", timeout=30000)
             await self._human_delay(1500, 2500)  # Let page stabilize
@@ -247,6 +259,15 @@ class AIStudioAutomation(BaseAutomation):
         except Exception as e:
             self._generation_in_progress = False
             print(f"[AIStudio] Interaction error: {e}")
+            
+            # Force refresh to reset page state for next request
+            try:
+                print("[AIStudio] 🔄 Error recovery: refreshing page...")
+                await self.page.reload(wait_until="domcontentloaded", timeout=15000)
+                self._request_count = 0  # Reset counter since we just refreshed
+            except:
+                pass
+            
             return {"success": False, "error": str(e)}
 
 
@@ -400,7 +421,7 @@ class AIStudioAutomation(BaseAutomation):
                         break
                 except:
                     pass
-                await asyncio.sleep(0.1) # Keep this as a short, consistent poll
+                await asyncio.sleep(0.5)  # Reduced CPU pressure (was 0.1)
             
             if not generation_started:
                 print("[AIStudio] Generation may have finished instantly or failed to start")
@@ -425,7 +446,7 @@ class AIStudioAutomation(BaseAutomation):
                 except:
                     pass
                 
-                await asyncio.sleep(1)  # Poll every 1 second
+                await asyncio.sleep(2)  # Poll every 2 seconds (reduced CPU pressure)
             
             # Content stability check - wait until text stops changing
             print("[AIStudio] Waiting for content to stabilize...")
@@ -452,7 +473,7 @@ class AIStudioAutomation(BaseAutomation):
                 except:
                     pass
                 
-                await asyncio.sleep(0.1) # Keep this as a short, consistent poll
+                await asyncio.sleep(0.3)  # Reduced CPU pressure (was 0.1)
             
         except Exception as e:
             print(f"[AIStudio] Wait warning: {e}")
@@ -612,6 +633,9 @@ class AIStudioAutomation(BaseAutomation):
 class GeminiWebAutomation(BaseAutomation):
     URL = "https://gemini.google.com/"
     
+    # Hard refresh every N requests to clear browser cache/memory
+    REFRESH_EVERY_N_REQUESTS = 10
+    
     # Selectors discovered during research
     SELECTORS = {
         "input": 'div[role="textbox"][aria-label="Enter a prompt here"]',
@@ -625,6 +649,10 @@ class GeminiWebAutomation(BaseAutomation):
         "menu_panel": '.mat-mdc-menu-panel',
         "menu_item": 'button.mat-mdc-menu-item'
     }
+    
+    def __init__(self):
+        super().__init__()
+        self._request_count = 0
 
     async def init_with_page(self, page: Page, context: BrowserContext) -> bool:
         self.page = page
@@ -710,6 +738,27 @@ class GeminiWebAutomation(BaseAutomation):
 
         try:
             self._generation_in_progress = True
+            self._request_count += 1
+            
+            # 0. Dismiss any stuck overlays/modals (Angular Material CDK overlays block clicks)
+            try:
+                await self.page.keyboard.press("Escape")
+                await self._human_delay(100, 200)
+                # Also try clicking the backdrop if it exists
+                backdrop = self.page.locator('.cdk-overlay-backdrop')
+                if await backdrop.count() > 0:
+                    print("[GeminiWeb] ⚠️ Dismissing stuck overlay...")
+                    await backdrop.first.click(force=True)
+                    await self._human_delay(200, 400)
+            except:
+                pass
+            
+            # 0.5 Periodic hard refresh to clear browser cache/memory
+            if self._request_count >= self.REFRESH_EVERY_N_REQUESTS:
+                print(f"[GeminiWeb] 🔄 Hard refresh (clearing cache after {self._request_count} requests)...")
+                await self.page.reload(wait_until="domcontentloaded", timeout=30000)
+                await self._human_delay(1000, 1500)
+                self._request_count = 0
             
             # 1. New Chat (starts fresh)
             print("[GeminiWeb] Starting new chat...")
@@ -763,7 +812,7 @@ class GeminiWebAutomation(BaseAutomation):
                     copy_btn = btns.nth(count - 1)
                     if await copy_btn.is_visible():
                         break
-                await asyncio.sleep(1) # Keep this as a short, consistent poll
+                await asyncio.sleep(2)  # Reduced CPU pressure (was 1)
             
             if not copy_btn:
                  return {"success": False, "error": "Timeout waiting for copy button"}
@@ -797,6 +846,15 @@ class GeminiWebAutomation(BaseAutomation):
         except Exception as e:
             self._generation_in_progress = False
             print(f"[GeminiWeb] Error: {e}")
+            
+            # Force refresh to reset page state for next request
+            try:
+                print("[GeminiWeb] 🔄 Error recovery: refreshing page...")
+                await self.page.reload(wait_until="domcontentloaded", timeout=15000)
+                self._request_count = 0  # Reset counter since we just refreshed
+            except:
+                pass
+            
             # Retry extraction once via DOM fallback
             return await self._fallback_extract()
 
