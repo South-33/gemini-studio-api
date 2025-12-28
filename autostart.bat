@@ -7,6 +7,17 @@ echo ==========================================
 :: Navigate to script directory
 cd /d "%~dp0"
 
+:: Load NGROK_DOMAIN from .env file
+for /f "tokens=1,2 delims==" %%a in (.env) do (
+    if "%%a"=="NGROK_DOMAIN" set NGROK_DOMAIN=%%b
+)
+if not defined NGROK_DOMAIN (
+    echo [ERROR] NGROK_DOMAIN not set in .env file!
+    echo Add: NGROK_DOMAIN=your-domain.ngrok-free.app
+    pause
+    exit /b 1
+)
+
 :: Wait for network (important after boot)
 echo [1/3] Waiting for network...
 timeout /t 10 /nobreak >nul
@@ -49,9 +60,9 @@ echo.
 echo ==========================================
 echo   Starting ngrok Tunnel
 echo ==========================================
-:: Replace YOUR_STATIC_DOMAIN with your ngrok static domain (e.g., my-gemini-api.ngrok-free.app)
-:: Get your free static domain at: https://dashboard.ngrok.com/cloud-edge/domains
-start "NgrokTunnel" /min cmd /c "ngrok http 8000 --domain=YOUR_STATIC_DOMAIN"
+:: Domain is loaded from .env file (NGROK_DOMAIN)
+echo Using domain: %NGROK_DOMAIN%
+start "NgrokTunnel" /min cmd /c "ngrok http 8000 --domain=%NGROK_DOMAIN%"
 
 :: Give tunnel time to register
 timeout /t 5 /nobreak >nul
@@ -66,7 +77,7 @@ echo.
 tasklist /FI "IMAGENAME eq ngrok.exe" 2>nul | find /I "ngrok.exe" >nul
 if %errorlevel% neq 0 (
     echo [%time%] ⚠️ Tunnel process died! Restarting...
-    start "NgrokTunnel" /min cmd /c "ngrok http 8000 --domain=YOUR_STATIC_DOMAIN"
+    start "NgrokTunnel" /min cmd /c "ngrok http 8000 --domain=%NGROK_DOMAIN%"
     timeout /t 10 /nobreak >nul
 )
 

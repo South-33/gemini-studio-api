@@ -76,7 +76,7 @@ Your domain stays the same forever (e.g., `my-gemini-api.ngrok-free.app`).
 
 1. `Win+R` → `shell:startup` → Enter
 2. Create a shortcut to `autostart.bat`
-3. Edit `autostart.bat` and replace `YOUR_STATIC_DOMAIN` with your ngrok domain
+3. Add your ngrok domain to `.env`: `NGROK_DOMAIN=your-domain.ngrok-free.app`
 
 ---
 
