@@ -53,25 +53,30 @@ The API runs headlessly using your saved session.
 
 ---
 
-## Step 6: Cloudflare Tunnel (Public URL)
+## Step 6: ngrok Tunnel (Persistent Public URL)
 
 ```powershell
-winget install Cloudflare.cloudflared
-cloudflared tunnel login
-cloudflared tunnel create gemini-local
-cloudflared tunnel run --url http://localhost:8000 gemini-local
+# Install ngrok
+winget install ngrok.ngrok
+
+# Authenticate (one-time setup)
+# Get your authtoken from: https://dashboard.ngrok.com/get-started/your-authtoken
+ngrok config add-authtoken YOUR_AUTHTOKEN
+
+# Claim a free static domain at: https://dashboard.ngrok.com/cloud-edge/domains
+# Then run with your static domain:
+ngrok http 8000 --domain=YOUR_STATIC_DOMAIN.ngrok-free.app
 ```
+
+Your domain stays the same forever (e.g., `my-gemini-api.ngrok-free.app`).
 
 ---
 
 ## Step 7: Auto-Start on Boot
 
 1. `Win+R` → `shell:startup` → Enter
-2. Create a shortcut to a `.bat` that runs:
-   ```batch
-   python main_bridge.py
-   cloudflared tunnel run gemini-local
-   ```
+2. Create a shortcut to `autostart.bat`
+3. Edit `autostart.bat` and replace `YOUR_STATIC_DOMAIN` with your ngrok domain
 
 ---
 

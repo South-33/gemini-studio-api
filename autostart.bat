@@ -43,30 +43,33 @@ goto check_api
 echo [3/3] Waiting 10s for browser to stabilize...
 timeout /t 10 /nobreak >nul
 
-:: Start Cloudflare Tunnel in BACKGROUND (minimized)
+:: Start ngrok Tunnel in BACKGROUND (minimized)
+:: Using static domain for persistent URL (requires ngrok account)
 echo.
 echo ==========================================
-echo   Starting Cloudflare Tunnel + Keepalive
+echo   Starting ngrok Tunnel + Keepalive
 echo ==========================================
-start "CloudflareTunnel" /min cmd /c "cloudflared tunnel --url http://localhost:8000"
+:: Replace YOUR_STATIC_DOMAIN with your ngrok static domain (e.g., my-gemini-api.ngrok-free.app)
+:: Get your free static domain at: https://dashboard.ngrok.com/cloud-edge/domains
+start "NgrokTunnel" /min cmd /c "ngrok http 8000 --domain=YOUR_STATIC_DOMAIN"
 
 :: Give tunnel time to register
 timeout /t 5 /nobreak >nul
 
-:: Keepalive loop (runs forever, keeps tunnel warm)
-echo [Keepalive] Pinging every 2 minutes to prevent idle timeout...
+:: Keepalive loop (runs forever, monitors tunnel health)
+echo [Keepalive] Monitoring tunnel every 5 minutes...
 echo.
 
 :keepalive
-:: Check if cloudflared process is still running
-tasklist /FI "IMAGENAME eq cloudflared.exe" 2>nul | find /I "cloudflared.exe" >nul
+:: Check if ngrok process is still running
+tasklist /FI "IMAGENAME eq ngrok.exe" 2>nul | find /I "ngrok.exe" >nul
 if %errorlevel% neq 0 (
     echo [Tunnel] ⚠️ Tunnel process died! Restarting...
-    start "CloudflareTunnel" /min cmd /c "cloudflared tunnel --url http://localhost:8000"
+    start "NgrokTunnel" /min cmd /c "ngrok http 8000 --domain=YOUR_STATIC_DOMAIN"
     timeout /t 5 /nobreak >nul
 )
 
-:: Ping health endpoint to keep tunnel warm
+:: Ping health endpoint to verify API is responsive
 powershell -Command "(Invoke-WebRequest -Uri 'http://localhost:8000/health' -UseBasicParsing -TimeoutSec 5).StatusCode" 2>nul | findstr "200" >nul
 if %errorlevel% equ 0 (
     echo [%time%] ✅ Keepalive OK
@@ -74,6 +77,6 @@ if %errorlevel% equ 0 (
     echo [%time%] ⚠️ Keepalive failed (API might be busy)
 )
 
-:: Wait 5 minutes (well under ~16 min idle timeout)
+:: Wait 5 minutes
 timeout /t 300 /nobreak >nul
 goto keepalive
