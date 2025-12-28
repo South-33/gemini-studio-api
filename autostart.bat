@@ -47,7 +47,7 @@ timeout /t 10 /nobreak >nul
 :: Using static domain for persistent URL (requires ngrok account)
 echo.
 echo ==========================================
-echo   Starting ngrok Tunnel + Keepalive
+echo   Starting ngrok Tunnel
 echo ==========================================
 :: Replace YOUR_STATIC_DOMAIN with your ngrok static domain (e.g., my-gemini-api.ngrok-free.app)
 :: Get your free static domain at: https://dashboard.ngrok.com/cloud-edge/domains
@@ -56,27 +56,20 @@ start "NgrokTunnel" /min cmd /c "ngrok http 8000 --domain=YOUR_STATIC_DOMAIN"
 :: Give tunnel time to register
 timeout /t 5 /nobreak >nul
 
-:: Keepalive loop (runs forever, monitors tunnel health)
-echo [Keepalive] Monitoring tunnel every 5 minutes...
+:: Monitor loop (process crash detection only, no HTTP pings)
+:: ngrok has no idle timeout, so keepalive pings are unnecessary
+echo [Monitor] Watching for tunnel crashes (no keepalive needed)...
 echo.
 
-:keepalive
+:monitor
 :: Check if ngrok process is still running
 tasklist /FI "IMAGENAME eq ngrok.exe" 2>nul | find /I "ngrok.exe" >nul
 if %errorlevel% neq 0 (
-    echo [Tunnel] ⚠️ Tunnel process died! Restarting...
+    echo [%time%] ⚠️ Tunnel process died! Restarting...
     start "NgrokTunnel" /min cmd /c "ngrok http 8000 --domain=YOUR_STATIC_DOMAIN"
-    timeout /t 5 /nobreak >nul
+    timeout /t 10 /nobreak >nul
 )
 
-:: Ping health endpoint to verify API is responsive
-powershell -Command "(Invoke-WebRequest -Uri 'http://localhost:8000/health' -UseBasicParsing -TimeoutSec 5).StatusCode" 2>nul | findstr "200" >nul
-if %errorlevel% equ 0 (
-    echo [%time%] ✅ Keepalive OK
-) else (
-    echo [%time%] ⚠️ Keepalive failed (API might be busy)
-)
-
-:: Wait 5 minutes
-timeout /t 300 /nobreak >nul
-goto keepalive
+:: Check every 60 seconds (no HTTP requests, just process check)
+timeout /t 60 /nobreak >nul
+goto monitor
