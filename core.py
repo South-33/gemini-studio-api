@@ -752,6 +752,7 @@ class GeminiWebAutomation(BaseAutomation):
             
             # 1. New Chat (starts fresh)
             print("[GeminiWeb] Starting new chat...")
+            new_chat_btn = self.page.locator(self.SELECTORS["new_chat"]).first
             if await new_chat_btn.is_visible():
                 # Count existing copy buttons BEFORE clicking new chat
                 old_copy_count = await self.page.locator(self.SELECTORS["copy_btn"]).count()
