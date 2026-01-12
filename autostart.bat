@@ -7,10 +7,14 @@ echo ==========================================
 :: Navigate to script directory
 cd /d "%~dp0"
 
-:: Load NGROK_DOMAIN from .env file
+:: Load PORT and NGROK_DOMAIN from .env file
+set PORT=8001
 for /f "tokens=1,2 delims==" %%a in (.env) do (
+    if "%%a"=="PORT" set PORT=%%b
     if "%%a"=="NGROK_DOMAIN" set NGROK_DOMAIN=%%b
 )
+echo [Config] PORT=%PORT%
+
 if not defined NGROK_DOMAIN (
     echo [ERROR] NGROK_DOMAIN not set in .env file!
     echo Add: NGROK_DOMAIN=your-domain.ngrok-free.app
@@ -18,12 +22,24 @@ if not defined NGROK_DOMAIN (
     exit /b 1
 )
 
-:: Wait for network (important after boot)
-echo [1/3] Waiting for network...
-timeout /t 10 /nobreak >nul
+:: Check if API is ALREADY running (skip startup if so)
+echo [1/4] Checking if API already running on port %PORT%...
+powershell -Command "(Invoke-WebRequest -Uri 'http://localhost:%PORT%/health' -UseBasicParsing -TimeoutSec 2).StatusCode" 2>nul | findstr "200" >nul
+if %errorlevel% equ 0 (
+    echo [Server] ✅ API already running! Skipping startup...
+    goto api_ready
+)
 
-:: Start the API in background
-echo [2/3] Starting API server...
+:: Kill any orphaned Python process on this port
+echo [2/4] Killing any orphaned process on port %PORT%...
+for /f "tokens=5" %%p in ('netstat -ano ^| findstr ":%PORT% " ^| findstr "LISTENING"') do (
+    echo   Found PID %%p on port %PORT%, killing...
+    taskkill /F /PID %%p 2>nul
+)
+timeout /t 2 /nobreak >nul
+
+:: Start the API
+echo [3/4] Starting API server on port %PORT%...
 start "GeminiAPI" /min cmd /c "python main.py"
 
 :: Wait for API with timeout (max 60 seconds)
@@ -35,7 +51,7 @@ set /a max_tries=20
 set /a counter+=1
 echo   Attempt %counter%/%max_tries%...
 
-powershell -Command "(Invoke-WebRequest -Uri 'http://localhost:8000/health' -UseBasicParsing -TimeoutSec 3).StatusCode" 2>nul | findstr "200" >nul
+powershell -Command "(Invoke-WebRequest -Uri 'http://localhost:%PORT%/health' -UseBasicParsing -TimeoutSec 3).StatusCode" 2>nul | findstr "200" >nul
 
 if %errorlevel% equ 0 (
     echo [Server] ✅ API is online!
@@ -51,7 +67,7 @@ timeout /t 3 /nobreak >nul
 goto check_api
 
 :api_ready
-echo [3/3] Waiting 10s for browser to stabilize...
+echo [4/4] Waiting 10s for browser to stabilize...
 timeout /t 10 /nobreak >nul
 
 :: Start ngrok Tunnel in BACKGROUND (minimized)
@@ -62,7 +78,7 @@ echo   Starting ngrok Tunnel
 echo ==========================================
 :: Domain is loaded from .env file (NGROK_DOMAIN)
 echo Using domain: %NGROK_DOMAIN%
-start "NgrokTunnel" /min cmd /c "ngrok http 8000 --domain=%NGROK_DOMAIN%"
+start "NgrokTunnel" /min cmd /c "ngrok http %PORT% --domain=%NGROK_DOMAIN%"
 
 :: Give tunnel time to register
 timeout /t 5 /nobreak >nul
@@ -77,7 +93,7 @@ echo.
 tasklist /FI "IMAGENAME eq ngrok.exe" 2>nul | find /I "ngrok.exe" >nul
 if %errorlevel% neq 0 (
     echo [%time%] ⚠️ Tunnel process died! Restarting...
-    start "NgrokTunnel" /min cmd /c "ngrok http 8000 --domain=%NGROK_DOMAIN%"
+    start "NgrokTunnel" /min cmd /c "ngrok http %PORT% --domain=%NGROK_DOMAIN%"
     timeout /t 10 /nobreak >nul
 )
 
