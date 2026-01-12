@@ -754,8 +754,24 @@ class GeminiWebAutomation(BaseAutomation):
             print("[GeminiWeb] Starting new chat...")
             new_chat_btn = self.page.locator(self.SELECTORS["new_chat"]).first
             if await new_chat_btn.is_visible():
+                # Count existing copy buttons BEFORE clicking new chat
+                old_copy_count = await self.page.locator(self.SELECTORS["copy_btn"]).count()
+                
                 await new_chat_btn.click()
-                await self._human_delay(800, 1200)  # Wait for page to settle
+                await self._human_delay(500, 800)
+                
+                # Wait for old responses to clear (copy buttons should disappear)
+                clear_start = time.time()
+                while (time.time() - clear_start) < 5:  # Max 5 seconds to clear
+                    current_count = await self.page.locator(self.SELECTORS["copy_btn"]).count()
+                    if current_count == 0:
+                        print("[GeminiWeb] ✅ Chat cleared")
+                        break
+                    await asyncio.sleep(0.3)
+                else:
+                    print("[GeminiWeb] ⚠️ Old chat may not have cleared, proceeding anyway...")
+                
+                await self._human_delay(300, 500)
             
             # 1.5 Enable Temporary Chat
             print("[GeminiWeb] Enabling temporary chat...")
@@ -787,11 +803,9 @@ class GeminiWebAutomation(BaseAutomation):
             
             # 5. Wait for Response (Copy button to appear)
             print("[GeminiWeb] Waiting for response...")
-            # We wait for the Copy button of the LAST message to be visible
-            # but usually it's better to wait for the generation to stop (no more loading states)
             await self._human_delay(1500, 2500) # Initial wait
             
-            # Polling for copy button
+            # Polling for copy button (should be the FIRST one since we cleared)
             start_time = time.time()
             max_wait = 120
             copy_btn = None
@@ -802,7 +816,7 @@ class GeminiWebAutomation(BaseAutomation):
                     copy_btn = btns.nth(count - 1)
                     if await copy_btn.is_visible():
                         break
-                await asyncio.sleep(2)  # Reduced CPU pressure (was 1)
+                await asyncio.sleep(2)
             
             if not copy_btn:
                  return {"success": False, "error": "Timeout waiting for copy button"}
