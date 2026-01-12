@@ -677,11 +677,10 @@ class GeminiWebAutomation(BaseAutomation):
         """
         Enable temporary chat mode. 
         The temp chat button is only visible when sidebar is expanded.
-        We need to expand sidebar -> click temp chat -> collapse sidebar.
+        We expand sidebar if needed and keep it open.
         """
         try:
             temp_btn = self.page.locator(self.SELECTORS["temp_chat"])
-            sidebar_expanded = False
             
             # Check if temp chat is already enabled (has temp-chat-on class)
             temp_active = self.page.locator(self.SELECTORS["temp_chat_active"])
@@ -696,8 +695,7 @@ class GeminiWebAutomation(BaseAutomation):
                 if await sidebar_btn.is_visible():
                     await sidebar_btn.click()
                     await self._human_delay(300, 500)
-                    sidebar_expanded = True
-                    print("[GeminiWeb] 📂 Sidebar expanded")
+                    print("[GeminiWeb] 📂 Sidebar expanded (keeping open)")
                 else:
                     print("[GeminiWeb] ⚠️ Sidebar toggle button not found")
                     return
@@ -720,14 +718,6 @@ class GeminiWebAutomation(BaseAutomation):
                         print("[GeminiWeb] ⚠️ Clicked temp chat but state unclear")
             else:
                 print("[GeminiWeb] ❌ Temp chat button still not visible after expanding sidebar")
-            
-            # Collapse sidebar back to keep UI clean
-            if sidebar_expanded:
-                sidebar_btn = self.page.locator(self.SELECTORS["sidebar_toggle"])
-                if await sidebar_btn.is_visible():
-                    await sidebar_btn.click()
-                    await self._human_delay(200, 400)
-                    print("[GeminiWeb] 📁 Sidebar collapsed")
                     
         except Exception as e:
             print(f"[GeminiWeb] ❌ Temp chat error: {e}")
@@ -1114,7 +1104,7 @@ class WorkerPool:
                 print("[WorkerPool] Re-opening Gemini Web tab...")
                 page = await self.shared_context.new_page()
                 try:
-                    await page.goto(GeminiWebAutomation.URL, timeout=60000, wait_until="networkidle")
+                    await page.goto(GeminiWebAutomation.URL, timeout=60000, wait_until="domcontentloaded")
                 except Exception as e:
                     print(f"[WorkerPool] ⚠️ Wake-up Gemini Web warning: {e}")
                 await self.geminiweb_worker.init_with_page(page, self.shared_context)
@@ -1124,7 +1114,7 @@ class WorkerPool:
                 print("[WorkerPool] Re-opening AI Studio tab...")
                 page = await self.shared_context.new_page()
                 try:
-                    await page.goto(AIStudioAutomation.PLAYGROUND_URL, timeout=60000, wait_until="networkidle")
+                    await page.goto(AIStudioAutomation.PLAYGROUND_URL, timeout=60000, wait_until="domcontentloaded")
                 except Exception as e:
                     print(f"[WorkerPool] ⚠️ Wake-up AI Studio warning: {e}")
                 await self.aistudio_worker.init_with_page(page, self.shared_context)
@@ -1139,12 +1129,12 @@ class WorkerPool:
             if provider == "aistudio" and self.aistudio_worker:
                 if self.aistudio_worker.page is None:
                     page = await self.shared_context.new_page()
-                    await page.goto(AIStudioAutomation.PLAYGROUND_URL, timeout=60000, wait_until="networkidle")
+                    await page.goto(AIStudioAutomation.PLAYGROUND_URL, timeout=60000, wait_until="domcontentloaded")
                     await self.aistudio_worker.init_with_page(page, self.shared_context)
             elif provider == "gemini-web" and self.geminiweb_worker:
                 if self.geminiweb_worker.page is None:
                     page = await self.shared_context.new_page()
-                    await page.goto(GeminiWebAutomation.URL, timeout=60000, wait_until="networkidle")
+                    await page.goto(GeminiWebAutomation.URL, timeout=60000, wait_until="domcontentloaded")
                     await self.geminiweb_worker.init_with_page(page, self.shared_context)
 
     async def init(self, cookies: List[Dict]) -> bool:
@@ -1223,7 +1213,7 @@ class WorkerPool:
                 print("[WorkerPool] Opening AI Studio tab...")
                 page1 = await self.shared_context.new_page()
                 try:
-                    await page1.goto(AIStudioAutomation.PLAYGROUND_URL, timeout=60000, wait_until="networkidle")
+                    await page1.goto(AIStudioAutomation.PLAYGROUND_URL, timeout=60000, wait_until="domcontentloaded")
                     print(f"[WorkerPool] ✅ AI Studio tab loaded: {page1.url}")
                 except Exception as e:
                     print(f"[WorkerPool] ⚠️ AI Studio navigation warning: {e}")
@@ -1236,7 +1226,7 @@ class WorkerPool:
                 print("[WorkerPool] Opening Gemini Web tab...")
                 page2 = await self.shared_context.new_page()
                 try:
-                    await page2.goto(GeminiWebAutomation.URL, timeout=60000, wait_until="networkidle")
+                    await page2.goto(GeminiWebAutomation.URL, timeout=60000, wait_until="domcontentloaded")
                     print(f"[WorkerPool] ✅ Gemini Web tab loaded: {page2.url}")
                 except Exception as e:
                     print(f"[WorkerPool] ⚠️ Gemini Web navigation warning: {e}")
