@@ -2,6 +2,8 @@ import asyncio
 import os
 import random
 import time
+import uuid
+from datetime import datetime
 from typing import List, Dict, Optional, Tuple
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page, Route
 
@@ -10,6 +12,10 @@ LOW_MEMORY_MODE = os.getenv("LOW_MEMORY_MODE", "true").lower() == "true"
 
 # Slow VM mode: use JavaScript clicks instead of Playwright clicks (for e2-micro etc)
 SLOW_VM_MODE = os.getenv("SLOW_VM_MODE", "true").lower() == "true"
+
+# Debug screenshots on failure (disabled by default for performance)
+DEBUG_SCREENSHOTS = os.getenv("DEBUG_SCREENSHOTS", "false").lower() == "true"
+DEBUG_SCREENSHOT_DIR = os.path.join(os.path.dirname(__file__), "debug_screenshots")
 
 class BaseAutomation:
     """Base class for browser-based AI automation."""
@@ -653,6 +659,158 @@ class GeminiWebAutomation(BaseAutomation):
     def __init__(self):
         super().__init__()
         self._request_count = 0
+        self._request_id = None  # Set per-request for log tracing
+
+    async def _screenshot_on_failure(self, action_name: str):
+        """
+        Capture screenshot when an action fails (only if DEBUG_SCREENSHOTS=true).
+        Uses JPEG quality 50 for minimal disk/CPU impact.
+        """
+        if not DEBUG_SCREENSHOTS:
+            return
+        
+        try:
+            # Create dir if needed
+            os.makedirs(DEBUG_SCREENSHOT_DIR, exist_ok=True)
+            
+            # Clean filename
+            safe_action = action_name.replace(" ", "_").lower()
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            req_id = self._request_id[:8] if self._request_id else "unknown"
+            filename = f"{timestamp}_{req_id}_{safe_action}.jpg"
+            filepath = os.path.join(DEBUG_SCREENSHOT_DIR, filename)
+            
+            # Capture low-quality JPEG (fast, small)
+            await self.page.screenshot(path=filepath, type="jpeg", quality=50)
+            print(f"[GeminiWeb] 📸 Screenshot: {filename}")
+            
+            # Limit to 20 screenshots max (delete oldest)
+            files = sorted(
+                [f for f in os.listdir(DEBUG_SCREENSHOT_DIR) if f.endswith('.jpg')],
+                key=lambda x: os.path.getmtime(os.path.join(DEBUG_SCREENSHOT_DIR, x))
+            )
+            while len(files) > 20:
+                oldest = files.pop(0)
+                os.remove(os.path.join(DEBUG_SCREENSHOT_DIR, oldest))
+        except Exception as e:
+            print(f"[GeminiWeb] ⚠️ Screenshot failed: {e}")
+
+    async def _verified_click(
+        self, 
+        selector: str, 
+        description: str,
+        verify_before: callable = None,  # async () -> any (state before click)
+        verify_after: callable = None,   # async (before_state) -> bool (True = success)
+        timeout: int = 3000,
+        max_retries: int = 2  # Retry up to 2 times on failure
+    ) -> bool:
+        """
+        Click an element with retry logic, JS fallback, and verification.
+        
+        Strategy:
+        1. Wait for element visibility
+        2. Scroll into view
+        3. Try Playwright click
+        4. If verification fails, try JS click
+        5. Retry up to max_retries times with increasing delays
+        """
+        for attempt in range(max_retries + 1):
+            try:
+                locator = self.page.locator(selector).first
+                
+                # Wait for visibility
+                try:
+                    await locator.wait_for(state="visible", timeout=timeout)
+                except Exception:
+                    if attempt == max_retries:
+                        print(f"[GeminiWeb] ❌ {description}: Element not visible after {max_retries + 1} attempts")
+                        await self._screenshot_on_failure(f"{description}_not_visible")
+                        return False
+                    print(f"[GeminiWeb] ⚠️ {description}: Not visible, retry {attempt + 1}...")
+                    await self._human_delay(500, 1000)
+                    continue
+                
+                # Scroll into view (ensures element is actually clickable)
+                try:
+                    await locator.scroll_into_view_if_needed(timeout=2000)
+                    await self._human_delay(100, 200)
+                except:
+                    pass  # Not critical
+                
+                # Capture state before click
+                before_state = None
+                if verify_before:
+                    try:
+                        before_state = await verify_before()
+                    except Exception as e:
+                        print(f"[GeminiWeb] ⚠️ {description}: Before state error: {e}")
+                
+                # Try Playwright click first
+                click_succeeded = False
+                try:
+                    await locator.click(timeout=timeout)
+                    await self._human_delay(300, 500)
+                    click_succeeded = True
+                except Exception as pw_err:
+                    print(f"[GeminiWeb] ⚠️ {description}: Playwright click failed, trying JS...")
+                    # Fallback to JavaScript click (escape selector for safety)
+                    try:
+                        safe_selector = selector.replace("'", "\\'")
+                        await self.page.evaluate(f'''
+                            () => {{
+                                const el = document.querySelector('{safe_selector}');
+                                if (el) {{ el.scrollIntoView(); el.click(); }}
+                            }}
+                        ''')
+                        await self._human_delay(300, 500)
+                        click_succeeded = True
+                    except Exception as js_err:
+                        print(f"[GeminiWeb] ⚠️ {description}: JS click also failed: {js_err}")
+                
+                if not click_succeeded:
+                    if attempt < max_retries:
+                        print(f"[GeminiWeb] 🔄 {description}: Retry {attempt + 1}/{max_retries}...")
+                        await self._human_delay(500 * (attempt + 1), 1000 * (attempt + 1))
+                        continue
+                    else:
+                        print(f"[GeminiWeb] ❌ {description}: All click attempts failed")
+                        await self._screenshot_on_failure(f"{description}_click_failed")
+                        return False
+                
+                # Verify state after click
+                if verify_after:
+                    try:
+                        success = await verify_after(before_state)
+                        if success:
+                            print(f"[GeminiWeb] ✅ {description}: Verified")
+                            return True
+                        else:
+                            if attempt < max_retries:
+                                print(f"[GeminiWeb] ⚠️ {description}: Verification failed, retry {attempt + 1}...")
+                                await self._human_delay(500 * (attempt + 1), 1000 * (attempt + 1))
+                                continue
+                            else:
+                                print(f"[GeminiWeb] ❌ {description}: Verification failed after {max_retries + 1} attempts")
+                                await self._screenshot_on_failure(f"{description}_verify_failed")
+                                return False
+                    except Exception as e:
+                        print(f"[GeminiWeb] ⚠️ {description}: Verification error: {e}")
+                        return False
+                else:
+                    # No verification provided, assume success
+                    print(f"[GeminiWeb] ✅ {description}: Clicked (unverified)")
+                    return True
+                    
+            except Exception as e:
+                if attempt < max_retries:
+                    print(f"[GeminiWeb] ⚠️ {description}: Error, retry {attempt + 1}... ({e})")
+                    await self._human_delay(500 * (attempt + 1), 1000 * (attempt + 1))
+                else:
+                    print(f"[GeminiWeb] ❌ {description}: Failed after {max_retries + 1} attempts: {e}")
+                    await self._screenshot_on_failure(f"{description}_error")
+                    return False
+        
+        return False
 
     async def init_with_page(self, page: Page, context: BrowserContext) -> bool:
         self.page = page
@@ -729,6 +887,8 @@ class GeminiWebAutomation(BaseAutomation):
         try:
             self._generation_in_progress = True
             self._request_count += 1
+            self._request_id = uuid.uuid4().hex[:8]  # Short ID for log tracing
+            print(f"[GeminiWeb] [{self._request_id}] === New Request ===")
             
             # 0. Dismiss any stuck overlays/modals (Angular Material CDK overlays block clicks)
             try:
@@ -750,17 +910,36 @@ class GeminiWebAutomation(BaseAutomation):
                 await self._human_delay(1000, 1500)
                 self._request_count = 0
             
-            # 1. New Chat (starts fresh)
-            print("[GeminiWeb] Starting new chat...")
-            new_chat_btn = self.page.locator(self.SELECTORS["new_chat"]).first
-            if await new_chat_btn.is_visible():
-                # Count existing copy buttons BEFORE clicking new chat
-                old_copy_count = await self.page.locator(self.SELECTORS["copy_btn"]).count()
-                
-                await new_chat_btn.click()
-                await self._human_delay(800, 1200)  # Wait for page to settle
-                
-                print("[GeminiWeb] ✅ Checked new chat")
+            # 1. New Chat (starts fresh) - VERIFIED
+            async def get_copy_count():
+                return await self.page.locator(self.SELECTORS["copy_btn"]).count()
+            
+            async def verify_chat_cleared(before_count):
+                # Give extra time for chat to clear
+                await self._human_delay(500, 800)
+                after_count = await self.page.locator(self.SELECTORS["copy_btn"]).count()
+                # Success if count dropped (ideally to 0, but at least fewer than before)
+                if after_count == 0:
+                    print(f"[GeminiWeb] New Chat: {before_count} → 0 copy buttons (chat cleared)")
+                    return True
+                elif after_count < before_count:
+                    print(f"[GeminiWeb] New Chat: {before_count} → {after_count} copy buttons (partial clear)")
+                    return True
+                else:
+                    print(f"[GeminiWeb] New Chat: Still {after_count} copy buttons (expected 0)")
+                    return False
+            
+            new_chat_success = await self._verified_click(
+                self.SELECTORS["new_chat"],
+                "New Chat",
+                verify_before=get_copy_count,
+                verify_after=verify_chat_cleared,
+                timeout=5000
+            )
+            
+            if not new_chat_success:
+                print("[GeminiWeb] ⚠️ New Chat failed - proceeding anyway (will use button counting)")
+
             
             # 1.5 Enable Temporary Chat
             print("[GeminiWeb] Enabling temporary chat...")
@@ -792,9 +971,55 @@ class GeminiWebAutomation(BaseAutomation):
             pre_send_count = await self.page.locator(self.SELECTORS["copy_btn"]).count()
             print(f"[GeminiWeb] Copy buttons before send: {pre_send_count}")
 
-            # 4. Click Send
-            await self.page.click(self.SELECTORS["send_btn"])
-            await self._human_delay(200, 500)
+            # 4. Click Send - VERIFIED
+            async def get_input_text():
+                try:
+                    return await input_area.inner_text()
+                except:
+                    return ""
+            
+            async def verify_send_worked(before_text):
+                # Wait a moment then check if input is cleared
+                await self._human_delay(300, 500)
+                try:
+                    # Try multiple methods to get input text (contenteditable vs textarea)
+                    after_text = ""
+                    try:
+                        after_text = await input_area.inner_text()
+                    except:
+                        try:
+                            after_text = await input_area.input_value()
+                        except:
+                            pass
+                    
+                    # Handle empty prompt case (e.g., image-only messages)
+                    before_len = len(before_text.strip()) if before_text else 0
+                    after_len = len(after_text.strip())
+                    
+                    if before_len == 0:
+                        # Empty prompt - can't verify by text, assume success
+                        print(f"[GeminiWeb] Send: Empty prompt, assuming success")
+                        return True
+                    elif after_len < before_len / 2:
+                        print(f"[GeminiWeb] Send: Input cleared ({before_len} → {after_len} chars)")
+                        return True
+                    else:
+                        print(f"[GeminiWeb] Send: Input NOT cleared (still {after_len} chars)")
+                        return False
+                except:
+                    return True  # If we can't check, assume success
+            
+            send_success = await self._verified_click(
+                self.SELECTORS["send_btn"],
+                "Send",
+                verify_before=get_input_text,
+                verify_after=verify_send_worked,
+                timeout=5000
+            )
+            
+            if not send_success:
+                print("[GeminiWeb] ❌ Send failed - check selector or UI state")
+                return {"success": False, "error": "Send button click failed"}
             
             # 5. Wait for Response (Copy button to appear)
             print("[GeminiWeb] Waiting for response...")
