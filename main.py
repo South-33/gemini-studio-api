@@ -105,17 +105,9 @@ def parse_model_and_thinking(model_name: str) -> tuple:
 
 @app.get("/v1/models")
 async def list_models():
-    """List available models for both providers."""
+    """List available Gemini Web models."""
     return {
         "data": [
-            # AI Studio models
-            {"id": "gemini-3-pro-preview", "object": "model", "provider": "aistudio"},
-            {"id": "gemini-3-flash-preview", "object": "model", "provider": "aistudio"},
-            {"id": "gemini-3-flash-preview-minimal", "object": "model", "provider": "aistudio"},
-            {"id": "gemini-3-flash-preview-low", "object": "model", "provider": "aistudio"},
-            {"id": "gemini-3-flash-preview-medium", "object": "model", "provider": "aistudio"},
-            {"id": "gemini-3-flash-preview-high", "object": "model", "provider": "aistudio"},
-            # Gemini Web models
             {"id": "fast", "object": "model", "provider": "gemini-web"},
             {"id": "thinking", "object": "model", "provider": "gemini-web"},
             {"id": "pro", "object": "model", "provider": "gemini-web"},

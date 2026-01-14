@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gemini Worker Stress Test</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg: #0f0f1a;
+            --card: #1a1a2e;
+            --accent: #7c4dff;
+            --success: #00e676;
+            --error: #ff5252;
+            --warning: #ffab00;
+            --text: #e0e0e0;
+            --dim: #888;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: 'Inter', sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            min-height: 100vh;
+            padding: 40px;
+        }
+        h1 {
+            font-size: 1.8rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, var(--accent), #00e5ff);
+            -webkit-background-clip: text;
+            background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 8px;
+        }
+        .subtitle { color: var(--dim); margin-bottom: 30px; }
+        .config {
+            display: flex;
+            gap: 16px;
+            flex-wrap: wrap;
+            margin-bottom: 30px;
+        }
+        .config-item {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+        .config-item label {
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            color: var(--dim);
+            font-weight: 600;
+        }
+        input, select {
+            background: var(--card);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 8px;
+            padding: 12px 16px;
+            color: var(--text);
+            font-family: inherit;
+            font-size: 0.9rem;
+            min-width: 180px;
+        }
+        input:focus, select:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+        .btn {
+            padding: 12px 24px;
+            border: none;
+            border-radius: 8px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .btn-primary {
+            background: var(--accent);
+            color: white;
+        }
+        .btn-primary:hover { filter: brightness(1.1); transform: translateY(-1px); }
+        .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+        .btn-secondary {
+            background: var(--card);
+            color: var(--text);
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+        .results {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 16px;
+            margin-top: 30px;
+        }
+        .result-card {
+            background: var(--card);
+            border-radius: 12px;
+            padding: 20px;
+            border: 1px solid rgba(255,255,255,0.05);
+        }
+        .result-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 12px;
+        }
+        .result-id {
+            font-weight: 600;
+            font-size: 0.9rem;
+        }
+        .result-status {
+            padding: 4px 10px;
+            border-radius: 20px;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+        .status-pending { background: rgba(255,171,0,0.2); color: var(--warning); }
+        .status-success { background: rgba(0,230,118,0.2); color: var(--success); }
+        .status-error { background: rgba(255,82,82,0.2); color: var(--error); }
+        .status-mismatch { background: rgba(255,82,82,0.3); color: #ff8a80; }
+        .result-content {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.8rem;
+            color: var(--dim);
+            white-space: pre-wrap;
+            word-break: break-word;
+            max-height: 150px;
+            overflow-y: auto;
+            margin-top: 10px;
+            background: rgba(0,0,0,0.2);
+            padding: 10px;
+            border-radius: 6px;
+        }
+        .result-time {
+            font-size: 0.75rem;
+            color: var(--dim);
+            margin-top: 8px;
+        }
+        .summary {
+            background: var(--card);
+            border-radius: 12px;
+            padding: 20px;
+            margin-top: 20px;
+            display: none;
+        }
+        .summary.visible { display: block; }
+        .summary h3 { margin-bottom: 12px; }
+        .stats {
+            display: flex;
+            gap: 30px;
+            flex-wrap: wrap;
+        }
+        .stat {
+            text-align: center;
+        }
+        .stat-value {
+            font-size: 2rem;
+            font-weight: 700;
+        }
+        .stat-label {
+            font-size: 0.75rem;
+            color: var(--dim);
+            text-transform: uppercase;
+        }
+        .stat-success .stat-value { color: var(--success); }
+        .stat-error .stat-value { color: var(--error); }
+        .stat-mismatch .stat-value { color: #ff8a80; }
+    </style>
+</head>
+<body>
+    <h1>🔥 Worker Stress Test</h1>
+    <p class="subtitle">Fire multiple parallel requests to verify worker isolation</p>
+
+    <div class="config">
+        <div class="config-item">
+            <label>API Endpoint</label>
+            <input type="text" id="api-url" value="http://localhost:8000" placeholder="http://localhost:8000">
+        </div>
+        <div class="config-item">
+            <label>Parallel Requests</label>
+            <input type="number" id="request-count" value="4" min="1" max="10">
+        </div>
+        <div class="config-item">
+            <label>Model</label>
+            <select id="model">
+                <option value="fast">Fast</option>
+                <option value="thinking" selected>Thinking</option>
+                <option value="pro">Pro</option>
+            </select>
+        </div>
+        <div class="config-item" style="align-self: flex-end;">
+            <button class="btn btn-primary" id="run-btn" onclick="runStressTest()">
+                🚀 Run Stress Test
+            </button>
+        </div>
+        <div class="config-item" style="align-self: flex-end;">
+            <button class="btn btn-secondary" onclick="clearResults()">
+                🗑️ Clear
+            </button>
+        </div>
+    </div>
+
+    <div class="summary" id="summary">
+        <h3>📊 Results Summary</h3>
+        <div class="stats">
+            <div class="stat stat-success">
+                <div class="stat-value" id="stat-success">0</div>
+                <div class="stat-label">Correct</div>
+            </div>
+            <div class="stat stat-mismatch">
+                <div class="stat-value" id="stat-mismatch">0</div>
+                <div class="stat-label">Mismatched</div>
+            </div>
+            <div class="stat stat-error">
+                <div class="stat-value" id="stat-error">0</div>
+                <div class="stat-label">Errors</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value" id="stat-time">0s</div>
+                <div class="stat-label">Total Time</div>
+            </div>
+        </div>
+    </div>
+
+    <div class="results" id="results"></div>
+
+    <script>
+        const resultsDiv = document.getElementById('results');
+        const summaryDiv = document.getElementById('summary');
+        let testResults = [];
+
+        function clearResults() {
+            resultsDiv.innerHTML = '';
+            summaryDiv.classList.remove('visible');
+            testResults = [];
+        }
+
+        async function runStressTest() {
+            const apiUrl = document.getElementById('api-url').value.trim();
+            const count = parseInt(document.getElementById('request-count').value);
+            const model = document.getElementById('model').value;
+            const runBtn = document.getElementById('run-btn');
+
+            if (!apiUrl) {
+                alert('Please enter API endpoint');
+                return;
+            }
+
+            clearResults();
+            runBtn.disabled = true;
+            runBtn.textContent = '⏳ Running...';
+
+            const startTime = Date.now();
+            testResults = [];
+
+            // Create unique test prompts - each has a UNIQUE identifier
+            const prompts = [];
+            for (let i = 0; i < count; i++) {
+                const uniqueId = `TEST_${i + 1}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+                prompts.push({
+                    id: i + 1,
+                    uniqueId: uniqueId,
+                    prompt: `IMPORTANT: Your response MUST start with this exact code: [${uniqueId}]\n\nAfter the code, tell me a unique fact about the number ${i + 1}. Keep it to 1-2 sentences.`
+                });
+            }
+
+            // Create cards for each request
+            prompts.forEach(p => {
+                const card = document.createElement('div');
+                card.className = 'result-card';
+                card.id = `result-${p.id}`;
+                card.innerHTML = `
+                    <div class="result-header">
+                        <span class="result-id">Request #${p.id}</span>
+                        <span class="result-status status-pending">⏳ Pending</span>
+                    </div>
+                    <div style="font-size: 0.75rem; color: var(--dim);">
+                        ID: <code>${p.uniqueId}</code>
+                    </div>
+                    <div class="result-content">Waiting for response...</div>
+                    <div class="result-time"></div>
+                `;
+                resultsDiv.appendChild(card);
+            });
+
+            // Fire all requests in PARALLEL
+            const requests = prompts.map(p => sendRequest(apiUrl, model, p));
+            await Promise.all(requests);
+
+            // Calculate summary
+            const endTime = Date.now();
+            const totalTime = ((endTime - startTime) / 1000).toFixed(1);
+
+            let successCount = 0;
+            let mismatchCount = 0;
+            let errorCount = 0;
+
+            testResults.forEach(r => {
+                if (r.error) errorCount++;
+                else if (r.matched) successCount++;
+                else mismatchCount++;
+            });
+
+            document.getElementById('stat-success').textContent = successCount;
+            document.getElementById('stat-mismatch').textContent = mismatchCount;
+            document.getElementById('stat-error').textContent = errorCount;
+            document.getElementById('stat-time').textContent = totalTime + 's';
+            summaryDiv.classList.add('visible');
+
+            runBtn.disabled = false;
+            runBtn.textContent = '🚀 Run Stress Test';
+        }
+
+        async function sendRequest(apiUrl, model, promptData) {
+            const card = document.getElementById(`result-${promptData.id}`);
+            const statusSpan = card.querySelector('.result-status');
+            const contentDiv = card.querySelector('.result-content');
+            const timeDiv = card.querySelector('.result-time');
+
+            const startTime = Date.now();
+
+            try {
+                const response = await fetch(`${apiUrl}/v1/chat/completions`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        model: model,
+                        messages: [{ role: 'user', content: promptData.prompt }]
+                    })
+                });
+
+                const endTime = Date.now();
+                const duration = ((endTime - startTime) / 1000).toFixed(2);
+
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+
+                const data = await response.json();
+                const content = data.choices?.[0]?.message?.content || 'No content';
+
+                // Check if response contains the correct unique ID
+                const expectedId = promptData.uniqueId;
+                const matched = content.includes(expectedId);
+
+                contentDiv.textContent = content.slice(0, 500) + (content.length > 500 ? '...' : '');
+                timeDiv.textContent = `⏱️ ${duration}s`;
+
+                if (matched) {
+                    statusSpan.className = 'result-status status-success';
+                    statusSpan.textContent = '✅ Correct';
+                } else {
+                    statusSpan.className = 'result-status status-mismatch';
+                    statusSpan.textContent = '⚠️ ID Mismatch!';
+                }
+
+                testResults.push({
+                    id: promptData.id,
+                    matched: matched,
+                    error: false,
+                    duration: duration
+                });
+
+            } catch (e) {
+                const endTime = Date.now();
+                const duration = ((endTime - startTime) / 1000).toFixed(2);
+
+                statusSpan.className = 'result-status status-error';
+                statusSpan.textContent = '❌ Error';
+                contentDiv.textContent = e.message;
+                timeDiv.textContent = `⏱️ ${duration}s`;
+
+                testResults.push({
+                    id: promptData.id,
+                    matched: false,
+                    error: true,
+                    duration: duration
+                });
+            }
+        }
+    </script>
+</body>
+</html>

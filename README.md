@@ -215,26 +215,12 @@ print(response.choices[0].message.content)
 
 ---
 
-### AI Studio Models (⚠️ May be blocked by bot detection)
-| Model | Description |
-|-------|-------------|
-| `gemini-3-flash-preview` | Fast responses (default: High thinking) |
-| `gemini-3-flash-preview-minimal` | Minimal thinking |
-| `gemini-3-flash-preview-low` | Low thinking |
-| `gemini-3-flash-preview-medium` | Medium thinking |
-| `gemini-3-flash-preview-high` | High thinking |
-| `gemini-3-pro-preview` | More capable model |
-
-> ⚠️ AI Studio has aggressive bot detection. These models may fail frequently. Use Gemini Web models below for reliability.
-
-### Gemini Web Models ✅ (Recommended)
+### Available Models
 | Model | Description |
 |-------|-------------|
 | `fast` | Quick responses |
 | `thinking` | Complex problem solving |
 | `pro` | Advanced math & reasoning |
-
-> **Auto-Routing**: By default (`PROVIDER=auto`), the API automatically routes requests to the correct provider based on model name. Use `thinking`, `pro`, or `fast` to hit Gemini Web; use `gemini-3-*` models to hit AI Studio.
 
 ---
 
@@ -242,15 +228,14 @@ print(response.choices[0].message.content)
 
 ```env
 HEADLESS=true      # false to see the browser
-WORKER_COUNT=1     # Ignored in dual-provider mode
-PROVIDER=auto      # "auto" (default), "aistudio", or "gemini-web"
+WORKER_COUNT=2     # Number of parallel tabs (1 worker = 1 tab)
 ```
 
-| Provider Mode | Behavior |
-|---------------|----------|
-| `auto` | Opens both tabs, routes by model name |
-| `aistudio` | Only uses AI Studio |
-| `gemini-web` | Only uses Gemini Web |
+| Setting | Description |
+|---------|-------------|
+| `WORKER_COUNT` | Number of concurrent browser tabs. Each can handle one request. |
+| `HEADLESS` | Run browser invisibly (recommended for servers) |
+| `IDLE_TIMEOUT_MINUTES` | Close tabs after N minutes of inactivity (default: 30) |
 
 ---
 
