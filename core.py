@@ -1339,59 +1339,36 @@ class WorkerPool:
                 ])
             
             base_session_dir = os.path.join(os.path.dirname(__file__), ".browser_session")
-            main_session_dir = os.path.join(base_session_dir, "main")
-            
-            # Check for session in main/ folder first
-            main_has_session = os.path.exists(os.path.join(main_session_dir, "Default", "Cookies")) or \
-                               os.path.exists(os.path.join(main_session_dir, "Cookies"))
-            
-            # Fallback: check old location (directly in .browser_session/)
-            # and migrate to main/ if found
-            if not main_has_session:
-                old_session = os.path.exists(os.path.join(base_session_dir, "Default", "Cookies")) or \
-                              os.path.exists(os.path.join(base_session_dir, "Cookies"))
-                if old_session:
-                    log("Found session in old location, migrating to main/...", "WorkerPool")
-                    try:
-                        # Move old session to main/
-                        os.makedirs(main_session_dir, exist_ok=True)
-                        for item in os.listdir(base_session_dir):
-                            if item != "main" and not item.startswith("worker_"):
-                                src = os.path.join(base_session_dir, item)
-                                dst = os.path.join(main_session_dir, item)
-                                if os.path.isdir(src):
-                                    shutil.copytree(src, dst)
-                                else:
-                                    shutil.copy2(src, dst)
-                        main_has_session = True
-                        log("✅ Session migrated to main/", "WorkerPool")
-                    except Exception as e:
-                        log(f"Migration failed: {e}", "WorkerPool")
-            
-            os.makedirs(main_session_dir, exist_ok=True)
-            
-            if not main_has_session and is_headless:
-                log("⚠️ No login session found! Run 'python setup_login.py' first.", "WorkerPool")
+            os.makedirs(base_session_dir, exist_ok=True)
             
             log(f"Launching {self.worker_count} browser instance(s)...", "WorkerPool")
             
             workers_ok = 0
             for i in range(self.worker_count):
-                worker_dir = os.path.join(base_session_dir, f"worker_{i+1}")
-                
-                # Copy main session to worker folder (if main session exists)
-                if main_has_session and os.path.exists(main_session_dir):
+                if i == 0:
+                    # Worker 1: Use the ORIGINAL session folder (guaranteed to have login)
+                    worker_dir = base_session_dir
+                    log(f"Worker 1 using original session folder", "WorkerPool")
+                else:
+                    # Workers 2-N: Copy session from original folder
+                    worker_dir = os.path.join(base_session_dir, f"worker_{i+1}")
                     try:
-                        # Remove old worker folder and copy fresh from main
                         if os.path.exists(worker_dir):
                             shutil.rmtree(worker_dir)
-                        shutil.copytree(main_session_dir, worker_dir)
+                        # Copy everything except worker_* folders
+                        os.makedirs(worker_dir, exist_ok=True)
+                        for item in os.listdir(base_session_dir):
+                            if not item.startswith("worker_"):
+                                src = os.path.join(base_session_dir, item)
+                                dst = os.path.join(worker_dir, item)
+                                if os.path.isdir(src):
+                                    shutil.copytree(src, dst)
+                                else:
+                                    shutil.copy2(src, dst)
                         log(f"Copied session to worker_{i+1}", "WorkerPool")
                     except Exception as e:
                         log(f"Session copy warning for worker_{i+1}: {e}", "WorkerPool")
                         os.makedirs(worker_dir, exist_ok=True)
-                else:
-                    os.makedirs(worker_dir, exist_ok=True)
                 
                 log(f"Starting browser {i+1}/{self.worker_count}...", "WorkerPool")
                 
