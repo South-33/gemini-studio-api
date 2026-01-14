@@ -1229,13 +1229,8 @@ class WorkerPool:
         self.playwright = None
         self._initialized = False
         
-        # Request tracking for timeout/retry handling
-        self._active_requests: Dict[str, int] = {}  # prompt_hash -> worker_index
-        self._pending_results: Dict[str, Dict] = {}  # prompt_hash -> result
-        self._result_timestamps: Dict[str, float] = {}  # prompt_hash -> timestamp
         self._lock = asyncio.Lock()
         self._browser_semaphore = asyncio.Semaphore(worker_count)  # Allow N concurrent requests
-        self.RESULT_TTL = 10  # Results expire after 10 seconds (just for timeout retries)
         
         # Idle/Keepalive settings
         self.IDLE_TIMEOUT_MINUTES = int(os.getenv("IDLE_TIMEOUT_MINUTES", "30"))
@@ -1277,21 +1272,7 @@ class WorkerPool:
                 print(f"[WorkerPool] Released worker {index+1}/{len(self.workers)}")
     
 
-    def _hash_prompt(self, prompt: str) -> str:
-        """Create a hash of the prompt for tracking."""
-        import hashlib
-        # Use first 1000 chars to avoid hashing huge prompts
-        return hashlib.md5(prompt[:1000].encode()).hexdigest()[:16]
 
-    async def _cleanup_stale(self):
-        """Remove expired results."""
-        now = time.time()
-        stale_keys = [k for k, ts in self._result_timestamps.items() 
-                      if now - ts > self.RESULT_TTL]
-        for key in stale_keys:
-            self._pending_results.pop(key, None)
-            self._result_timestamps.pop(key, None)
-            self._active_requests.pop(key, None)
 
     async def _keepalive_loop(self):
         """Background task to visit Google occasionally to keep session alive."""
@@ -1302,11 +1283,11 @@ class WorkerPool:
             try:
                 await asyncio.sleep(self.KEEPALIVE_HOURS * 3600)
                 
-                # Check if we are busy
-                async with self._lock:
-                    if len(self._active_requests) > 0:
-                        print("[WorkerPool] ⏳ Skipping keepalive, system busy")
-                        continue
+                # Check if any workers are busy
+                busy_count = sum(1 for b in self._worker_busy if b)
+                if busy_count > 0:
+                    print("[WorkerPool] ⏳ Skipping keepalive, system busy")
+                    continue
                 
                 print("[WorkerPool] 💤 Visiting Google for session keepalive...")
                 async with self._wake_lock: # Ensure we don't clash with wake/sleep
@@ -1336,9 +1317,11 @@ class WorkerPool:
                 if idle_time >= self.IDLE_TIMEOUT_MINUTES and not self._is_sleeping:
                     async with self._idle_lock:
                         # Double check under lock
-                        async with self._lock:
-                            if len(self._active_requests) > 0:
-                                continue
+                        # Check if any workers are busy
+                        busy_count = sum(1 for b in self._worker_busy if b)
+                        if busy_count > 0:
+                            print("[WorkerPool] ⏳ Active requests, resetting idle timer")
+                            continue
                         
                         print(f"[WorkerPool] 🛌 System idle for {idle_time:.1f}m. Entering sleep mode...")
                         
@@ -1503,49 +1486,13 @@ class WorkerPool:
         Send message with round-robin worker dispatch.
         Supports N concurrent requests (1 per worker).
         """
-        prompt_hash = self._hash_prompt(prompt)
-        
         # Check sleep mode and wake up OUTSIDE the lock (wake-up can take 60s+)
         if self._is_sleeping:
             print("[WorkerPool] 🛌 System is sleeping, triggering wake up...")
             await self._wake_up()
         
-        async with self._lock:
-            await self._cleanup_stale()
-            
-            # Update activity
-            self._last_activity = time.time()
-
-            # Check if we have a cached result for this exact prompt
-            if prompt_hash in self._pending_results:
-                result = self._pending_results.pop(prompt_hash)
-                self._result_timestamps.pop(prompt_hash, None)
-                self._active_requests.pop(prompt_hash, None)
-                print(f"[WorkerPool] ✅ Returning cached result for {prompt_hash}")
-                return result
-            
-            # Check if this prompt is already being processed
-            is_duplicate = prompt_hash in self._active_requests
-            if is_duplicate:
-                print(f"[WorkerPool] ⏳ Request {prompt_hash} already in progress, waiting...")
-        
-        # If duplicate detected, wait outside the lock for result
-        if is_duplicate:
-            wait_start = time.time()
-            max_wait = 300  # 5 minute timeout for duplicate requests
-            while time.time() - wait_start < max_wait:
-                await asyncio.sleep(2)  # Poll every 2 seconds
-                async with self._lock:
-                    if prompt_hash in self._pending_results:
-                        result = self._pending_results.pop(prompt_hash)
-                        self._result_timestamps.pop(prompt_hash, None)
-                        print(f"[WorkerPool] ✅ Got result for duplicate request {prompt_hash}")
-                        return result
-                    if prompt_hash not in self._active_requests:
-                        # Original request finished but result was already consumed
-                        break
-            # Timeout or result consumed - let this request proceed (will re-run prompt)
-            print(f"[WorkerPool] ⚠️ Duplicate wait timeout/consumed for {prompt_hash}, proceeding")
+        # Update activity timestamp
+        self._last_activity = time.time()
         
         # No workers available
         if not self.workers:
@@ -1556,22 +1503,11 @@ class WorkerPool:
             # Get available worker (round-robin)
             worker_index, worker = await self._get_available_worker()
             
-            async with self._lock:
-                self._active_requests[prompt_hash] = worker_index
-            
             try:
                 print(f"[WorkerPool] Worker {worker_index+1} processing model '{model}'")
                 result = await worker.send_message(prompt, model, thinking_level, use_search, images)
-                
-                async with self._lock:
-                    self._pending_results[prompt_hash] = result
-                    self._result_timestamps[prompt_hash] = time.time()
-                
                 return result
             finally:
-                # Always clean up, even on exception
-                async with self._lock:
-                    self._active_requests.pop(prompt_hash, None)
                 await self._release_worker(worker_index)
                 self._last_activity = time.time()
 
