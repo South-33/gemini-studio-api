@@ -38,8 +38,8 @@ class BaseAutomation:
         self._last_activity = time.time()
 
     @staticmethod
-    async def _human_delay(min_ms: int = 100, max_ms: int = 400):
-        """Add random delay to simulate human interaction."""
+    async def _human_delay(min_ms: int = 50, max_ms: int = 150):
+        """Add random delay to simulate human interaction. Reduced for speed."""
         delay = random.uniform(min_ms, max_ms) / 1000
         await asyncio.sleep(delay)
 
@@ -1003,7 +1003,7 @@ class GeminiWebAutomation(BaseAutomation):
             
             async def verify_send_worked(before_text):
                 # Wait a moment then check if input is cleared
-                await self._human_delay(500, 800)  # Increased delay for reliability
+                await self._human_delay(200, 400)  # Reduced for speed
                 try:
                     # Try multiple methods to get input text (contenteditable vs textarea)
                     after_text = ""
@@ -1047,7 +1047,7 @@ class GeminiWebAutomation(BaseAutomation):
             
             # 5. Wait for Response (Copy button to appear)
             print(f"[Worker {self.worker_id}] Waiting for response...")
-            await self._human_delay(1500, 2500) # Initial wait
+            await self._human_delay(300, 600)  # Reduced initial wait
             
             # Polling for copy button (Wait until we have MORE buttons than before)
             start_time = time.time()
@@ -1064,7 +1064,7 @@ class GeminiWebAutomation(BaseAutomation):
                     if await copy_btn.is_visible():
                         break
                         
-                await asyncio.sleep(2)
+                await asyncio.sleep(1)  # Reduced from 2s
             
             if not copy_btn:
                 log(f"❌ TIMEOUT after {max_wait}s waiting for copy button", f"Worker {self.worker_id}")
@@ -1081,7 +1081,7 @@ class GeminiWebAutomation(BaseAutomation):
                     }
                 }
             ''')
-            await self._human_delay(400, 800)  # Wait for scroll to complete
+            await self._human_delay(150, 300)  # Reduced scroll wait
 
             # 6. Extraction via Copy Button (with lock to prevent clipboard race condition)
             log(f"Extracting markdown via Copy button...", f"Worker {self.worker_id}")
@@ -1089,7 +1089,7 @@ class GeminiWebAutomation(BaseAutomation):
             # Lock clipboard access to prevent race between workers
             async with GeminiWebAutomation._get_clipboard_lock():
                 await copy_btn.click()
-                await self._human_delay(400, 800)  # Wait for clipboard
+                await self._human_delay(100, 200)  # Reduced - clipboard is fast
                 markdown = await self.page.evaluate("navigator.clipboard.readText()")
             
             self._generation_in_progress = False
