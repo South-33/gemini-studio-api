@@ -29,9 +29,9 @@ for /f "tokens=5" %%p in ('netstat -ano ^| findstr ":%PORT% " ^| findstr "LISTEN
 )
 timeout /t 3 /nobreak >nul
 
-:: Start the API (with unbuffered output to fix Windows terminal buffering)
+:: Start the API (with unbuffered output, keep window visible to prevent Windows console suspension)
 echo [2/3] Starting API server on port %PORT%...
-start "GeminiAPI" /min cmd /c "set PYTHONUNBUFFERED=1 && python -u main.py"
+start "GeminiAPI" cmd /c "set PYTHONUNBUFFERED=1 && python -u main.py"
 
 :: Start ngrok immediately (it'll just wait for API to be ready)
 echo [3/3] Starting ngrok tunnel on port %PORT%...
