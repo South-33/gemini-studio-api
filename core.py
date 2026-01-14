@@ -1317,7 +1317,7 @@ class WorkerPool:
                     self._worker_busy[index] = False
 
     async def init(self, cookies: List[Dict]) -> bool:
-        """Launch N separate browser instances. Session copied from 'main' folder to each worker."""
+        """Launch N separate browser instances, all using the same session folder."""
         import shutil
         
         try:
@@ -1341,34 +1341,12 @@ class WorkerPool:
             base_session_dir = os.path.join(os.path.dirname(__file__), ".browser_session")
             os.makedirs(base_session_dir, exist_ok=True)
             
-            log(f"Launching {self.worker_count} browser instance(s)...", "WorkerPool")
+            log(f"Launching {self.worker_count} browser instance(s) (same session folder)...", "WorkerPool")
             
             workers_ok = 0
             for i in range(self.worker_count):
-                if i == 0:
-                    # Worker 1: Use the ORIGINAL session folder (guaranteed to have login)
-                    worker_dir = base_session_dir
-                    log(f"Worker 1 using original session folder", "WorkerPool")
-                else:
-                    # Workers 2-N: Copy session from original folder
-                    worker_dir = os.path.join(base_session_dir, f"worker_{i+1}")
-                    try:
-                        if os.path.exists(worker_dir):
-                            shutil.rmtree(worker_dir)
-                        # Copy everything except worker_* folders
-                        os.makedirs(worker_dir, exist_ok=True)
-                        for item in os.listdir(base_session_dir):
-                            if not item.startswith("worker_"):
-                                src = os.path.join(base_session_dir, item)
-                                dst = os.path.join(worker_dir, item)
-                                if os.path.isdir(src):
-                                    shutil.copytree(src, dst)
-                                else:
-                                    shutil.copy2(src, dst)
-                        log(f"Copied session to worker_{i+1}", "WorkerPool")
-                    except Exception as e:
-                        log(f"Session copy warning for worker_{i+1}: {e}", "WorkerPool")
-                        os.makedirs(worker_dir, exist_ok=True)
+                # ALL browsers use the SAME session folder
+                worker_dir = base_session_dir
                 
                 log(f"Starting browser {i+1}/{self.worker_count}...", "WorkerPool")
                 
