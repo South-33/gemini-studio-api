@@ -1340,14 +1340,38 @@ class WorkerPool:
             
             base_session_dir = os.path.join(os.path.dirname(__file__), ".browser_session")
             main_session_dir = os.path.join(base_session_dir, "main")
-            os.makedirs(main_session_dir, exist_ok=True)
             
-            # Check if main session exists (has cookies)
+            # Check for session in main/ folder first
             main_has_session = os.path.exists(os.path.join(main_session_dir, "Default", "Cookies")) or \
                                os.path.exists(os.path.join(main_session_dir, "Cookies"))
             
+            # Fallback: check old location (directly in .browser_session/)
+            # and migrate to main/ if found
+            if not main_has_session:
+                old_session = os.path.exists(os.path.join(base_session_dir, "Default", "Cookies")) or \
+                              os.path.exists(os.path.join(base_session_dir, "Cookies"))
+                if old_session:
+                    log("Found session in old location, migrating to main/...", "WorkerPool")
+                    try:
+                        # Move old session to main/
+                        os.makedirs(main_session_dir, exist_ok=True)
+                        for item in os.listdir(base_session_dir):
+                            if item != "main" and not item.startswith("worker_"):
+                                src = os.path.join(base_session_dir, item)
+                                dst = os.path.join(main_session_dir, item)
+                                if os.path.isdir(src):
+                                    shutil.copytree(src, dst)
+                                else:
+                                    shutil.copy2(src, dst)
+                        main_has_session = True
+                        log("✅ Session migrated to main/", "WorkerPool")
+                    except Exception as e:
+                        log(f"Migration failed: {e}", "WorkerPool")
+            
+            os.makedirs(main_session_dir, exist_ok=True)
+            
             if not main_has_session and is_headless:
-                log("⚠️ No login session found! Run with HEADLESS=false first to log in.", "WorkerPool")
+                log("⚠️ No login session found! Run 'python setup_login.py' first.", "WorkerPool")
             
             log(f"Launching {self.worker_count} browser instance(s)...", "WorkerPool")
             

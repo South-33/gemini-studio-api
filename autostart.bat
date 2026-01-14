@@ -7,18 +7,28 @@ echo ==========================================
 :: Navigate to script directory
 cd /d "%~dp0"
 
-:: Load PORT and NGROK_DOMAIN from .env file
+:: Load PORT, NGROK_DOMAIN, and WORKER_COUNT from .env file
 set PORT=8001
 for /f "tokens=1,2 delims==" %%a in (.env) do (
     if "%%a"=="PORT" set PORT=%%b
     if "%%a"=="NGROK_DOMAIN" set NGROK_DOMAIN=%%b
+    if "%%a"=="WORKER_COUNT" set WORKER_COUNT=%%b
 )
-echo [Config] PORT=%PORT%
+echo [Config] PORT=%PORT%, WORKERS=%WORKER_COUNT%
 
 if not defined NGROK_DOMAIN (
     echo [ERROR] NGROK_DOMAIN not set in .env file!
     pause
     exit /b 1
+)
+
+:: Check if login session exists
+if not exist ".browser_session\main\Default\Cookies" (
+    if not exist ".browser_session\main\Cookies" (
+        echo [WARNING] No login session found!
+        echo Run 'python setup_login.py' first to log in.
+        echo.
+    )
 )
 
 :: Kill any orphaned processes on this port
@@ -30,7 +40,7 @@ for /f "tokens=5" %%p in ('netstat -ano ^| findstr ":%PORT% " ^| findstr "LISTEN
 timeout /t 3 /nobreak >nul
 
 :: Start the API
-echo [2/3] Starting API server on port %PORT%...
+echo [2/3] Starting API server on port %PORT% with %WORKER_COUNT% workers...
 start "GeminiAPI" /min cmd /c "python main.py"
 
 :: Start ngrok immediately (it'll just wait for API to be ready)
