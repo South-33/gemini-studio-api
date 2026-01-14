@@ -1022,11 +1022,11 @@ class GeminiWebAutomation(BaseAutomation):
             )
             
             if not send_success:
-                print("[GeminiWeb] ❌ Send failed - check selector or UI state")
+                print(f"[Worker {self.worker_id}] ❌ Send failed - check selector or UI state")
                 return {"success": False, "error": "Send button click failed"}
             
             # 5. Wait for Response (Copy button to appear)
-            print("[GeminiWeb] Waiting for response...")
+            print(f"[Worker {self.worker_id}] Waiting for response...")
             await self._human_delay(1500, 2500) # Initial wait
             
             # Polling for copy button (Wait until we have MORE buttons than before)
@@ -1050,7 +1050,7 @@ class GeminiWebAutomation(BaseAutomation):
                  return {"success": False, "error": "Timeout waiting for copy button"}
 
             # Auto-scroll to ensure copy button is visible
-            print("[GeminiWeb] Scrolling to copy button...")
+            print(f"[Worker {self.worker_id}] Scrolling to copy button...")
             await self.page.evaluate('''
                 () => {
                     const copyButtons = document.querySelectorAll('button[aria-label="Copy"]');
@@ -1086,11 +1086,11 @@ class GeminiWebAutomation(BaseAutomation):
 
         except Exception as e:
             self._generation_in_progress = False
-            print(f"[GeminiWeb] Error: {e}")
+            print(f"[Worker {self.worker_id}] ❌ Error: {e}")
             
             # Force refresh to reset page state for next request
             try:
-                print("[GeminiWeb] 🔄 Error recovery: refreshing page...")
+                print(f"[Worker {self.worker_id}] 🔄 Error recovery: refreshing page...")
                 await self.page.reload(wait_until="domcontentloaded", timeout=15000)
                 self._request_count = 0  # Reset counter since we just refreshed
             except:
@@ -1136,14 +1136,14 @@ class GeminiWebAutomation(BaseAutomation):
                 text = await item.inner_text()
                 if model_name.lower() in text.lower():
                     await item.click()
-                    print(f"[GeminiWeb] ✅ Selected model: {model_name}")
+                    print(f"[Worker {self.worker_id}] ✅ Selected model: {model_name}")
                     await self._human_delay(300, 600)
                     return
             # If not found, close menu
             await self.page.keyboard.press("Escape")
             await self._human_delay(100, 300)
         except Exception as e:
-            print(f"[GeminiWeb] ⚠️ Model selection failed: {e}")
+            print(f"[Worker {self.worker_id}] ⚠️ Model selection failed: {e}")
 
     async def _wait_and_extract_pending(self) -> Dict:
         # Simplified for web: just try to extract if button exists
@@ -1161,7 +1161,7 @@ class GeminiWebAutomation(BaseAutomation):
     async def _paste_image(self, image_path: str):
         """Paste an image via clipboard into Gemini Web."""
         try:
-            print(f"[GeminiWeb] Pasting image: {image_path}")
+            print(f"[Worker {self.worker_id}] Pasting image: {image_path}")
             
             with open(image_path, 'rb') as f:
                 image_data = f.read()
@@ -1203,9 +1203,9 @@ class GeminiWebAutomation(BaseAutomation):
             
             await self.page.keyboard.press("Control+v")
             await asyncio.sleep(1.0)
-            print(f"[GeminiWeb] ✅ Image pasted")
+            print(f"[Worker {self.worker_id}] ✅ Image pasted")
         except Exception as e:
-            print(f"[GeminiWeb] ⚠️ Image paste warning: {e}")
+            print(f"[Worker {self.worker_id}] ⚠️ Image paste warning: {e}")
 
     async def close(self):
         await super().close()
@@ -1566,10 +1566,12 @@ class WorkerPool:
                 async with self._lock:
                     self._pending_results[prompt_hash] = result
                     self._result_timestamps[prompt_hash] = time.time()
-                    self._active_requests.pop(prompt_hash, None)
                 
                 return result
             finally:
+                # Always clean up, even on exception
+                async with self._lock:
+                    self._active_requests.pop(prompt_hash, None)
                 await self._release_worker(worker_index)
                 self._last_activity = time.time()
 

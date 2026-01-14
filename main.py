@@ -45,7 +45,7 @@ async def init_browser_thread():
 async def lifespan(app: FastAPI):
     success = await init_browser_thread()
     if success:
-        print(f"[Server] ✅ Dual-Provider Worker Pool Ready (Provider mode: {PROVIDER})")
+        print(f"[Server] ✅ Multi-Worker Pool Ready ({WORKER_COUNT} workers)")
     
     yield
     if worker_pool:
