@@ -642,6 +642,9 @@ class GeminiWebAutomation(BaseAutomation):
     # Hard refresh every N requests to clear browser cache/memory
     REFRESH_EVERY_N_REQUESTS = 10
     
+    # Shared lock for clipboard operations (clipboard is shared across all tabs)
+    _clipboard_lock = None  # Will be initialized as asyncio.Lock() on first use
+    
     # Selectors discovered during research
     SELECTORS = {
         "input": 'div[role="textbox"][aria-label="Enter a prompt here"]',
@@ -656,8 +659,9 @@ class GeminiWebAutomation(BaseAutomation):
         "menu_item": '.mat-mdc-menu-item'
     }
     
-    def __init__(self):
+    def __init__(self, worker_id: int = 0):
         super().__init__()
+        self.worker_id = worker_id  # For logging
         self._request_count = 0
         self._request_id = None  # Set per-request for log tracing
 
@@ -1058,17 +1062,26 @@ class GeminiWebAutomation(BaseAutomation):
             ''')
             await self._human_delay(400, 800)  # Wait for scroll to complete
 
-            # 6. Extraction via Copy Button
-            print("[GeminiWeb] Extracting markdown...")
-            await copy_btn.click()
-            await self._human_delay(400, 800) # Wait for clipboard
+            # 6. Extraction via Copy Button (with lock to prevent clipboard race condition)
+            print(f"[Worker {self.worker_id}] Extracting markdown via Copy button...")
             
-            markdown = await self.page.evaluate("navigator.clipboard.readText()")
+            # Initialize shared clipboard lock if needed
+            if GeminiWebAutomation._clipboard_lock is None:
+                GeminiWebAutomation._clipboard_lock = asyncio.Lock()
+            
+            # Lock clipboard access to prevent race between workers
+            async with GeminiWebAutomation._clipboard_lock:
+                await copy_btn.click()
+                await self._human_delay(400, 800)  # Wait for clipboard
+                markdown = await self.page.evaluate("navigator.clipboard.readText()")
+            
             self._generation_in_progress = False
             
             if not markdown:
-                return {"success": False, "error": "Clipboard empty after copy"}
+                print(f"[Worker {self.worker_id}] ⚠️ Clipboard empty, trying fallback...")
+                return await self._fallback_extract()
 
+            print(f"[Worker {self.worker_id}] ✅ Extracted {len(markdown)} chars")
             return {"success": True, "response": markdown.strip()}
 
         except Exception as e:
@@ -1237,7 +1250,10 @@ class WorkerPool:
     
     async def _get_available_worker(self) -> Tuple[int, GeminiWebAutomation]:
         """Get first available worker (round-robin). Waits if all are busy."""
-        while True:
+        start_time = time.time()
+        max_wait = 60  # 60 second timeout to prevent infinite loop
+        
+        while time.time() - start_time < max_wait:
             async with self._worker_lock:
                 for i, busy in enumerate(self._worker_busy):
                     if not busy and self.workers[i]._initialized:
@@ -1246,12 +1262,19 @@ class WorkerPool:
                         return i, self.workers[i]
             # All workers busy, wait and retry
             await asyncio.sleep(0.5)
+        
+        # Timeout - force assign to first worker (will queue)
+        print(f"[WorkerPool] ⚠️ Worker assignment timeout, forcing worker 1")
+        async with self._worker_lock:
+            self._worker_busy[0] = True
+        return 0, self.workers[0]
     
-    def _release_worker(self, index: int):
-        """Mark worker as available."""
-        if 0 <= index < len(self._worker_busy):
-            self._worker_busy[index] = False
-            print(f"[WorkerPool] Released worker {index+1}/{len(self.workers)}")
+    async def _release_worker(self, index: int):
+        """Mark worker as available (async for thread safety)."""
+        async with self._worker_lock:
+            if 0 <= index < len(self._worker_busy):
+                self._worker_busy[index] = False
+                print(f"[WorkerPool] Released worker {index+1}/{len(self.workers)}")
     
 
     def _hash_prompt(self, prompt: str) -> str:
@@ -1451,7 +1474,7 @@ class WorkerPool:
                 except Exception as e:
                     print(f"[WorkerPool] ⚠️ Tab {i+1} navigation warning: {e}")
                 
-                worker = GeminiWebAutomation()
+                worker = GeminiWebAutomation(worker_id=i+1)
                 if await worker.init_with_page(page, self.shared_context):
                     workers_ok += 1
                 self.workers.append(worker)
@@ -1547,7 +1570,7 @@ class WorkerPool:
                 
                 return result
             finally:
-                self._release_worker(worker_index)
+                await self._release_worker(worker_index)
                 self._last_activity = time.time()
 
 

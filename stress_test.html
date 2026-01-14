@@ -1,10 +1,13 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Gemini Worker Stress Test</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400&display=swap"
+        rel="stylesheet">
     <style>
         :root {
             --bg: #0f0f1a;
@@ -16,7 +19,13 @@
             --text: #e0e0e0;
             --dim: #888;
         }
-        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
         body {
             font-family: 'Inter', sans-serif;
             background: var(--bg);
@@ -24,6 +33,7 @@
             min-height: 100vh;
             padding: 40px;
         }
+
         h1 {
             font-size: 1.8rem;
             font-weight: 700;
@@ -33,27 +43,36 @@
             -webkit-text-fill-color: transparent;
             margin-bottom: 8px;
         }
-        .subtitle { color: var(--dim); margin-bottom: 30px; }
+
+        .subtitle {
+            color: var(--dim);
+            margin-bottom: 30px;
+        }
+
         .config {
             display: flex;
             gap: 16px;
             flex-wrap: wrap;
             margin-bottom: 30px;
         }
+
         .config-item {
             display: flex;
             flex-direction: column;
             gap: 6px;
         }
+
         .config-item label {
             font-size: 0.75rem;
             text-transform: uppercase;
             color: var(--dim);
             font-weight: 600;
         }
-        input, select {
+
+        input,
+        select {
             background: var(--card);
-            border: 1px solid rgba(255,255,255,0.1);
+            border: 1px solid rgba(255, 255, 255, 0.1);
             border-radius: 8px;
             padding: 12px 16px;
             color: var(--text);
@@ -61,10 +80,13 @@
             font-size: 0.9rem;
             min-width: 180px;
         }
-        input:focus, select:focus {
+
+        input:focus,
+        select:focus {
             outline: none;
             border-color: var(--accent);
         }
+
         .btn {
             padding: 12px 24px;
             border: none;
@@ -73,49 +95,81 @@
             cursor: pointer;
             transition: all 0.2s;
         }
+
         .btn-primary {
             background: var(--accent);
             color: white;
         }
-        .btn-primary:hover { filter: brightness(1.1); transform: translateY(-1px); }
-        .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+
+        .btn-primary:hover {
+            filter: brightness(1.1);
+            transform: translateY(-1px);
+        }
+
+        .btn-primary:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
         .btn-secondary {
             background: var(--card);
             color: var(--text);
-            border: 1px solid rgba(255,255,255,0.1);
+            border: 1px solid rgba(255, 255, 255, 0.1);
         }
+
         .results {
             display: grid;
             grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
             gap: 16px;
             margin-top: 30px;
         }
+
         .result-card {
             background: var(--card);
             border-radius: 12px;
             padding: 20px;
-            border: 1px solid rgba(255,255,255,0.05);
+            border: 1px solid rgba(255, 255, 255, 0.05);
         }
+
         .result-header {
             display: flex;
             justify-content: space-between;
             align-items: center;
             margin-bottom: 12px;
         }
+
         .result-id {
             font-weight: 600;
             font-size: 0.9rem;
         }
+
         .result-status {
             padding: 4px 10px;
             border-radius: 20px;
             font-size: 0.75rem;
             font-weight: 600;
         }
-        .status-pending { background: rgba(255,171,0,0.2); color: var(--warning); }
-        .status-success { background: rgba(0,230,118,0.2); color: var(--success); }
-        .status-error { background: rgba(255,82,82,0.2); color: var(--error); }
-        .status-mismatch { background: rgba(255,82,82,0.3); color: #ff8a80; }
+
+        .status-pending {
+            background: rgba(255, 171, 0, 0.2);
+            color: var(--warning);
+        }
+
+        .status-success {
+            background: rgba(0, 230, 118, 0.2);
+            color: var(--success);
+        }
+
+        .status-error {
+            background: rgba(255, 82, 82, 0.2);
+            color: var(--error);
+        }
+
+        .status-mismatch {
+            background: rgba(255, 82, 82, 0.3);
+            color: #ff8a80;
+        }
+
         .result-content {
             font-family: 'JetBrains Mono', monospace;
             font-size: 0.8rem;
@@ -125,15 +179,17 @@
             max-height: 150px;
             overflow-y: auto;
             margin-top: 10px;
-            background: rgba(0,0,0,0.2);
+            background: rgba(0, 0, 0, 0.2);
             padding: 10px;
             border-radius: 6px;
         }
+
         .result-time {
             font-size: 0.75rem;
             color: var(--dim);
             margin-top: 8px;
         }
+
         .summary {
             background: var(--card);
             border-radius: 12px;
@@ -141,30 +197,50 @@
             margin-top: 20px;
             display: none;
         }
-        .summary.visible { display: block; }
-        .summary h3 { margin-bottom: 12px; }
+
+        .summary.visible {
+            display: block;
+        }
+
+        .summary h3 {
+            margin-bottom: 12px;
+        }
+
         .stats {
             display: flex;
             gap: 30px;
             flex-wrap: wrap;
         }
+
         .stat {
             text-align: center;
         }
+
         .stat-value {
             font-size: 2rem;
             font-weight: 700;
         }
+
         .stat-label {
             font-size: 0.75rem;
             color: var(--dim);
             text-transform: uppercase;
         }
-        .stat-success .stat-value { color: var(--success); }
-        .stat-error .stat-value { color: var(--error); }
-        .stat-mismatch .stat-value { color: #ff8a80; }
+
+        .stat-success .stat-value {
+            color: var(--success);
+        }
+
+        .stat-error .stat-value {
+            color: var(--error);
+        }
+
+        .stat-mismatch .stat-value {
+            color: #ff8a80;
+        }
     </style>
 </head>
+
 <body>
     <h1>🔥 Worker Stress Test</h1>
     <p class="subtitle">Fire multiple parallel requests to verify worker isolation</p>
@@ -254,11 +330,11 @@
             // Create unique test prompts - each has a UNIQUE identifier
             const prompts = [];
             for (let i = 0; i < count; i++) {
-                const uniqueId = `TEST_${i + 1}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+                const uniqueId = `ID_${i + 1}_${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
                 prompts.push({
                     id: i + 1,
                     uniqueId: uniqueId,
-                    prompt: `IMPORTANT: Your response MUST start with this exact code: [${uniqueId}]\n\nAfter the code, tell me a unique fact about the number ${i + 1}. Keep it to 1-2 sentences.`
+                    prompt: `Reply with ONLY this exact text, nothing else: ${uniqueId}`
                 });
             }
 
@@ -378,4 +454,5 @@
         }
     </script>
 </body>
+
 </html>
