@@ -7,10 +7,16 @@ from datetime import datetime
 from typing import List, Dict, Optional, Tuple
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page, Route
 
+# --- Timestamped Logging ---
+def log(msg: str, tag: str = "Core"):
+    """Print with timestamp for debugging."""
+    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    print(f"[{ts}] [{tag}] {msg}", flush=True)
+
 # Low memory mode: block images, fonts, etc.
 LOW_MEMORY_MODE = os.getenv("LOW_MEMORY_MODE", "true").lower() == "true"
 
-# Slow VM mode: use JavaScript clicks instead of Playwright clicks (for e2-micro etc)
+# Slow VM mode: use JavaScript clicks instead of Playwright clicks
 SLOW_VM_MODE = os.getenv("SLOW_VM_MODE", "true").lower() == "true"
 
 # Debug screenshots on failure (disabled by default for performance)
@@ -643,7 +649,15 @@ class GeminiWebAutomation(BaseAutomation):
     REFRESH_EVERY_N_REQUESTS = 10
     
     # Shared lock for clipboard operations (clipboard is shared across all tabs)
-    _clipboard_lock = asyncio.Lock()
+    # Note: Using class-level lock - all workers share this across tabs
+    _clipboard_lock: asyncio.Lock = None  # Lazy init to ensure correct event loop
+    
+    @classmethod
+    def _get_clipboard_lock(cls) -> asyncio.Lock:
+        """Get or create clipboard lock (lazy init for correct event loop)."""
+        if cls._clipboard_lock is None:
+            cls._clipboard_lock = asyncio.Lock()
+        return cls._clipboard_lock
     
     # Selectors discovered during research
     SELECTORS = {
@@ -1064,10 +1078,10 @@ class GeminiWebAutomation(BaseAutomation):
             await self._human_delay(400, 800)  # Wait for scroll to complete
 
             # 6. Extraction via Copy Button (with lock to prevent clipboard race condition)
-            print(f"[Worker {self.worker_id}] Extracting markdown via Copy button...")
+            log(f"Extracting markdown via Copy button...", f"Worker {self.worker_id}")
             
             # Lock clipboard access to prevent race between workers
-            async with GeminiWebAutomation._clipboard_lock:
+            async with GeminiWebAutomation._get_clipboard_lock():
                 await copy_btn.click()
                 await self._human_delay(400, 800)  # Wait for clipboard
                 markdown = await self.page.evaluate("navigator.clipboard.readText()")
@@ -1250,13 +1264,13 @@ class WorkerPool:
                 for i, busy in enumerate(self._worker_busy):
                     if not busy and self.workers[i]._initialized:
                         self._worker_busy[i] = True
-                        print(f"[WorkerPool] Assigned worker {i+1}/{len(self.workers)}")
+                        log(f"Assigned worker {i+1}/{len(self.workers)}", "WorkerPool")
                         return i, self.workers[i]
             # All workers busy, wait and retry
             await asyncio.sleep(0.5)
         
         # Timeout - force assign to first worker (will queue)
-        print(f"[WorkerPool] ⚠️ Worker assignment timeout, forcing worker 1")
+        log(f"⚠️ Worker assignment timeout, forcing worker 1", "WorkerPool")
         async with self._worker_lock:
             self._worker_busy[0] = True
         return 0, self.workers[0]
@@ -1266,7 +1280,7 @@ class WorkerPool:
         async with self._worker_lock:
             if 0 <= index < len(self._worker_busy):
                 self._worker_busy[index] = False
-                print(f"[WorkerPool] Released worker {index+1}/{len(self.workers)}")
+                log(f"Released worker {index+1}/{len(self.workers)}", "WorkerPool")
     
 
 
@@ -1483,9 +1497,11 @@ class WorkerPool:
         Send message with round-robin worker dispatch.
         Supports N concurrent requests (1 per worker).
         """
+        log(f">>> ENTER send_message (model={model})", "WorkerPool")
+        
         # Check sleep mode and wake up OUTSIDE the lock (wake-up can take 60s+)
         if self._is_sleeping:
-            print("[WorkerPool] 🛌 System is sleeping, triggering wake up...")
+            log("🛌 System is sleeping, triggering wake up...", "WorkerPool")
             await self._wake_up()
         
         # Update activity timestamp
@@ -1493,23 +1509,27 @@ class WorkerPool:
         
         # No workers available
         if not self.workers:
+            log("<<< EXIT send_message (no workers)", "WorkerPool")
             return {"success": False, "error": "No workers available"}
         
         # Acquire semaphore (limits concurrent requests to N workers)
+        log(f"Acquiring semaphore...", "WorkerPool")
         async with self._browser_semaphore:
+            log(f"Semaphore acquired, getting worker...", "WorkerPool")
             # Get available worker (round-robin)
             worker_index, worker = await self._get_available_worker()
             
             try:
-                print(f"[WorkerPool] Worker {worker_index+1} processing model '{model}'")
+                log(f"Worker {worker_index+1} processing model '{model}'", "WorkerPool")
                 result = await worker.send_message(prompt, model, thinking_level, use_search, images)
                 
                 # Log result status for debugging
                 if result.get("success"):
-                    print(f"[WorkerPool] Worker {worker_index+1} completed successfully")
+                    log(f"Worker {worker_index+1} completed successfully", "WorkerPool")
                 else:
-                    print(f"[WorkerPool] Worker {worker_index+1} returned error: {result.get('error', 'unknown')}")
+                    log(f"Worker {worker_index+1} returned error: {result.get('error', 'unknown')}", "WorkerPool")
                 
+                log(f"<<< EXIT send_message (success={result.get('success')})", "WorkerPool")
                 return result
             finally:
                 await self._release_worker(worker_index)

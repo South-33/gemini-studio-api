@@ -10,12 +10,19 @@ import base64
 import tempfile
 import json
 import time
+from datetime import datetime
 from typing import List, Optional, Dict, Union
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
+
+# --- Timestamped Logging ---
+def log(msg: str, tag: str = "Server"):
+    """Print with timestamp for debugging."""
+    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    print(f"[{ts}] [{tag}] {msg}", flush=True)
 
 # Load .env file
 load_dotenv()
@@ -50,7 +57,7 @@ async def init_browser_thread():
 async def lifespan(app: FastAPI):
     success = await init_browser_thread()
     if success:
-        print(f"[Server] ✅ Multi-Worker Pool Ready ({WORKER_COUNT} workers)")
+        log(f"✅ Multi-Worker Pool Ready ({WORKER_COUNT} workers)")
     
     yield
     if worker_pool:
@@ -138,7 +145,7 @@ async def openai_chat(request: Request):
     if thinking_level_explicit:
         thinking_level = thinking_level_explicit
 
-    print(f"[API] Model: {base_model} | Thinking: {thinking_level} | Messages: {len(messages)}", flush=True)
+    log(f"Model: {base_model} | Thinking: {thinking_level} | Messages: {len(messages)}", "API")
 
     # Combine messages and extract images
     prompt = ""
@@ -168,12 +175,13 @@ async def openai_chat(request: Request):
                             temp_file.close()
                             image_paths.append(temp_file.name)
                         except Exception as e:
-                            print(f"[API] Failed to decode image: {e}")
+                            log(f"Failed to decode image: {e}", "API")
         else:
             if content:
                 prompt += content + "\n"
     
     # Send to worker
+    log(f"Dispatching to browser thread...", "API")
     coro = worker_pool.send_message(
         prompt, 
         model=base_model, 
@@ -183,8 +191,20 @@ async def openai_chat(request: Request):
     )
     future = asyncio.run_coroutine_threadsafe(coro, browser_loop)
     
+    # CRITICAL: Use timeout to prevent infinite blocking
+    # The lambda with timeout prevents run_in_executor from blocking forever
+    BROWSER_TIMEOUT = 300  # 5 minutes max for generation
+    
     try:
-        result = await asyncio.get_event_loop().run_in_executor(None, future.result)
+        log(f"Waiting for browser thread (timeout={BROWSER_TIMEOUT}s)...", "API")
+        result = await asyncio.get_event_loop().run_in_executor(
+            None, 
+            lambda: future.result(timeout=BROWSER_TIMEOUT)
+        )
+        log(f"Browser thread returned", "API")
+    except TimeoutError:
+        log(f"❌ BROWSER TIMEOUT after {BROWSER_TIMEOUT}s - request stuck in browser thread", "API")
+        raise HTTPException(status_code=504, detail=f"Browser operation timed out after {BROWSER_TIMEOUT}s")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
@@ -196,7 +216,7 @@ async def openai_chat(request: Request):
         raise HTTPException(status_code=500, detail=result.get("error"))
 
     content = result["response"] or ""
-    print(f"[API] Got response ({len(content)} chars)")
+    log(f"Got response ({len(content)} chars)", "API")
     
     return {
         "id": f"chatcmpl-{int(time.time())}",
