@@ -1317,7 +1317,7 @@ class WorkerPool:
                     self._worker_busy[index] = False
 
     async def init(self, cookies: List[Dict]) -> bool:
-        """Launch N separate browser instances, all using the same session folder."""
+        """Launch N separate browser instances. Copy session to all folders FIRST, then launch."""
         import shutil
         
         try:
@@ -1341,12 +1341,39 @@ class WorkerPool:
             base_session_dir = os.path.join(os.path.dirname(__file__), ".browser_session")
             os.makedirs(base_session_dir, exist_ok=True)
             
-            log(f"Launching {self.worker_count} browser instance(s) (same session folder)...", "WorkerPool")
+            # STEP 1: Copy session to all worker folders BEFORE launching any browser
+            log(f"Preparing {self.worker_count} session folders...", "WorkerPool")
+            worker_dirs = []
+            for i in range(self.worker_count):
+                worker_dir = os.path.join(base_session_dir, f"worker_{i+1}")
+                worker_dirs.append(worker_dir)
+                
+                try:
+                    # Remove old worker folder
+                    if os.path.exists(worker_dir):
+                        shutil.rmtree(worker_dir)
+                    
+                    # Copy main session (everything except worker_* folders)
+                    os.makedirs(worker_dir, exist_ok=True)
+                    for item in os.listdir(base_session_dir):
+                        if not item.startswith("worker_"):
+                            src = os.path.join(base_session_dir, item)
+                            dst = os.path.join(worker_dir, item)
+                            if os.path.isdir(src):
+                                shutil.copytree(src, dst)
+                            else:
+                                shutil.copy2(src, dst)
+                    log(f"✅ Copied session to worker_{i+1}", "WorkerPool")
+                except Exception as e:
+                    log(f"⚠️ Session copy failed for worker_{i+1}: {e}", "WorkerPool")
+                    os.makedirs(worker_dir, exist_ok=True)
+            
+            # STEP 2: Now launch all browsers (each using its own copied folder)
+            log(f"Launching {self.worker_count} browser instance(s)...", "WorkerPool")
             
             workers_ok = 0
             for i in range(self.worker_count):
-                # ALL browsers use the SAME session folder
-                worker_dir = base_session_dir
+                worker_dir = worker_dirs[i]
                 
                 log(f"Starting browser {i+1}/{self.worker_count}...", "WorkerPool")
                 
@@ -1377,7 +1404,6 @@ class WorkerPool:
                     
                 except Exception as e:
                     log(f"❌ Browser {i+1} failed: {e}", "WorkerPool")
-                
                 if i < self.worker_count - 1:
                     await asyncio.sleep(2)
             
