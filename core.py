@@ -643,7 +643,7 @@ class GeminiWebAutomation(BaseAutomation):
     REFRESH_EVERY_N_REQUESTS = 10
     
     # Shared lock for clipboard operations (clipboard is shared across all tabs)
-    _clipboard_lock = None  # Will be initialized as asyncio.Lock() on first use
+    _clipboard_lock = asyncio.Lock()
     
     # Selectors discovered during research
     SELECTORS = {
@@ -1047,7 +1047,8 @@ class GeminiWebAutomation(BaseAutomation):
                 await asyncio.sleep(2)
             
             if not copy_btn:
-                 return {"success": False, "error": "Timeout waiting for copy button"}
+                print(f"[Worker {self.worker_id}] ❌ TIMEOUT after {max_wait}s waiting for copy button")
+                return {"success": False, "error": f"Timeout after {max_wait}s waiting for response"}
 
             # Auto-scroll to ensure copy button is visible
             print(f"[Worker {self.worker_id}] Scrolling to copy button...")
@@ -1064,10 +1065,6 @@ class GeminiWebAutomation(BaseAutomation):
 
             # 6. Extraction via Copy Button (with lock to prevent clipboard race condition)
             print(f"[Worker {self.worker_id}] Extracting markdown via Copy button...")
-            
-            # Initialize shared clipboard lock if needed
-            if GeminiWebAutomation._clipboard_lock is None:
-                GeminiWebAutomation._clipboard_lock = asyncio.Lock()
             
             # Lock clipboard access to prevent race between workers
             async with GeminiWebAutomation._clipboard_lock:
@@ -1506,6 +1503,13 @@ class WorkerPool:
             try:
                 print(f"[WorkerPool] Worker {worker_index+1} processing model '{model}'")
                 result = await worker.send_message(prompt, model, thinking_level, use_search, images)
+                
+                # Log result status for debugging
+                if result.get("success"):
+                    print(f"[WorkerPool] Worker {worker_index+1} completed successfully")
+                else:
+                    print(f"[WorkerPool] Worker {worker_index+1} returned error: {result.get('error', 'unknown')}")
+                
                 return result
             finally:
                 await self._release_worker(worker_index)

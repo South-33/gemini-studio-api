@@ -1,4 +1,9 @@
+import sys
 import os
+
+# Force unbuffered output (important for Windows/ngrok)
+sys.stdout.reconfigure(line_buffering=True)
+
 import asyncio
 import threading
 import base64
@@ -133,7 +138,7 @@ async def openai_chat(request: Request):
     if thinking_level_explicit:
         thinking_level = thinking_level_explicit
 
-    print(f"[API] Model: {base_model} | Thinking: {thinking_level} | Messages: {len(messages)}")
+    print(f"[API] Model: {base_model} | Thinking: {thinking_level} | Messages: {len(messages)}", flush=True)
 
     # Combine messages and extract images
     prompt = ""
