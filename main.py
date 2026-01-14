@@ -1,8 +1,14 @@
 import sys
 import os
 
-# Force unbuffered output (important for Windows/ngrok)
-sys.stdout.reconfigure(line_buffering=True)
+# Force unbuffered output (critical for Windows/ngrok)
+# Method 1: Set environment variable (for subprocesses)
+os.environ['PYTHONUNBUFFERED'] = '1'
+# Method 2: Reconfigure stdout/stderr
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(line_buffering=True)
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(line_buffering=True)
 
 import asyncio
 import threading
@@ -18,11 +24,12 @@ from pydantic import BaseModel, ConfigDict
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 
-# --- Timestamped Logging ---
+# --- Timestamped Logging (use stderr - always unbuffered) ---
 def log(msg: str, tag: str = "Server"):
-    """Print with timestamp for debugging."""
+    """Print with timestamp for debugging. Uses stderr for guaranteed immediate output."""
     ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    print(f"[{ts}] [{tag}] {msg}", flush=True)
+    # Use stderr (unbuffered) instead of stdout
+    print(f"[{ts}] [{tag}] {msg}", file=sys.stderr, flush=True)
 
 # Load .env file
 load_dotenv()

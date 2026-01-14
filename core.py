@@ -1,5 +1,6 @@
 import asyncio
 import os
+import sys
 import random
 import time
 import uuid
@@ -7,11 +8,11 @@ from datetime import datetime
 from typing import List, Dict, Optional, Tuple
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page, Route
 
-# --- Timestamped Logging ---
+# --- Timestamped Logging (use stderr - always unbuffered) ---
 def log(msg: str, tag: str = "Core"):
-    """Print with timestamp for debugging."""
+    """Print with timestamp for debugging. Uses stderr for guaranteed immediate output."""
     ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    print(f"[{ts}] [{tag}] {msg}", flush=True)
+    print(f"[{ts}] [{tag}] {msg}", file=sys.stderr, flush=True)
 
 # Low memory mode: block images, fonts, etc.
 LOW_MEMORY_MODE = os.getenv("LOW_MEMORY_MODE", "true").lower() == "true"
