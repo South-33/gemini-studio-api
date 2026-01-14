@@ -906,7 +906,7 @@ class GeminiWebAutomation(BaseAutomation):
             self._generation_in_progress = True
             self._request_count += 1
             self._request_id = uuid.uuid4().hex[:8]  # Short ID for log tracing
-            print(f"[GeminiWeb] [{self._request_id}] === New Request ===")
+            log(f"[{self._request_id}] === New Request ===", f"Worker {self.worker_id}")
             
             # 0. Dismiss any stuck overlays/modals (Angular Material CDK overlays block clicks)
             try:
@@ -915,7 +915,7 @@ class GeminiWebAutomation(BaseAutomation):
                 # Also try clicking the backdrop if it exists
                 backdrop = self.page.locator('.cdk-overlay-backdrop')
                 if await backdrop.count() > 0:
-                    print("[GeminiWeb] ⚠️ Dismissing stuck overlay...")
+                    log("⚠️ Dismissing stuck overlay...", f"Worker {self.worker_id}")
                     await backdrop.first.click(force=True)
                     await self._human_delay(200, 400)
             except:
@@ -923,7 +923,7 @@ class GeminiWebAutomation(BaseAutomation):
             
             # 0.5 Periodic hard refresh to clear browser cache/memory
             if self._request_count >= self.REFRESH_EVERY_N_REQUESTS:
-                print(f"[GeminiWeb] 🔄 Hard refresh (clearing cache after {self._request_count} requests)...")
+                log(f"🔄 Hard refresh (clearing cache after {self._request_count} requests)...", f"Worker {self.worker_id}")
                 await self.page.reload(wait_until="domcontentloaded", timeout=30000)
                 await self._human_delay(1000, 1500)
                 self._request_count = 0
@@ -932,19 +932,21 @@ class GeminiWebAutomation(BaseAutomation):
             async def get_copy_count():
                 return await self.page.locator(self.SELECTORS["copy_btn"]).count()
             
+            worker_id_for_closure = self.worker_id  # Capture for nested functions
+            
             async def verify_chat_cleared(before_count):
                 # Give extra time for chat to clear
                 await self._human_delay(500, 800)
                 after_count = await self.page.locator(self.SELECTORS["copy_btn"]).count()
                 # Success if count dropped (ideally to 0, but at least fewer than before)
                 if after_count == 0:
-                    print(f"[GeminiWeb] New Chat: {before_count} → 0 copy buttons (chat cleared)")
+                    log(f"New Chat: {before_count} → 0 copy buttons (chat cleared)", f"Worker {worker_id_for_closure}")
                     return True
                 elif after_count < before_count:
-                    print(f"[GeminiWeb] New Chat: {before_count} → {after_count} copy buttons (partial clear)")
+                    log(f"New Chat: {before_count} → {after_count} copy buttons (partial clear)", f"Worker {worker_id_for_closure}")
                     return True
                 else:
-                    print(f"[GeminiWeb] New Chat: Still {after_count} copy buttons (expected 0)")
+                    log(f"New Chat: Still {after_count} copy buttons (expected 0)", f"Worker {worker_id_for_closure}")
                     return False
             
             new_chat_success = await self._verified_click(
@@ -956,11 +958,11 @@ class GeminiWebAutomation(BaseAutomation):
             )
             
             if not new_chat_success:
-                print("[GeminiWeb] ⚠️ New Chat failed - proceeding anyway (will use button counting)")
+                log("⚠️ New Chat failed - proceeding anyway (will use button counting)", f"Worker {self.worker_id}")
 
             
             # 1.5 Enable Temporary Chat
-            print("[GeminiWeb] Enabling temporary chat...")
+            log("Enabling temporary chat...", f"Worker {self.worker_id}")
             await self._enable_temp_chat()
             await self._human_delay()
 
@@ -969,7 +971,7 @@ class GeminiWebAutomation(BaseAutomation):
                 await self._select_model(model)
 
             # 3. Enter Prompt
-            print(f"[GeminiWeb] Entering prompt...")
+            log(f"Entering prompt ({len(prompt)} chars)...", f"Worker {self.worker_id}")
             input_area = self.page.locator(self.SELECTORS["input"])
             await input_area.click()
             await self._human_delay()
@@ -987,9 +989,11 @@ class GeminiWebAutomation(BaseAutomation):
             # If chat was cleared successfully, pre_send_count should be 0.
             # If chat wasn't cleared, it might be > 0.
             pre_send_count = await self.page.locator(self.SELECTORS["copy_btn"]).count()
-            print(f"[GeminiWeb] Copy buttons before send: {pre_send_count}")
+            log(f"Copy buttons before send: {pre_send_count}", f"Worker {self.worker_id}")
 
             # 4. Click Send - VERIFIED
+            worker_id = self.worker_id  # Capture for closure
+            
             async def get_input_text():
                 try:
                     return await input_area.inner_text()
@@ -998,7 +1002,7 @@ class GeminiWebAutomation(BaseAutomation):
             
             async def verify_send_worked(before_text):
                 # Wait a moment then check if input is cleared
-                await self._human_delay(300, 500)
+                await self._human_delay(500, 800)  # Increased delay for reliability
                 try:
                     # Try multiple methods to get input text (contenteditable vs textarea)
                     after_text = ""
@@ -1016,16 +1020,17 @@ class GeminiWebAutomation(BaseAutomation):
                     
                     if before_len == 0:
                         # Empty prompt - can't verify by text, assume success
-                        print(f"[GeminiWeb] Send: Empty prompt, assuming success")
+                        log(f"Send: Empty prompt, assuming success", f"Worker {worker_id}")
                         return True
                     elif after_len < before_len / 2:
-                        print(f"[GeminiWeb] Send: Input cleared ({before_len} → {after_len} chars)")
+                        log(f"Send: Input cleared ({before_len} → {after_len} chars)", f"Worker {worker_id}")
                         return True
                     else:
-                        print(f"[GeminiWeb] Send: Input NOT cleared (still {after_len} chars)")
+                        log(f"Send: Input NOT cleared (still {after_len} chars) - SEND FAILED!", f"Worker {worker_id}")
                         return False
-                except:
-                    return True  # If we can't check, assume success
+                except Exception as e:
+                    log(f"Send verification error: {e} - retrying", f"Worker {worker_id}")
+                    return False  # FIXED: Don't assume success on error!
             
             send_success = await self._verified_click(
                 self.SELECTORS["send_btn"],
@@ -1061,11 +1066,11 @@ class GeminiWebAutomation(BaseAutomation):
                 await asyncio.sleep(2)
             
             if not copy_btn:
-                print(f"[Worker {self.worker_id}] ❌ TIMEOUT after {max_wait}s waiting for copy button")
+                log(f"❌ TIMEOUT after {max_wait}s waiting for copy button", f"Worker {self.worker_id}")
                 return {"success": False, "error": f"Timeout after {max_wait}s waiting for response"}
 
             # Auto-scroll to ensure copy button is visible
-            print(f"[Worker {self.worker_id}] Scrolling to copy button...")
+            log(f"Scrolling to copy button...", f"Worker {self.worker_id}")
             await self.page.evaluate('''
                 () => {
                     const copyButtons = document.querySelectorAll('button[aria-label="Copy"]');
@@ -1089,19 +1094,19 @@ class GeminiWebAutomation(BaseAutomation):
             self._generation_in_progress = False
             
             if not markdown:
-                print(f"[Worker {self.worker_id}] ⚠️ Clipboard empty, trying fallback...")
+                log(f"⚠️ Clipboard empty, trying fallback...", f"Worker {self.worker_id}")
                 return await self._fallback_extract()
 
-            print(f"[Worker {self.worker_id}] ✅ Extracted {len(markdown)} chars")
+            log(f"✅ Extracted {len(markdown)} chars", f"Worker {self.worker_id}")
             return {"success": True, "response": markdown.strip()}
 
         except Exception as e:
             self._generation_in_progress = False
-            print(f"[Worker {self.worker_id}] ❌ Error: {e}")
+            log(f"❌ Error: {e}", f"Worker {self.worker_id}")
             
             # Force refresh to reset page state for next request
             try:
-                print(f"[Worker {self.worker_id}] 🔄 Error recovery: refreshing page...")
+                log(f"🔄 Error recovery: refreshing page...", f"Worker {self.worker_id}")
                 await self.page.reload(wait_until="domcontentloaded", timeout=15000)
                 self._request_count = 0  # Reset counter since we just refreshed
             except:
