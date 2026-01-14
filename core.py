@@ -648,17 +648,6 @@ class GeminiWebAutomation(BaseAutomation):
     # Hard refresh every N requests to clear browser cache/memory
     REFRESH_EVERY_N_REQUESTS = 10
     
-    # Shared lock for clipboard operations (clipboard is shared across all tabs)
-    # Note: Using class-level lock - all workers share this across tabs
-    _clipboard_lock: asyncio.Lock = None  # Lazy init to ensure correct event loop
-    
-    @classmethod
-    def _get_clipboard_lock(cls) -> asyncio.Lock:
-        """Get or create clipboard lock (lazy init for correct event loop)."""
-        if cls._clipboard_lock is None:
-            cls._clipboard_lock = asyncio.Lock()
-        return cls._clipboard_lock
-    
     # Selectors discovered during research
     SELECTORS = {
         "input": 'div[role="textbox"][aria-label="Enter a prompt here"]',
@@ -1077,14 +1066,12 @@ class GeminiWebAutomation(BaseAutomation):
             ''')
             await self._human_delay(400, 800)  # Wait for scroll to complete
 
-            # 6. Extraction via Copy Button (with lock to prevent clipboard race condition)
+            # 6. Extraction via Copy Button (no lock needed - each worker has its own browser)
             log(f"Extracting markdown via Copy button...", f"Worker {self.worker_id}")
             
-            # Lock clipboard access to prevent race between workers
-            async with GeminiWebAutomation._get_clipboard_lock():
-                await copy_btn.click()
-                await self._human_delay(400, 800)  # Wait for clipboard
-                markdown = await self.page.evaluate("navigator.clipboard.readText()")
+            await copy_btn.click()
+            await self._human_delay(400, 800)  # Wait for clipboard
+            markdown = await self.page.evaluate("navigator.clipboard.readText()")
             
             self._generation_in_progress = False
             
@@ -1286,95 +1273,37 @@ class WorkerPool:
 
 
     async def _keepalive_loop(self):
-        """Background task to visit Google occasionally to keep session alive."""
-        print(f"[WorkerPool] 🕒 Keepalive background task started (every {self.KEEPALIVE_HOURS}h)")
-        while not self._tasks_started: await asyncio.sleep(1) # Wait for init
-        
-        while True:
-            try:
-                await asyncio.sleep(self.KEEPALIVE_HOURS * 3600)
-                
-                # Check if any workers are busy
-                busy_count = sum(1 for b in self._worker_busy if b)
-                if busy_count > 0:
-                    print("[WorkerPool] ⏳ Skipping keepalive, system busy")
-                    continue
-                
-                print("[WorkerPool] 💤 Visiting Google for session keepalive...")
-                async with self._wake_lock: # Ensure we don't clash with wake/sleep
-                    temp_page = await self.shared_context.new_page()
-                    try:
-                        await temp_page.goto("https://www.google.com", timeout=30000)
-                        await asyncio.sleep(2)
-                        print("[WorkerPool] ✅ Keepalive visit complete")
-                    finally:
-                        await temp_page.close()
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                print(f"[WorkerPool] ⚠️ Keepalive error: {e}")
-                await asyncio.sleep(60)
+        """Disabled - not compatible with separate browser instances."""
+        # Each browser has its own session, keepalive not needed
+        pass
 
     async def _idle_monitor(self):
-        """Background task to close tabs when idle."""
-        print(f"[WorkerPool] 💤 Idle monitor started (timeout: {self.IDLE_TIMEOUT_MINUTES}m)")
-        while True:
-            try:
-                await asyncio.sleep(60) # Check every minute
-                
-                now = time.time()
-                idle_time = (now - self._last_activity) / 60
-                
-                if idle_time >= self.IDLE_TIMEOUT_MINUTES and not self._is_sleeping:
-                    async with self._idle_lock:
-                        # Double check under lock
-                        # Check if any workers are busy
-                        busy_count = sum(1 for b in self._worker_busy if b)
-                        if busy_count > 0:
-                            print("[WorkerPool] ⏳ Active requests, resetting idle timer")
-                            continue
-                        
-                        print(f"[WorkerPool] 🛌 System idle for {idle_time:.1f}m. Entering sleep mode...")
-                        
-                        # Close all worker pages but keep context (and cookies) alive
-                        for i, w in enumerate(self.workers):
-                            try:
-                                if w.page:
-                                    await w.page.close()
-                                    w.page = None
-                                    w._initialized = False
-                                    self._worker_busy[i] = False
-                            except: pass
-                        
-                        self._is_sleeping = True
-                        print(f"[WorkerPool] ✅ Sleep mode active ({len(self.workers)} tabs closed)")
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                print(f"[WorkerPool] ⚠️ Idle monitor error: {e}")
+        """Disabled - with separate browsers, idle management is simpler (just let them sit)."""
+        # Each browser maintains its own session. No need to close/reopen.
+        pass
 
     async def _wake_up(self):
-        """Re-open all worker tabs if sleeping."""
+        """Re-initialize worker pages if sleeping (for separate browser architecture)."""
         async with self._wake_lock:
             if not self._is_sleeping:
                 return
             
-            print(f"[WorkerPool] ☕ Waking up from sleep mode ({len(self.workers)} workers)...")
+            log(f"☕ Waking up {len(self.workers)} workers...", "WorkerPool")
             
-            # Re-initialize all workers
             for i, w in enumerate(self.workers):
-                print(f"[WorkerPool] Re-opening tab {i+1}/{len(self.workers)}...")
-                page = await self.shared_context.new_page()
-                try:
-                    await page.goto(GeminiWebAutomation.URL, timeout=60000, wait_until="domcontentloaded")
-                except Exception as e:
-                    print(f"[WorkerPool] ⚠️ Wake-up tab {i+1} warning: {e}")
-                await w.init_with_page(page, self.shared_context)
-                self._worker_busy[i] = False
+                if w.context and not w._initialized:
+                    try:
+                        page = await w.context.new_page()
+                        await page.goto(GeminiWebAutomation.URL, timeout=60000, wait_until="domcontentloaded")
+                        await w.init_with_page(page, w.context)
+                        self._worker_busy[i] = False
+                        log(f"✅ Worker {i+1} awake", "WorkerPool")
+                    except Exception as e:
+                        log(f"❌ Worker {i+1} wake failed: {e}", "WorkerPool")
             
             self._is_sleeping = False
             self._last_activity = time.time()
-            print(f"[WorkerPool] ✅ All {len(self.workers)} workers awake")
+            log(f"✅ All workers awake", "WorkerPool")
 
     async def _wake_up_worker(self, index: int):
         """Wake up a specific worker by index."""
@@ -1388,102 +1317,96 @@ class WorkerPool:
                     self._worker_busy[index] = False
 
     async def init(self, cookies: List[Dict]) -> bool:
-        """Launch shared browser and N Gemini Web tabs."""
+        """Launch N separate browser instances. Session copied from 'main' folder to each worker."""
+        import shutil
+        
         try:
             self.playwright = await async_playwright().start()
             
             is_headless = os.getenv("HEADLESS", "true").lower() == "true"
             
-            # Use GeminiWebAutomation constants (AI Studio code removed)
             browser_args = [
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
             ]
             if is_headless:
-                browser_args.extend([
-                    "--disable-gpu",
-                    "--disable-software-rasterizer",
-                ])
+                browser_args.extend(["--disable-gpu", "--disable-software-rasterizer"])
             if LOW_MEMORY_MODE:
                 browser_args.extend([
-                    "--disable-extensions",
-                    "--disable-background-networking",
-                    "--disable-sync",
-                    "--disable-translate",
-                    "--no-first-run",
-                    "--disable-default-apps",
+                    "--disable-extensions", "--disable-background-networking",
+                    "--disable-sync", "--disable-translate", "--no-first-run", "--disable-default-apps",
                 ])
             
-            # Use .browser_session for persistence
-            user_data_dir = os.path.join(os.path.dirname(__file__), ".browser_session")
+            base_session_dir = os.path.join(os.path.dirname(__file__), ".browser_session")
+            main_session_dir = os.path.join(base_session_dir, "main")
+            os.makedirs(main_session_dir, exist_ok=True)
             
-            self.shared_context = await self.playwright.chromium.launch_persistent_context(
-                user_data_dir,
-                headless=is_headless,
-                args=browser_args,
-                viewport={"width": 1920, "height": 1080},
-                permissions=["clipboard-read", "clipboard-write"],
-            )
+            # Check if main session exists (has cookies)
+            main_has_session = os.path.exists(os.path.join(main_session_dir, "Default", "Cookies")) or \
+                               os.path.exists(os.path.join(main_session_dir, "Cookies"))
             
-            # Inject cookies if provided
-            if cookies:
-                sanitized_cookies = []
-                for cookie in cookies:
-                    try:
-                        c = dict(cookie)
-                        same_site = c.get("sameSite", "")
-                        if same_site is None or str(same_site).lower() not in ["strict", "lax", "none"]:
-                            c["sameSite"] = "Lax"
-                        else:
-                            c["sameSite"] = str(same_site).capitalize()
-                        for field in ["id", "storeId", "session"]:
-                            c.pop(field, None)
-                        if "expirationDate" in c:
-                            c["expires"] = c.pop("expirationDate")
-                        sanitized_cookies.append(c)
-                    except Exception as e:
-                        print(f"[WorkerPool] Skipping malformed cookie: {e}")
-                        continue
-                
-                try:
-                    await self.shared_context.add_cookies(sanitized_cookies)
-                    print(f"[WorkerPool] ✅ Added {len(sanitized_cookies)} cookies")
-                except Exception as cookie_err:
-                    print(f"[WorkerPool] ⚠️ Cookie injection failed: {cookie_err}")
+            if not main_has_session and is_headless:
+                log("⚠️ No login session found! Run with HEADLESS=false first to log in.", "WorkerPool")
             
-            if LOW_MEMORY_MODE:
-                await self.shared_context.route("**/*", self._block_resources)
-
-            # Create N Gemini Web workers (1 worker = 1 tab)
-            print(f"[WorkerPool] Creating {self.worker_count} Gemini Web worker(s)...")
+            log(f"Launching {self.worker_count} browser instance(s)...", "WorkerPool")
             
             workers_ok = 0
             for i in range(self.worker_count):
-                print(f"[WorkerPool] Opening tab {i+1}/{self.worker_count}...")
-                page = await self.shared_context.new_page()
+                worker_dir = os.path.join(base_session_dir, f"worker_{i+1}")
+                
+                # Copy main session to worker folder (if main session exists)
+                if main_has_session and os.path.exists(main_session_dir):
+                    try:
+                        # Remove old worker folder and copy fresh from main
+                        if os.path.exists(worker_dir):
+                            shutil.rmtree(worker_dir)
+                        shutil.copytree(main_session_dir, worker_dir)
+                        log(f"Copied session to worker_{i+1}", "WorkerPool")
+                    except Exception as e:
+                        log(f"Session copy warning for worker_{i+1}: {e}", "WorkerPool")
+                        os.makedirs(worker_dir, exist_ok=True)
+                else:
+                    os.makedirs(worker_dir, exist_ok=True)
+                
+                log(f"Starting browser {i+1}/{self.worker_count}...", "WorkerPool")
+                
                 try:
+                    context = await self.playwright.chromium.launch_persistent_context(
+                        worker_dir,
+                        headless=is_headless,
+                        args=browser_args,
+                        viewport={"width": 1920, "height": 1080},
+                        permissions=["clipboard-read", "clipboard-write"],
+                    )
+                    
+                    if LOW_MEMORY_MODE:
+                        await context.route("**/*", self._block_resources)
+                    
+                    page = context.pages[0] if context.pages else await context.new_page()
                     await page.goto(GeminiWebAutomation.URL, timeout=60000, wait_until="domcontentloaded")
-                    print(f"[WorkerPool] ✅ Tab {i+1} loaded: {page.url}")
+                    log(f"✅ Browser {i+1} ready", "WorkerPool")
+                    
+                    worker = GeminiWebAutomation(worker_id=i+1)
+                    worker.context = context
+                    
+                    if await worker.init_with_page(page, context):
+                        workers_ok += 1
+                    
+                    self.workers.append(worker)
+                    self._worker_busy.append(False)
+                    
                 except Exception as e:
-                    print(f"[WorkerPool] ⚠️ Tab {i+1} navigation warning: {e}")
+                    log(f"❌ Browser {i+1} failed: {e}", "WorkerPool")
                 
-                worker = GeminiWebAutomation(worker_id=i+1)
-                if await worker.init_with_page(page, self.shared_context):
-                    workers_ok += 1
-                self.workers.append(worker)
-                self._worker_busy.append(False)
-                
-                # Stagger tab creation to avoid rate limiting
                 if i < self.worker_count - 1:
                     await asyncio.sleep(2)
             
-            print(f"[WorkerPool] ✅ {workers_ok}/{self.worker_count} workers ready")
-            
+            log(f"✅ {workers_ok}/{self.worker_count} workers ready", "WorkerPool")
             self._initialized = True
-            return workers_ok > 0  # Success if at least one works
+            return workers_ok > 0
         except Exception as e:
-            print(f"[WorkerPool] Init error: {e}")
+            log(f"Init error: {e}", "WorkerPool")
             return False
 
     async def _block_resources(self, route: Route):
@@ -1537,14 +1460,29 @@ class WorkerPool:
 
 
     async def close(self):
+        """Clean up all browser instances."""
+        log("Shutting down...", "WorkerPool")
+        
         # Cancel background tasks
-        if self._idle_task: self._idle_task.cancel()
-        if self._keepalive_task: self._keepalive_task.cancel()
+        if self._idle_task: 
+            self._idle_task.cancel()
+        if self._keepalive_task: 
+            self._keepalive_task.cancel()
         
-        # Close all workers
-        for w in self.workers:
-            await w.close()
+        # Close each worker's browser context
+        for i, w in enumerate(self.workers):
+            try:
+                if w.page:
+                    await w.page.close()
+                if hasattr(w, 'context') and w.context:
+                    await w.context.close()
+                log(f"Closed browser {i+1}", "WorkerPool")
+            except Exception as e:
+                log(f"Error closing browser {i+1}: {e}", "WorkerPool")
         
-        if self.shared_context: await self.shared_context.close()
-        if self.playwright: await self.playwright.stop()
+        # Stop playwright
+        if self.playwright: 
+            await self.playwright.stop()
+        
+        log("Shutdown complete", "WorkerPool")
 
