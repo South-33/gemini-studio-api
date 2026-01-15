@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import os
 import sys
 import random
@@ -93,12 +94,6 @@ class AIStudioAutomation(BaseAutomation):
     
     def __init__(self):
         super().__init__()
-        self._is_sleeping = False
-        self._wake_lock = asyncio.Lock()
-        self._idle_lock = asyncio.Lock()
-        self._keepalive_task = None
-        self._idle_task = None
-        self._stop_tasks = False
         self._request_count = 0
 
     async def init_with_page(self, page: Page, context: BrowserContext) -> bool:
@@ -339,7 +334,6 @@ class AIStudioAutomation(BaseAutomation):
             with open(image_path, 'rb') as f:
                 image_data = f.read()
             
-            import base64
             base64_image = base64.b64encode(image_data).decode('utf-8')
             
             # Determine mime type
@@ -1162,19 +1156,6 @@ class GeminiWebAutomation(BaseAutomation):
         except Exception as e:
             print(f"[Worker {self.worker_id}] ⚠️ Model selection failed: {e}")
 
-    async def _wait_and_extract_pending(self) -> Dict:
-        # Simplified for web: just try to extract if button exists
-        btns = self.page.locator(self.SELECTORS["copy_btn"])
-        count = await btns.count()
-        if count > 0:
-            copy_btn = btns.nth(count - 1)
-            await copy_btn.click()
-            await asyncio.sleep(0.5)
-            markdown = await self.page.evaluate("navigator.clipboard.readText()")
-            if markdown:
-                return {"success": True, "response": markdown.strip()}
-        return {"success": False, "error": "Still generating or failed"}
-
     async def _paste_image(self, image_path: str):
         """Paste an image via clipboard into Gemini Web."""
         try:
@@ -1183,7 +1164,6 @@ class GeminiWebAutomation(BaseAutomation):
             with open(image_path, 'rb') as f:
                 image_data = f.read()
             
-            import base64
             base64_image = base64.b64encode(image_data).decode('utf-8')
             
             ext = image_path.split('.')[-1].lower()
@@ -1246,19 +1226,8 @@ class WorkerPool:
         self.playwright = None
         self._initialized = False
         
-        self._lock = asyncio.Lock()
         self._browser_semaphore = asyncio.Semaphore(worker_count)  # Allow N concurrent requests
-        
-        # Idle/Keepalive settings
-        self.IDLE_TIMEOUT_MINUTES = int(os.getenv("IDLE_TIMEOUT_MINUTES", "30"))
-        self.KEEPALIVE_HOURS = float(os.getenv("KEEPALIVE_HOURS", "4"))
         self._last_activity = time.time()
-        self._is_sleeping = False
-        self._wake_lock = asyncio.Lock()
-        self._idle_lock = asyncio.Lock()
-        self._tasks_started = False
-        self._keepalive_task = None
-        self._idle_task = None
     
     async def _get_available_worker(self, exclude: set = None) -> Tuple[int, GeminiWebAutomation]:
         """Get first available worker (round-robin). Waits if all are busy.
@@ -1294,111 +1263,6 @@ class WorkerPool:
             if 0 <= index < len(self._worker_busy):
                 self._worker_busy[index] = False
                 log(f"Released worker {index+1}/{len(self.workers)}", "WorkerPool")
-    
-
-
-
-    async def _keepalive_loop(self):
-        """Background task to visit Google occasionally to keep session alive."""
-        print(f"[WorkerPool] 🕒 Keepalive background task started (every {self.KEEPALIVE_HOURS}h)")
-        while not self._tasks_started: await asyncio.sleep(1) # Wait for init
-        
-        while True:
-            try:
-                await asyncio.sleep(self.KEEPALIVE_HOURS * 3600)
-                
-                # Check if any workers are busy
-                busy_count = sum(1 for b in self._worker_busy if b)
-                if busy_count > 0:
-                    print("[WorkerPool] ⏳ Skipping keepalive, system busy")
-                    continue
-                
-                print("[WorkerPool] 💤 Visiting Google for session keepalive...")
-                async with self._wake_lock: # Ensure we don't clash with wake/sleep
-                    temp_page = await self.shared_context.new_page()
-                    try:
-                        await temp_page.goto("https://www.google.com", timeout=30000)
-                        await asyncio.sleep(2)
-                        print("[WorkerPool] ✅ Keepalive visit complete")
-                    finally:
-                        await temp_page.close()
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                print(f"[WorkerPool] ⚠️ Keepalive error: {e}")
-                await asyncio.sleep(60)
-
-    async def _idle_monitor(self):
-        """Background task to close tabs when idle."""
-        print(f"[WorkerPool] 💤 Idle monitor started (timeout: {self.IDLE_TIMEOUT_MINUTES}m)")
-        while True:
-            try:
-                await asyncio.sleep(60) # Check every minute
-                
-                now = time.time()
-                idle_time = (now - self._last_activity) / 60
-                
-                if idle_time >= self.IDLE_TIMEOUT_MINUTES and not self._is_sleeping:
-                    async with self._idle_lock:
-                        # Double check under lock
-                        # Check if any workers are busy
-                        busy_count = sum(1 for b in self._worker_busy if b)
-                        if busy_count > 0:
-                            print("[WorkerPool] ⏳ Active requests, resetting idle timer")
-                            continue
-                        
-                        print(f"[WorkerPool] 🛌 System idle for {idle_time:.1f}m. Entering sleep mode...")
-                        
-                        # Close all worker pages but keep context (and cookies) alive
-                        for i, w in enumerate(self.workers):
-                            try:
-                                if w.page:
-                                    await w.page.close()
-                                    w.page = None
-                                    w._initialized = False
-                                    self._worker_busy[i] = False
-                            except: pass
-                        
-                        self._is_sleeping = True
-                        print(f"[WorkerPool] ✅ Sleep mode active ({len(self.workers)} tabs closed)")
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                print(f"[WorkerPool] ⚠️ Idle monitor error: {e}")
-
-    async def _wake_up(self):
-        """Re-open all worker tabs if sleeping."""
-        async with self._wake_lock:
-            if not self._is_sleeping:
-                return
-            
-            print(f"[WorkerPool] ☕ Waking up from sleep mode ({len(self.workers)} workers)...")
-            
-            # Re-initialize all workers
-            for i, w in enumerate(self.workers):
-                print(f"[WorkerPool] Re-opening tab {i+1}/{len(self.workers)}...")
-                page = await self.shared_context.new_page()
-                try:
-                    await page.goto(GeminiWebAutomation.URL, timeout=60000, wait_until="domcontentloaded")
-                except Exception as e:
-                    print(f"[WorkerPool] ⚠️ Wake-up tab {i+1} warning: {e}")
-                await w.init_with_page(page, self.shared_context)
-                self._worker_busy[i] = False
-            
-            self._is_sleeping = False
-            self._last_activity = time.time()
-            print(f"[WorkerPool] ✅ All {len(self.workers)} workers awake")
-
-    async def _wake_up_worker(self, index: int):
-        """Wake up a specific worker by index."""
-        async with self._wake_lock:
-            if 0 <= index < len(self.workers):
-                w = self.workers[index]
-                if w.page is None:
-                    page = await self.shared_context.new_page()
-                    await page.goto(GeminiWebAutomation.URL, timeout=60000, wait_until="domcontentloaded")
-                    await w.init_with_page(page, self.shared_context)
-                    self._worker_busy[index] = False
 
     async def init(self, cookies: List[Dict]) -> bool:
         """Launch shared browser and N Gemini Web tabs."""
@@ -1516,11 +1380,6 @@ class WorkerPool:
         """
         log(f">>> ENTER send_message (model={model})", "WorkerPool")
         
-        # Check sleep mode and wake up OUTSIDE the lock (wake-up can take 60s+)
-        if self._is_sleeping:
-            log("🛌 System is sleeping, triggering wake up...", "WorkerPool")
-            await self._wake_up()
-        
         # Update activity timestamp
         self._last_activity = time.time()
         
@@ -1583,10 +1442,6 @@ class WorkerPool:
 
 
     async def close(self):
-        # Cancel background tasks
-        if self._idle_task: self._idle_task.cancel()
-        if self._keepalive_task: self._keepalive_task.cancel()
-        
         # Close all workers
         for w in self.workers:
             await w.close()
