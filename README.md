@@ -28,11 +28,10 @@ pip install fastapi uvicorn playwright python-dotenv pydantic
 # Install browser
 playwright install chromium
 
-# First-time: Login to Google
-python setup_session.py  # Chrome opens, log in, then Ctrl+C
-
-# Run the API
+# Run the API (browser opens - log into Google on first run)
 python main.py
+
+# After logging in, set HEADLESS=true in .env for background operation
 ```
 
 ### Expose to Internet (ngrok)
@@ -248,8 +247,7 @@ WORKER_COUNT=2     # Number of parallel tabs (1 worker = 1 tab)
 | File | Purpose |
 |------|---------|
 | `main.py` | Main API server |
-| `core.py` | AI Studio automation logic |
-| `setup_session.py` | One-time Google login script |
+| `core.py` | Browser automation logic |
 | `test_api.html` | Web UI for testing the API |
 | `autostart.bat` | Auto-start on Windows boot |
 
@@ -259,7 +257,7 @@ WORKER_COUNT=2     # Number of parallel tabs (1 worker = 1 tab)
 
 | Issue | Solution |
 |-------|----------|
-| Session expired | Run `python setup_session.py` and login again |
+| Session expired | Set `HEADLESS=false` in .env, restart, and login again |
 | 502 Bad Gateway | Make sure API is running (`python main.py`) |
 | ngrok connection refused | Ensure API is running before starting ngrok |
 | Extraction failed (500 errors) | Usually auto-recovers. If persistent, restart the API |

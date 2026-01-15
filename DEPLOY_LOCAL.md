@@ -34,19 +34,19 @@ While remoted in, run:
 
 ```powershell
 cd path\to\gemini-studio-api
-python setup_session.py
+python main.py
 ```
 
-A Chrome window will open on the remote desktop. Log into Google and go to `aistudio.google.com`. Once you see the prompt box, close the script (Ctrl+C).
+A Chrome window will open on the remote desktop (HEADLESS defaults to false). Log into Google and go to `gemini.google.com`. Once logged in, stop the script (Ctrl+C).
 
-**Done!** The session is now saved locally on the old PC.
+Then set `HEADLESS=true` in your `.env` file for background operation.
 
 ---
 
 ## Step 5: Start the API
 
 ```powershell
-python main_bridge.py
+python main.py
 ```
 
 The API runs headlessly using your saved session.

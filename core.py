@@ -105,7 +105,7 @@ class AIStudioAutomation(BaseAutomation):
         try:
             # Check if we are seeing the playground. 
             # If not, and we are in non-headless mode, wait longer for user to login manually.
-            is_headless = os.getenv("HEADLESS", "true").lower() == "true"
+            is_headless = os.getenv("HEADLESS", "false").lower() == "true"
             timeout = 15000 if is_headless else 300000 # 5 minutes for manual login
             
             if not is_headless:
@@ -1269,7 +1269,7 @@ class WorkerPool:
         try:
             self.playwright = await async_playwright().start()
             
-            is_headless = os.getenv("HEADLESS", "true").lower() == "true"
+            is_headless = os.getenv("HEADLESS", "false").lower() == "true"
             
             # Use GeminiWebAutomation constants (AI Studio code removed)
             browser_args = [
