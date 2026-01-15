@@ -1560,7 +1560,7 @@ class WorkerPool:
                         if len(response.strip()) < 3:
                             log(f"Worker {worker_index+1} returned empty/short response, retrying...", "WorkerPool")
                             last_error = "Empty response"
-                            await self._release_worker(worker_index)
+                            # Don't call _release_worker here - finally block handles it
                             continue
                         
                         log(f"Worker {worker_index+1} completed successfully", "WorkerPool")
