@@ -8,7 +8,7 @@ echo ==========================================
 cd /d "%~dp0"
 
 :: Load PORT and NGROK_DOMAIN from .env file
-set PORT=8001
+set PORT=8000
 for /f "tokens=1,2 delims==" %%a in (.env) do (
     if "%%a"=="PORT" set PORT=%%b
     if "%%a"=="NGROK_DOMAIN" set NGROK_DOMAIN=%%b

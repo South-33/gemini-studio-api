@@ -81,7 +81,7 @@ See [DEPLOY_LOCAL.md](DEPLOY_LOCAL.md) for full headless server setup guide.
 
 This API is fully **OpenAI-compatible** and can be used from any programming language or tool that supports OpenAI's chat completions endpoint.
 
-> **Note**: Replace `http://localhost:8001` in the examples below with:
+> **Note**: Replace `http://localhost:8000` in the examples below with:
 > - Your ngrok URL: `https://your-subdomain.ngrok-free.app`
 > - Or your deployed API URL (if hosted elsewhere)
 
@@ -92,7 +92,7 @@ This API is fully **OpenAI-compatible** and can be used from any programming lan
 ### Basic Chat Request (curl)
 
 ```bash
-curl -X POST http://localhost:8001/v1/chat/completions \
+curl -X POST http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer anything" \
   -d '{
@@ -109,7 +109,7 @@ curl -X POST http://localhost:8001/v1/chat/completions \
 import requests
 
 response = requests.post(
-    "http://localhost:8001/v1/chat/completions",
+    "http://localhost:8000/v1/chat/completions",
     headers={"Authorization": "Bearer anything"},
     json={
         "model": "gemini-3-flash-preview",
@@ -127,7 +127,7 @@ print(response.json()["choices"][0]["message"]["content"])
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="http://localhost:8001/v1",
+    base_url="http://localhost:8000/v1",
     api_key="anything"  # API key is ignored but required by SDK
 )
 
@@ -143,7 +143,7 @@ print(response.choices[0].message.content)
 ### JavaScript/TypeScript Example
 
 ```javascript
-const response = await fetch('http://localhost:8001/v1/chat/completions', {
+const response = await fetch('http://localhost:8000/v1/chat/completions', {
   method: 'POST',
   headers: {
     'Content-Type': 'application/json',
@@ -167,7 +167,7 @@ console.log(data.choices[0].message.content);
 import base64
 from openai import OpenAI
 
-client = OpenAI(base_url="http://localhost:8001/v1", api_key="anything")
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="anything")
 
 # Read and encode image
 with open("image.png", "rb") as f:
