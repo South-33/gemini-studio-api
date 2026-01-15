@@ -719,13 +719,6 @@ class GeminiWebAutomation(BaseAutomation):
     ) -> bool:
         """
         Click an element with retry logic, JS fallback, and verification.
-        
-        Strategy:
-        1. Wait for element visibility
-        2. Scroll into view
-        3. Try Playwright click
-        4. If verification fails, try JS click
-        5. Retry up to max_retries times with increasing delays
         """
         for attempt in range(max_retries + 1):
             try:
@@ -736,27 +729,26 @@ class GeminiWebAutomation(BaseAutomation):
                     await locator.wait_for(state="visible", timeout=timeout)
                 except Exception:
                     if attempt == max_retries:
-                        print(f"[GeminiWeb] ❌ {description}: Element not visible after {max_retries + 1} attempts")
+                        log(f"❌ {description}: not visible", f"Worker {self.worker_id}")
                         await self._screenshot_on_failure(f"{description}_not_visible")
                         return False
-                    print(f"[GeminiWeb] ⚠️ {description}: Not visible, retry {attempt + 1}...")
                     await self._human_delay(500, 1000)
                     continue
                 
-                # Scroll into view (ensures element is actually clickable)
+                # Scroll into view
                 try:
                     await locator.scroll_into_view_if_needed(timeout=2000)
                     await self._human_delay(100, 200)
                 except:
-                    pass  # Not critical
+                    pass
                 
                 # Capture state before click
                 before_state = None
                 if verify_before:
                     try:
                         before_state = await verify_before()
-                    except Exception as e:
-                        print(f"[GeminiWeb] ⚠️ {description}: Before state error: {e}")
+                    except:
+                        pass
                 
                 # Try Playwright click first
                 click_succeeded = False
@@ -764,9 +756,8 @@ class GeminiWebAutomation(BaseAutomation):
                     await locator.click(timeout=timeout)
                     await self._human_delay(300, 500)
                     click_succeeded = True
-                except Exception as pw_err:
-                    print(f"[GeminiWeb] ⚠️ {description}: Playwright click failed, trying JS...")
-                    # Fallback to JavaScript click (escape selector for safety)
+                except Exception:
+                    # Fallback to JavaScript click
                     try:
                         safe_selector = selector.replace("'", "\\'")
                         await self.page.evaluate(f'''
@@ -777,16 +768,15 @@ class GeminiWebAutomation(BaseAutomation):
                         ''')
                         await self._human_delay(300, 500)
                         click_succeeded = True
-                    except Exception as js_err:
-                        print(f"[GeminiWeb] ⚠️ {description}: JS click also failed: {js_err}")
+                    except:
+                        pass
                 
                 if not click_succeeded:
                     if attempt < max_retries:
-                        print(f"[GeminiWeb] 🔄 {description}: Retry {attempt + 1}/{max_retries}...")
                         await self._human_delay(500 * (attempt + 1), 1000 * (attempt + 1))
                         continue
                     else:
-                        print(f"[GeminiWeb] ❌ {description}: All click attempts failed")
+                        log(f"❌ {description}: click failed", f"Worker {self.worker_id}")
                         await self._screenshot_on_failure(f"{description}_click_failed")
                         return False
                 
@@ -795,31 +785,27 @@ class GeminiWebAutomation(BaseAutomation):
                     try:
                         success = await verify_after(before_state)
                         if success:
-                            print(f"[GeminiWeb] ✅ {description}: Verified")
                             return True
                         else:
                             if attempt < max_retries:
-                                print(f"[GeminiWeb] ⚠️ {description}: Verification failed, retry {attempt + 1}...")
                                 await self._human_delay(500 * (attempt + 1), 1000 * (attempt + 1))
                                 continue
                             else:
-                                print(f"[GeminiWeb] ❌ {description}: Verification failed after {max_retries + 1} attempts")
+                                log(f"❌ {description}: verification failed", f"Worker {self.worker_id}")
                                 await self._screenshot_on_failure(f"{description}_verify_failed")
                                 return False
                     except Exception as e:
-                        print(f"[GeminiWeb] ⚠️ {description}: Verification error: {e}")
+                        log(f"⚠️ {description}: verify error: {e}", f"Worker {self.worker_id}")
                         return False
                 else:
                     # No verification provided, assume success
-                    print(f"[GeminiWeb] ✅ {description}: Clicked (unverified)")
                     return True
                     
             except Exception as e:
                 if attempt < max_retries:
-                    print(f"[GeminiWeb] ⚠️ {description}: Error, retry {attempt + 1}... ({e})")
                     await self._human_delay(500 * (attempt + 1), 1000 * (attempt + 1))
                 else:
-                    print(f"[GeminiWeb] ❌ {description}: Failed after {max_retries + 1} attempts: {e}")
+                    log(f"❌ {description}: failed: {e}", f"Worker {self.worker_id}")
                     await self._screenshot_on_failure(f"{description}_error")
                     return False
         
@@ -845,53 +831,33 @@ class GeminiWebAutomation(BaseAutomation):
             return False
 
     async def _enable_temp_chat(self):
-        """
-        Enable temporary chat mode. 
-        The temp chat button is only visible when sidebar is expanded.
-        We expand sidebar if needed and keep it open.
-        """
+        """Enable temporary chat mode."""
         try:
             temp_btn = self.page.locator(self.SELECTORS["temp_chat"])
             
-            # Check if temp chat is already enabled (has temp-chat-on class)
+            # Check if temp chat is already enabled
             temp_active = self.page.locator(self.SELECTORS["temp_chat_active"])
             if await temp_active.count() > 0:
-                print("[GeminiWeb] ✅ Temporary chat already enabled")
                 return
             
-            # Check if button is visible (sidebar expanded)
+            # Expand sidebar if button not visible
             if not await temp_btn.is_visible():
-                print("[GeminiWeb] 🔍 Temp chat button not visible, expanding sidebar...")
                 sidebar_btn = self.page.locator(self.SELECTORS["sidebar_toggle"])
                 if await sidebar_btn.is_visible():
                     await sidebar_btn.click()
                     await self._human_delay(300, 500)
-                    print("[GeminiWeb] 📂 Sidebar expanded (keeping open)")
                 else:
-                    print("[GeminiWeb] ⚠️ Sidebar toggle button not found")
                     return
             
-            # Now try to click temp chat button
+            # Click temp chat button
             if await temp_btn.is_visible():
-                # Check if already active before clicking
                 temp_active = self.page.locator(self.SELECTORS["temp_chat_active"])
-                if await temp_active.count() > 0:
-                    print("[GeminiWeb] ✅ Temporary chat already enabled (after expand)")
-                else:
+                if await temp_active.count() == 0:
                     await temp_btn.click()
                     await self._human_delay(200, 400)
                     
-                    # Verify it worked
-                    temp_active = self.page.locator(self.SELECTORS["temp_chat_active"])
-                    if await temp_active.count() > 0:
-                        print("[GeminiWeb] ✅ Temporary chat enabled successfully")
-                    else:
-                        print("[GeminiWeb] ⚠️ Clicked temp chat but state unclear")
-            else:
-                print("[GeminiWeb] ❌ Temp chat button still not visible after expanding sidebar")
-                    
         except Exception as e:
-            print(f"[GeminiWeb] ❌ Temp chat error: {e}")
+            log(f"⚠️ Temp chat error: {e}", f"Worker {self.worker_id}")
 
     async def send_message(self, prompt: str, model: str = None, thinking_level: str = None, use_search: bool = False, images: List[str] = None) -> Dict:
         if not self._initialized: 
@@ -901,7 +867,7 @@ class GeminiWebAutomation(BaseAutomation):
             self._generation_in_progress = True
             self._request_count += 1
             self._request_id = uuid.uuid4().hex[:8]  # Short ID for log tracing
-            log(f"[{self._request_id}] === New Request ===", f"Worker {self.worker_id}")
+            log(f"[{self._request_id}] Request: model={model}, prompt={len(prompt)} chars", f"Worker {self.worker_id}")
             
             # 0. Dismiss any stuck overlays/modals (Angular Material CDK overlays block clicks)
             try:
@@ -910,7 +876,7 @@ class GeminiWebAutomation(BaseAutomation):
                 # Also try clicking the backdrop if it exists
                 backdrop = self.page.locator('.cdk-overlay-backdrop')
                 if await backdrop.count() > 0:
-                    log("⚠️ Dismissing stuck overlay...", f"Worker {self.worker_id}")
+                    log("Dismissing stuck overlay", f"Worker {self.worker_id}")
                     await backdrop.first.click(force=True)
                     await self._human_delay(200, 400)
             except:
@@ -918,7 +884,7 @@ class GeminiWebAutomation(BaseAutomation):
             
             # 0.5 Periodic hard refresh to clear browser cache/memory
             if self._request_count >= self.REFRESH_EVERY_N_REQUESTS:
-                log(f"🔄 Hard refresh (clearing cache after {self._request_count} requests)...", f"Worker {self.worker_id}")
+                log(f"Hard refresh (request #{self._request_count})", f"Worker {self.worker_id}")
                 await self.page.reload(wait_until="domcontentloaded", timeout=30000)
                 await self._human_delay(1000, 1500)
                 self._request_count = 0
@@ -934,15 +900,7 @@ class GeminiWebAutomation(BaseAutomation):
                 await self._human_delay(500, 800)
                 after_count = await self.page.locator(self.SELECTORS["copy_btn"]).count()
                 # Success if count dropped (ideally to 0, but at least fewer than before)
-                if after_count == 0:
-                    log(f"New Chat: {before_count} → 0 copy buttons (chat cleared)", f"Worker {worker_id_for_closure}")
-                    return True
-                elif after_count < before_count:
-                    log(f"New Chat: {before_count} → {after_count} copy buttons (partial clear)", f"Worker {worker_id_for_closure}")
-                    return True
-                else:
-                    log(f"New Chat: Still {after_count} copy buttons (expected 0)", f"Worker {worker_id_for_closure}")
-                    return False
+                return after_count == 0 or after_count < before_count
             
             new_chat_success = await self._verified_click(
                 self.SELECTORS["new_chat"],
@@ -953,11 +911,10 @@ class GeminiWebAutomation(BaseAutomation):
             )
             
             if not new_chat_success:
-                log("⚠️ New Chat failed - proceeding anyway (will use button counting)", f"Worker {self.worker_id}")
+                log("⚠️ New Chat click failed, proceeding anyway", f"Worker {self.worker_id}")
 
             
             # 1.5 Enable Temporary Chat
-            log("Enabling temporary chat...", f"Worker {self.worker_id}")
             await self._enable_temp_chat()
             await self._human_delay()
 
@@ -966,7 +923,6 @@ class GeminiWebAutomation(BaseAutomation):
                 await self._select_model(model)
 
             # 3. Enter Prompt
-            log(f"Entering prompt ({len(prompt)} chars)...", f"Worker {self.worker_id}")
             input_area = self.page.locator(self.SELECTORS["input"])
             await input_area.click()
             await self._human_delay()
@@ -981,10 +937,7 @@ class GeminiWebAutomation(BaseAutomation):
             await self._human_delay(300, 600)
 
             # Capture button count BEFORE sending (to ensure we wait for a NEW one)
-            # If chat was cleared successfully, pre_send_count should be 0.
-            # If chat wasn't cleared, it might be > 0.
             pre_send_count = await self.page.locator(self.SELECTORS["copy_btn"]).count()
-            log(f"Copy buttons before send: {pre_send_count}", f"Worker {self.worker_id}")
 
             # 4. Click Send - VERIFIED
             worker_id = self.worker_id  # Capture for closure
@@ -1014,18 +967,15 @@ class GeminiWebAutomation(BaseAutomation):
                     after_len = len(after_text.strip())
                     
                     if before_len == 0:
-                        # Empty prompt - can't verify by text, assume success
-                        log(f"Send: Empty prompt, assuming success", f"Worker {worker_id}")
-                        return True
+                        return True  # Empty prompt - can't verify, assume success
                     elif after_len < before_len / 2:
-                        log(f"Send: Input cleared ({before_len} → {after_len} chars)", f"Worker {worker_id}")
-                        return True
+                        return True  # Input cleared = send worked
                     else:
-                        log(f"Send: Input NOT cleared (still {after_len} chars) - SEND FAILED!", f"Worker {worker_id}")
+                        log(f"⚠️ Send failed: input not cleared ({after_len} chars remain)", f"Worker {worker_id}")
                         return False
                 except Exception as e:
-                    log(f"Send verification error: {e} - retrying", f"Worker {worker_id}")
-                    return False  # FIXED: Don't assume success on error!
+                    log(f"⚠️ Send verification error: {e}", f"Worker {worker_id}")
+                    return False  # Don't assume success on error
             
             send_success = await self._verified_click(
                 self.SELECTORS["send_btn"],
@@ -1036,11 +986,11 @@ class GeminiWebAutomation(BaseAutomation):
             )
             
             if not send_success:
-                print(f"[Worker {self.worker_id}] ❌ Send failed - check selector or UI state")
+                log(f"❌ Send button click failed", f"Worker {self.worker_id}")
                 return {"success": False, "error": "Send button click failed"}
             
             # 5. Wait for Response (Copy button to appear)
-            print(f"[Worker {self.worker_id}] Waiting for response...")
+            log(f"Waiting for response...", f"Worker {self.worker_id}")
             await self._human_delay(300, 600)  # Reduced initial wait
             
             # Polling for copy button (Wait until we have MORE buttons than before)
@@ -1061,11 +1011,10 @@ class GeminiWebAutomation(BaseAutomation):
                 await asyncio.sleep(1)  # Reduced from 2s
             
             if not copy_btn:
-                log(f"❌ TIMEOUT after {max_wait}s waiting for copy button", f"Worker {self.worker_id}")
+                log(f"❌ Timeout after {max_wait}s waiting for response", f"Worker {self.worker_id}")
                 return {"success": False, "error": f"Timeout after {max_wait}s waiting for response"}
 
             # Auto-scroll to ensure copy button is visible
-            log(f"Scrolling to copy button...", f"Worker {self.worker_id}")
             await self.page.evaluate('''
                 () => {
                     const copyButtons = document.querySelectorAll('button[aria-label="Copy"]');
@@ -1075,24 +1024,21 @@ class GeminiWebAutomation(BaseAutomation):
                     }
                 }
             ''')
-            await self._human_delay(150, 300)  # Reduced scroll wait
+            await self._human_delay(150, 300)
 
             # 6. Extraction via Copy Button (with lock to prevent clipboard race condition)
-            log(f"Extracting markdown via Copy button...", f"Worker {self.worker_id}")
-            
-            # Lock clipboard access to prevent race between workers
             async with GeminiWebAutomation._get_clipboard_lock():
                 await copy_btn.click()
-                await self._human_delay(100, 200)  # Reduced - clipboard is fast
+                await self._human_delay(100, 200)
                 markdown = await self.page.evaluate("navigator.clipboard.readText()")
             
             self._generation_in_progress = False
             
             if not markdown:
-                log(f"⚠️ Clipboard empty, trying fallback...", f"Worker {self.worker_id}")
+                log(f"⚠️ Clipboard empty, using fallback", f"Worker {self.worker_id}")
                 return await self._fallback_extract()
 
-            log(f"✅ Extracted {len(markdown)} chars", f"Worker {self.worker_id}")
+            log(f"✅ Response: {len(markdown)} chars", f"Worker {self.worker_id}")
             return {"success": True, "response": markdown.strip()}
 
         except Exception as e:
@@ -1101,9 +1047,8 @@ class GeminiWebAutomation(BaseAutomation):
             
             # Force refresh to reset page state for next request
             try:
-                log(f"🔄 Error recovery: refreshing page...", f"Worker {self.worker_id}")
                 await self.page.reload(wait_until="domcontentloaded", timeout=15000)
-                self._request_count = 0  # Reset counter since we just refreshed
+                self._request_count = 0
             except:
                 pass
             
@@ -1230,39 +1175,31 @@ class WorkerPool:
         self._last_activity = time.time()
     
     async def _get_available_worker(self, exclude: set = None) -> Tuple[int, GeminiWebAutomation]:
-        """Get first available worker (round-robin). Waits if all are busy.
-        
-        Args:
-            exclude: Set of worker indices to skip (for retry logic)
-        """
+        """Get first available worker (round-robin). Waits if all are busy."""
         if exclude is None:
             exclude = set()
             
         start_time = time.time()
-        max_wait = 60  # 60 second timeout to prevent infinite loop
+        max_wait = 60
         
         while time.time() - start_time < max_wait:
             async with self._worker_lock:
                 for i, busy in enumerate(self._worker_busy):
                     if i in exclude:
-                        continue  # Skip excluded workers
+                        continue
                     if not busy and self.workers[i]._initialized:
                         self._worker_busy[i] = True
-                        log(f"Assigned worker {i+1}/{len(self.workers)}", "WorkerPool")
                         return i, self.workers[i]
-            # All workers busy, wait and retry
             await asyncio.sleep(0.5)
         
-        # Timeout - return None to signal no workers available
-        log(f"⚠️ Worker assignment timeout or all workers excluded", "WorkerPool")
+        log(f"⚠️ Worker assignment timeout", "WorkerPool")
         return None, None
     
     async def _release_worker(self, index: int):
-        """Mark worker as available (async for thread safety)."""
+        """Mark worker as available."""
         async with self._worker_lock:
             if 0 <= index < len(self._worker_busy):
                 self._worker_busy[index] = False
-                log(f"Released worker {index+1}/{len(self.workers)}", "WorkerPool")
 
     async def init(self, cookies: List[Dict]) -> bool:
         """Launch shared browser and N Gemini Web tabs."""
@@ -1378,14 +1315,12 @@ class WorkerPool:
         Send message with round-robin worker dispatch.
         Supports N concurrent requests (1 per worker).
         """
-        log(f">>> ENTER send_message (model={model})", "WorkerPool")
-        
         # Update activity timestamp
         self._last_activity = time.time()
         
         # No workers available
         if not self.workers:
-            log("<<< EXIT send_message (no workers)", "WorkerPool")
+            log("❌ No workers available", "WorkerPool")
             return {"success": False, "error": "No workers available"}
         
         # Retry configuration
@@ -1395,21 +1330,18 @@ class WorkerPool:
         
         for attempt in range(MAX_RETRIES):
             # Acquire semaphore (limits concurrent requests to N workers)
-            log(f"Acquiring semaphore (attempt {attempt+1}/{MAX_RETRIES})...", "WorkerPool")
             async with self._browser_semaphore:
-                log(f"Semaphore acquired, getting worker...", "WorkerPool")
                 
                 # Get available worker, excluding already-tried workers
                 worker_index, worker = await self._get_available_worker(exclude=tried_workers)
                 
                 if worker is None:
-                    log(f"No available workers left to try", "WorkerPool")
+                    log(f"⚠️ No available workers left to try", "WorkerPool")
                     break
                 
                 tried_workers.add(worker_index)
                 
                 try:
-                    log(f"Worker {worker_index+1} processing model '{model}' (attempt {attempt+1})", "WorkerPool")
                     result = await worker.send_message(prompt, model, thinking_level, use_search, images)
                     
                     # Validate response
@@ -1417,17 +1349,15 @@ class WorkerPool:
                         response = result.get("response", "")
                         # Check for empty or suspiciously short responses
                         if len(response.strip()) < 3:
-                            log(f"Worker {worker_index+1} returned empty/short response, retrying...", "WorkerPool")
+                            log(f"Worker {worker_index+1}: Empty/short response, retrying...", "WorkerPool")
                             last_error = "Empty response"
                             # Don't call _release_worker here - finally block handles it
                             continue
                         
-                        log(f"Worker {worker_index+1} completed successfully", "WorkerPool")
-                        log(f"<<< EXIT send_message (success=True)", "WorkerPool")
                         return result
                     else:
                         last_error = result.get('error', 'unknown')
-                        log(f"Worker {worker_index+1} failed: {last_error}, retrying on different worker...", "WorkerPool")
+                        log(f"Worker {worker_index+1} failed: {last_error}, retrying...", "WorkerPool")
                         
                 except Exception as e:
                     last_error = str(e)
@@ -1437,7 +1367,7 @@ class WorkerPool:
                     self._last_activity = time.time()
         
         # All retries exhausted
-        log(f"<<< EXIT send_message (all {MAX_RETRIES} attempts failed)", "WorkerPool")
+        log(f"❌ All {MAX_RETRIES} attempts failed. Last error: {last_error}", "WorkerPool")
         return {"success": False, "error": f"All workers failed. Last error: {last_error}"}
 
 
