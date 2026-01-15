@@ -1347,9 +1347,9 @@ class WorkerPool:
                     # Validate response
                     if result.get("success"):
                         response = result.get("response", "")
-                        # Check for empty or suspiciously short responses
-                        if len(response.strip()) < 3:
-                            log(f"Worker {worker_index+1}: Empty/short response, retrying...", "WorkerPool")
+                        # Check for empty responses (extraction failed)
+                        if not response.strip():
+                            log(f"Worker {worker_index+1}: Empty response, retrying...", "WorkerPool")
                             last_error = "Empty response"
                             # Don't call _release_worker here - finally block handles it
                             continue
