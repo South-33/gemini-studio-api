@@ -1260,14 +1260,23 @@ class WorkerPool:
         self._keepalive_task = None
         self._idle_task = None
     
-    async def _get_available_worker(self) -> Tuple[int, GeminiWebAutomation]:
-        """Get first available worker (round-robin). Waits if all are busy."""
+    async def _get_available_worker(self, exclude: set = None) -> Tuple[int, GeminiWebAutomation]:
+        """Get first available worker (round-robin). Waits if all are busy.
+        
+        Args:
+            exclude: Set of worker indices to skip (for retry logic)
+        """
+        if exclude is None:
+            exclude = set()
+            
         start_time = time.time()
         max_wait = 60  # 60 second timeout to prevent infinite loop
         
         while time.time() - start_time < max_wait:
             async with self._worker_lock:
                 for i, busy in enumerate(self._worker_busy):
+                    if i in exclude:
+                        continue  # Skip excluded workers
                     if not busy and self.workers[i]._initialized:
                         self._worker_busy[i] = True
                         log(f"Assigned worker {i+1}/{len(self.workers)}", "WorkerPool")
@@ -1275,11 +1284,9 @@ class WorkerPool:
             # All workers busy, wait and retry
             await asyncio.sleep(0.5)
         
-        # Timeout - force assign to first worker (will queue)
-        log(f"⚠️ Worker assignment timeout, forcing worker 1", "WorkerPool")
-        async with self._worker_lock:
-            self._worker_busy[0] = True
-        return 0, self.workers[0]
+        # Timeout - return None to signal no workers available
+        log(f"⚠️ Worker assignment timeout or all workers excluded", "WorkerPool")
+        return None, None
     
     async def _release_worker(self, index: int):
         """Mark worker as available (async for thread safety)."""
@@ -1405,6 +1412,10 @@ class WorkerPool:
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
+                # Anti-throttling: prevent Chrome from suspending background tabs
+                "--disable-background-timer-throttling",
+                "--disable-backgrounding-occluded-windows",
+                "--disable-renderer-backgrounding",
             ]
             if is_headless:
                 browser_args.extend([
@@ -1518,28 +1529,57 @@ class WorkerPool:
             log("<<< EXIT send_message (no workers)", "WorkerPool")
             return {"success": False, "error": "No workers available"}
         
-        # Acquire semaphore (limits concurrent requests to N workers)
-        log(f"Acquiring semaphore...", "WorkerPool")
-        async with self._browser_semaphore:
-            log(f"Semaphore acquired, getting worker...", "WorkerPool")
-            # Get available worker (round-robin)
-            worker_index, worker = await self._get_available_worker()
-            
-            try:
-                log(f"Worker {worker_index+1} processing model '{model}'", "WorkerPool")
-                result = await worker.send_message(prompt, model, thinking_level, use_search, images)
+        # Retry configuration
+        MAX_RETRIES = min(3, len(self.workers))  # Try up to 3 different workers
+        tried_workers = set()
+        last_error = None
+        
+        for attempt in range(MAX_RETRIES):
+            # Acquire semaphore (limits concurrent requests to N workers)
+            log(f"Acquiring semaphore (attempt {attempt+1}/{MAX_RETRIES})...", "WorkerPool")
+            async with self._browser_semaphore:
+                log(f"Semaphore acquired, getting worker...", "WorkerPool")
                 
-                # Log result status for debugging
-                if result.get("success"):
-                    log(f"Worker {worker_index+1} completed successfully", "WorkerPool")
-                else:
-                    log(f"Worker {worker_index+1} returned error: {result.get('error', 'unknown')}", "WorkerPool")
+                # Get available worker, excluding already-tried workers
+                worker_index, worker = await self._get_available_worker(exclude=tried_workers)
                 
-                log(f"<<< EXIT send_message (success={result.get('success')})", "WorkerPool")
-                return result
-            finally:
-                await self._release_worker(worker_index)
-                self._last_activity = time.time()
+                if worker is None:
+                    log(f"No available workers left to try", "WorkerPool")
+                    break
+                
+                tried_workers.add(worker_index)
+                
+                try:
+                    log(f"Worker {worker_index+1} processing model '{model}' (attempt {attempt+1})", "WorkerPool")
+                    result = await worker.send_message(prompt, model, thinking_level, use_search, images)
+                    
+                    # Validate response
+                    if result.get("success"):
+                        response = result.get("response", "")
+                        # Check for empty or suspiciously short responses
+                        if len(response.strip()) < 3:
+                            log(f"Worker {worker_index+1} returned empty/short response, retrying...", "WorkerPool")
+                            last_error = "Empty response"
+                            await self._release_worker(worker_index)
+                            continue
+                        
+                        log(f"Worker {worker_index+1} completed successfully", "WorkerPool")
+                        log(f"<<< EXIT send_message (success=True)", "WorkerPool")
+                        return result
+                    else:
+                        last_error = result.get('error', 'unknown')
+                        log(f"Worker {worker_index+1} failed: {last_error}, retrying on different worker...", "WorkerPool")
+                        
+                except Exception as e:
+                    last_error = str(e)
+                    log(f"Worker {worker_index+1} exception: {e}, retrying...", "WorkerPool")
+                finally:
+                    await self._release_worker(worker_index)
+                    self._last_activity = time.time()
+        
+        # All retries exhausted
+        log(f"<<< EXIT send_message (all {MAX_RETRIES} attempts failed)", "WorkerPool")
+        return {"success": False, "error": f"All workers failed. Last error: {last_error}"}
 
 
     async def close(self):

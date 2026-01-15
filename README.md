@@ -266,6 +266,9 @@ WORKER_COUNT=2     # Number of parallel tabs (1 worker = 1 tab)
 
 The API includes several self-healing mechanisms:
 
+- **Request-Level Retry**: If a worker fails, automatically retries on a different worker (up to 3 attempts)
+- **Response Validation**: Detects empty/invalid responses and triggers retry
+- **Chrome Anti-Throttling**: Browser flags prevent Chrome from suspending background tabs during idle
 - **Overlay Dismissal**: Automatically clears stuck Angular Material modals/menus before each request
 - **Periodic Hard Refresh**: Browser tab refreshes every 10 requests to clear memory/cache buildup
 - **Error Recovery**: On failure, the page automatically refreshes to reset state for the next request
