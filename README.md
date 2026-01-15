@@ -1,14 +1,14 @@
 # Gemini Studio API
 
-A lightweight API that automates Google AI Studio to provide OpenAI-compatible endpoints. Use Gemini Pro/Flash with thinking levels directly from Roo Code, Cursor, or any OpenAI-compatible tool.
+A lightweight API that automates Google AI Studio to provide OpenAI-compatible endpoints. Use Gemini Pro/Flash with thinking levels directly from Roo Code, Cline, or any OpenAI-compatible tool.
 
 - **Multi-Provider** - Supports both **Google AI Studio** and **Gemini Web** (gemini.google.com)
-- **OpenAI Compatible** - Works with Cursor, Roo Code, Continue, etc.
+- **OpenAI Compatible** - Works with Roo Code, Cline, Continue, etc.
 - **Thinking Levels** - Control via model name suffix: `-minimal`, `-low`, `-medium`, `-high`
 - **Simplified Models** - Use `thinking`, `pro`, or `fast` with Gemini Web (recommended)
 - **Image Upload** - Send images via OpenAI Vision API format
 - **Session Persistence** - Login once via Chrome, stays authenticated forever
-- **Cloudflare Tunnel** - Expose your local API to the internet for free
+- **ngrok Tunnel** - Expose your local API to the internet with a static domain
 - **Self-Healing** - Auto-recovers from stuck UI states and errors
 
 > ⚠️ **Note**: AI Studio has bot detection that may block automation. **Gemini Web models (`thinking`, `pro`, `fast`) are recommended** for reliable operation.
@@ -35,13 +35,18 @@ python setup_session.py  # Chrome opens, log in, then Ctrl+C
 python main.py
 ```
 
-### Expose to Internet (Cloudflare Tunnel)
+### Expose to Internet (ngrok)
 
 ```bash
-cloudflared tunnel --url http://localhost:8000
+# One-time setup: Create free account at ngrok.com and get auth token
+ngrok config add-authtoken YOUR_AUTH_TOKEN
+
+# Optional: Claim a free static domain at dashboard.ngrok.com/domains
+# Then run with your domain:
+ngrok http 8000 --domain=your-subdomain.ngrok-free.app
 ```
 
-You'll get a public URL like: `https://random-words.trycloudflare.com`
+You'll get a public URL like: `https://your-subdomain.ngrok-free.app`
 
 ### Auto-Start on Boot
 
@@ -62,12 +67,12 @@ See [DEPLOY_LOCAL.md](DEPLOY_LOCAL.md) for full headless server setup guide.
 
 ---
 
-## Client Setup (Cursor, Roo Code)
+## Client Setup (Roo Code, Cline)
 
 | Setting | Value |
 |---------|-------|
 | **Provider** | OpenAI Compatible |
-| **Base URL** | `https://your-tunnel-url.trycloudflare.com/v1` |
+| **Base URL** | `https://your-subdomain.ngrok-free.app/v1` |
 | **API Key** | `anything` (ignored) |
 | **Model** | `thinking` (recommended) or `pro`, `fast` |
 
@@ -78,8 +83,8 @@ See [DEPLOY_LOCAL.md](DEPLOY_LOCAL.md) for full headless server setup guide.
 This API is fully **OpenAI-compatible** and can be used from any programming language or tool that supports OpenAI's chat completions endpoint.
 
 > **Note**: Replace `http://localhost:8001` in the examples below with:
-> - Your Cloudflare Tunnel URL: `https://your-tunnel-url.trycloudflare.com`
-> - Or your deployed API URL (if hosted on Convex, Railway, etc.)
+> - Your ngrok URL: `https://your-subdomain.ngrok-free.app`
+> - Or your deployed API URL (if hosted elsewhere)
 
 > **Model Routing**: The API automatically routes to the correct provider based on the model name:
 > - Use `thinking`, `pro`, or `fast` → Routes to **Gemini Web**
@@ -235,7 +240,6 @@ WORKER_COUNT=2     # Number of parallel tabs (1 worker = 1 tab)
 |---------|-------------|
 | `WORKER_COUNT` | Number of concurrent browser tabs. Each can handle one request. |
 | `HEADLESS` | Run browser invisibly (recommended for servers) |
-| `IDLE_TIMEOUT_MINUTES` | Close tabs after N minutes of inactivity (default: 30) |
 
 ---
 
@@ -257,7 +261,7 @@ WORKER_COUNT=2     # Number of parallel tabs (1 worker = 1 tab)
 |-------|----------|
 | Session expired | Run `python setup_session.py` and login again |
 | 502 Bad Gateway | Make sure API is running (`python main.py`) |
-| Cloudflare can't connect | Use `http://` not `https://` in tunnel command |
+| ngrok connection refused | Ensure API is running before starting ngrok |
 | Extraction failed (500 errors) | Usually auto-recovers. If persistent, restart the API |
 | High CPU usage | Normal during generation. Polling is optimized to reduce load |
 | Stuck overlay/modal | Auto-dismissed on next request. Hard refresh every 10 requests |
@@ -290,10 +294,10 @@ The API includes several self-healing mechanisms:
 │  └──────────────────────────────────────────┘   │
 │                      ↓                          │
 │  ┌──────────────────────────────────────────┐   │
-│  │  Cloudflare Tunnel                        │   │
+│  │  ngrok Tunnel                             │   │
 │  │  (Public HTTPS URL)                       │   │
 │  └──────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────┘
                        ↓
-              Google AI Studio (Web)
+              Gemini Web (gemini.google.com)
 ```
