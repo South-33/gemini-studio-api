@@ -3,7 +3,6 @@
 A lightweight API that automates Google AI Studio to provide OpenAI-compatible endpoints. Use Gemini Pro/Flash with thinking levels directly from Roo Code, Cline, or any OpenAI-compatible tool.
 
 - **OpenAI Compatible** - Works with Roo Code, Cline, Continue, etc.
-- **Thinking Levels** - Control via model name suffix: `-minimal`, `-low`, `-medium`, `-high`
 - **Simplified Models** - Use `thinking`, `pro`, or `fast` with Gemini Web (recommended)
 - **Image Upload** - Send images via OpenAI Vision API format
 - **Session Persistence** - Login once via Chrome, stays authenticated forever
