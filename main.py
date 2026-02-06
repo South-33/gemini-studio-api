@@ -34,7 +34,7 @@ def log(msg: str, tag: str = "Server"):
 # Load .env file
 load_dotenv()
 
-from core import WorkerPool
+from core import WorkerPool, GeminiWebAutomation
 
 # Configuration
 WORKER_COUNT = int(os.getenv("WORKER_COUNT", "1"))
@@ -245,6 +245,44 @@ async def openai_chat(request: Request):
 @app.get("/health")
 async def health():
     return {"status": "ok", "workers": WORKER_COUNT}
+
+@app.get("/v1/diagnostics")
+async def diagnostics():
+    """
+    Diagnostics endpoint for debugging selector failures and worker health.
+    Returns structured error information that can be parsed by monitoring tools.
+    """
+    errors = GeminiWebAutomation.get_all_errors()
+    
+    # Get worker status
+    worker_status = []
+    if worker_pool and worker_pool.workers:
+        for i, worker in enumerate(worker_pool.workers):
+            worker_status.append({
+                "worker_id": i + 1,
+                "initialized": worker._initialized,
+                "busy": worker_pool._worker_busy[i] if i < len(worker_pool._worker_busy) else False,
+                "request_count": worker._request_count,
+                "last_error": errors.get(i + 1)
+            })
+    
+    return {
+        "status": "ok" if worker_pool and worker_pool._initialized else "initializing",
+        "worker_count": WORKER_COUNT,
+        "workers": worker_status,
+        "errors": errors,
+        "selectors": {
+            key: vals[0] if isinstance(vals, list) and vals else vals 
+            for key, vals in GeminiWebAutomation.SELECTORS.items()
+        },
+        "timestamp": datetime.now().isoformat()
+    }
+
+@app.post("/v1/diagnostics/clear-errors")
+async def clear_errors():
+    """Clear all tracked errors."""
+    GeminiWebAutomation.clear_errors()
+    return {"status": "ok", "message": "Errors cleared"}
 
 if __name__ == "__main__":
     import uvicorn

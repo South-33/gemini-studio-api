@@ -654,25 +654,166 @@ class GeminiWebAutomation(BaseAutomation):
             cls._clipboard_lock = asyncio.Lock()
         return cls._clipboard_lock
     
-    # Selectors discovered during research
+    # Selectors with fallbacks - each key maps to a list of selectors to try in order
+    # STRATEGY: Put STABLE structural selectors FIRST, volatile text-based ones LAST
+    # Structural (role, contenteditable) > Class-based > aria-label text
+    # Last updated: 2026-02-07
     SELECTORS = {
-        "input": 'div[role="textbox"][aria-label="Enter a prompt here"]',
-        "send_btn": '[aria-label="Send message"]',
-        "model_btn": '.input-area-switch',
-        "new_chat": '[data-test-id="new-chat-button"]',
-        "temp_chat": '[aria-label="Temporary chat"]',
-        "temp_chat_active": '[aria-label="Temporary chat"].temp-chat-on',
-        "sidebar_toggle": '[aria-label="Main menu"]',
-        "copy_btn": '[aria-label="Copy"]',
-        "menu_panel": '.mat-mdc-menu-panel',
-        "menu_item": '.mat-mdc-menu-item'
+        # INPUT: Most volatile - Google changes aria-label text frequently
+        # Priority: structural > class > partial keywords (NO exact text matches)
+        "input": [
+            'div[role="textbox"][contenteditable="true"]',  # STABLE: structural attributes
+            '.ql-editor.textarea',  # Class-based (Quill editor)
+            'div.ql-editor[contenteditable="true"]',  # Quill + structural
+            'div[aria-label*="prompt" i][contenteditable="true"]',  # Keyword: "prompt"
+            'div[aria-label*="Gemini" i][contenteditable="true"]',  # Keyword: "Gemini"
+            'div[aria-label*="Ask" i][contenteditable="true"]',  # Keyword: "Ask"
+            'div[aria-label*="Enter" i][contenteditable="true"]',  # Keyword: "Enter"
+            'div[aria-label*="message" i][contenteditable="true"]',  # Keyword: "message"
+            'div[aria-label*="chat" i][contenteditable="true"]',  # Keyword: "chat"
+        ],
+        # SEND: Button near input - use class and partial keywords only
+        "send_btn": [
+            'button.send-button',  # Class-based - more stable
+            'button[aria-label*="Send" i]',  # Keyword: "Send"
+            'button[aria-label*="Submit" i]',  # Keyword: "Submit"
+            '[aria-label*="Send" i]',  # Any element with Send
+        ],
+        # MODEL: The dropdown to switch Fast/Pro/Thinking
+        "model_btn": [
+            'button.input-area-switch',  # Class-based
+            '.input-area-switch',  # Any element with this class
+            'button:has-text("Fast")',  # Text-based fallbacks
+            'button:has-text("Pro")',
+            'button:has-text("Thinking")',
+        ],
+        # NEW CHAT: Now an <a> tag - use URL and keywords
+        "new_chat": [
+            'a[href="/app"]',  # URL-based - very stable!
+            '.side-nav-action-button',  # Class-based
+            'a[aria-label*="New" i]',  # Keyword: "New"
+            'button[aria-label*="New" i]',  # Button fallback with keyword
+            'a[aria-label*="chat" i]',  # Keyword: "chat"
+        ],
+        # TEMP CHAT: Toggle button - keywords only
+        "temp_chat": [
+            'button.temp-chat-button',  # Class-based
+            '[aria-label*="Temporary" i]',  # Keyword: "Temporary"
+            '[aria-label*="temp" i]',  # Keyword: "temp"
+        ],
+        "temp_chat_active": [
+            'button.temp-chat-button.temp-chat-on',  # Class-based active state
+            'button[aria-label*="Temporary" i][aria-pressed="true"]',  # aria-pressed
+            '[aria-label*="Temporary" i].temp-chat-on',  # Keyword + class
+        ],
+        # SIDEBAR: Hamburger menu - keywords only
+        "sidebar_toggle": [
+            'button[aria-label*="menu" i]',  # Keyword: "menu"
+            'button[aria-label*="Menu" i]',  # Keyword: "Menu" (case variation)
+            'button[aria-label*="sidebar" i]',  # Keyword: "sidebar"
+            'button[aria-label*="navigation" i]',  # Keyword: "navigation"
+        ],
+        # COPY: Generic action, unlikely to change
+        "copy_btn": [
+            'button[aria-label="Copy"]',  # Exact - "Copy" is universal
+            'button[aria-label*="Copy" i]',  # Partial fallback
+            'button.copy-button',  # Class-based fallback
+        ],
+        # MENU: Standard accessibility roles - very stable
+        "menu_panel": [
+            '[role="menu"]',  # STABLE: accessibility standard
+            '[role="listbox"]',  # Alternative menu pattern
+            '.mat-mdc-menu-panel',  # Angular Material
+        ],
+        "menu_item": [
+            '[role="menuitem"]',  # STABLE: accessibility standard
+            '[role="option"]',  # Alternative pattern
+            '.mat-mdc-menu-item',  # Angular Material
+        ],
+        # OVERLAY: Angular CDK internal - stable
+        "overlay_backdrop": [
+            '.cdk-overlay-backdrop',  # STABLE: Angular CDK
+            '.cdk-overlay-container .cdk-overlay-backdrop',  # More specific
+        ]
     }
+    
+    # Error tracking for diagnostics
+    _last_errors: Dict[int, Dict] = {}  # worker_id -> {error, selector, action, timestamp}
     
     def __init__(self, worker_id: int = 0):
         super().__init__()
         self.worker_id = worker_id  # For logging
         self._request_count = 0
         self._request_id = None  # Set per-request for log tracing
+
+    def _get_selector(self, key: str) -> str:
+        """Get the first selector from a selector group (for backward compatibility)."""
+        selectors = self.SELECTORS.get(key, [])
+        if isinstance(selectors, list) and len(selectors) > 0:
+            return selectors[0]
+        elif isinstance(selectors, str):
+            return selectors
+        return ""
+    
+    def _get_all_selectors(self, key: str) -> List[str]:
+        """Get all selectors for a key as a list."""
+        selectors = self.SELECTORS.get(key, [])
+        if isinstance(selectors, list):
+            return selectors
+        elif isinstance(selectors, str):
+            return [selectors]
+        return []
+    
+    async def _find_element(self, key: str, timeout: int = 5000, description: str = None):
+        """
+        Try all selectors for a key until one finds a visible element.
+        Returns (locator, selector_used) or (None, None) if all fail.
+        """
+        desc = description or key
+        selectors = self._get_all_selectors(key)
+        
+        for selector in selectors:
+            try:
+                locator = self.page.locator(selector).first
+                # Quick visibility check
+                if await locator.is_visible():
+                    return locator, selector
+            except:
+                continue
+        
+        # None found immediately visible, try waiting for first selector
+        if selectors:
+            try:
+                locator = self.page.locator(selectors[0]).first
+                await locator.wait_for(state="visible", timeout=timeout)
+                return locator, selectors[0]
+            except:
+                pass
+        
+        # Track the failure
+        self._track_error(f"Element not found: {desc}", key, desc)
+        return None, None
+    
+    def _track_error(self, error: str, selector_key: str, action: str):
+        """Track error for diagnostics endpoint."""
+        GeminiWebAutomation._last_errors[self.worker_id] = {
+            "error": error,
+            "selector_key": selector_key,
+            "action": action,
+            "timestamp": datetime.now().isoformat(),
+            "worker_id": self.worker_id
+        }
+        log(f"Error tracked: {error} (selector: {selector_key}, action: {action})", f"Worker {self.worker_id}")
+    
+    @classmethod
+    def get_all_errors(cls) -> Dict[int, Dict]:
+        """Get all tracked errors (for diagnostics endpoint)."""
+        return cls._last_errors.copy()
+    
+    @classmethod
+    def clear_errors(cls):
+        """Clear all tracked errors."""
+        cls._last_errors.clear()
 
     async def _screenshot_on_failure(self, action_name: str):
         """
@@ -815,10 +956,30 @@ class GeminiWebAutomation(BaseAutomation):
         self.page = page
         self.context = context
         try:
-            # Wait for input to be ready (login check)
-            await self.page.wait_for_selector(self.SELECTORS["input"], timeout=30000)
+            # Wait for input to be ready (login check) - try all selectors
+            input_found = False
+            selectors = self._get_all_selectors("input")
+            
+            for selector in selectors:
+                try:
+                    await self.page.wait_for_selector(selector, timeout=10000)
+                    input_found = True
+                    log(f"Input found with selector: {selector}", f"Worker {self.worker_id}")
+                    break
+                except:
+                    continue
+            
+            if not input_found:
+                # Last attempt with longer timeout on first selector
+                try:
+                    await self.page.wait_for_selector(selectors[0], timeout=30000)
+                    input_found = True
+                except Exception as e:
+                    self._track_error(f"Input not found: {e}", "input", "init")
+                    raise e
+            
             await self._human_delay(500, 1000)
-            print("[GeminiWeb] ✅ Logged in and ready")
+            print("[GeminiWeb] Logged in and ready")
             
             # Default to Temporary Chat if possible for clean sessions
             await self._enable_temp_chat()
@@ -827,37 +988,39 @@ class GeminiWebAutomation(BaseAutomation):
             self._initialized = True
             return True
         except Exception as e:
-            print(f"[GeminiWeb] ❌ Init failed: {e}")
+            print(f"[GeminiWeb] Init failed: {e}")
+            self._track_error(str(e), "input", "init")
             return False
 
     async def _enable_temp_chat(self):
         """Enable temporary chat mode."""
         try:
-            temp_btn = self.page.locator(self.SELECTORS["temp_chat"])
+            # Check if temp chat is already enabled using fallback selectors
+            for selector in self._get_all_selectors("temp_chat_active"):
+                try:
+                    if await self.page.locator(selector).count() > 0:
+                        return  # Already enabled
+                except:
+                    continue
             
-            # Check if temp chat is already enabled
-            temp_active = self.page.locator(self.SELECTORS["temp_chat_active"])
-            if await temp_active.count() > 0:
-                return
+            # Try to find temp chat button
+            temp_btn, _ = await self._find_element("temp_chat", timeout=2000, description="Temporary chat button")
             
-            # Expand sidebar if button not visible
-            if not await temp_btn.is_visible():
-                sidebar_btn = self.page.locator(self.SELECTORS["sidebar_toggle"])
-                if await sidebar_btn.is_visible():
+            if temp_btn is None:
+                # Expand sidebar if button not visible
+                sidebar_btn, _ = await self._find_element("sidebar_toggle", timeout=2000, description="Sidebar toggle")
+                if sidebar_btn:
                     await sidebar_btn.click()
                     await self._human_delay(300, 500)
-                else:
-                    return
+                    # Try again
+                    temp_btn, _ = await self._find_element("temp_chat", timeout=2000, description="Temporary chat button")
             
-            # Click temp chat button
-            if await temp_btn.is_visible():
-                temp_active = self.page.locator(self.SELECTORS["temp_chat_active"])
-                if await temp_active.count() == 0:
-                    await temp_btn.click()
-                    await self._human_delay(200, 400)
+            if temp_btn and await temp_btn.is_visible():
+                await temp_btn.click()
+                await self._human_delay(200, 400)
                     
         except Exception as e:
-            log(f"⚠️ Temp chat error: {e}", f"Worker {self.worker_id}")
+            log(f"Temp chat error: {e}", f"Worker {self.worker_id}")
 
     async def send_message(self, prompt: str, model: str = None, thinking_level: str = None, use_search: bool = False, images: List[str] = None) -> Dict:
         if not self._initialized: 
@@ -891,19 +1054,21 @@ class GeminiWebAutomation(BaseAutomation):
             
             # 1. New Chat (starts fresh) - VERIFIED
             async def get_copy_count():
-                return await self.page.locator(self.SELECTORS["copy_btn"]).count()
+                copy_selector = self._get_selector("copy_btn")
+                return await self.page.locator(copy_selector).count()
             
             worker_id_for_closure = self.worker_id  # Capture for nested functions
             
             async def verify_chat_cleared(before_count):
                 # Give extra time for chat to clear
                 await self._human_delay(500, 800)
-                after_count = await self.page.locator(self.SELECTORS["copy_btn"]).count()
+                copy_selector = self._get_selector("copy_btn")
+                after_count = await self.page.locator(copy_selector).count()
                 # Success if count dropped (ideally to 0, but at least fewer than before)
                 return after_count == 0 or after_count < before_count
             
             new_chat_success = await self._verified_click(
-                self.SELECTORS["new_chat"],
+                self._get_selector("new_chat"),
                 "New Chat",
                 verify_before=get_copy_count,
                 verify_after=verify_chat_cleared,
@@ -922,8 +1087,12 @@ class GeminiWebAutomation(BaseAutomation):
             if model:
                 await self._select_model(model)
 
-            # 3. Enter Prompt
-            input_area = self.page.locator(self.SELECTORS["input"])
+            # 3. Enter Prompt - use fallback selector finding
+            input_area, input_selector = await self._find_element("input", timeout=5000, description="Input textbox")
+            if not input_area:
+                self._track_error("Input textbox not found", "input", "send_message")
+                return {"success": False, "error": "Input textbox not found"}
+            
             await input_area.click()
             await self._human_delay()
             
@@ -937,7 +1106,8 @@ class GeminiWebAutomation(BaseAutomation):
             await self._human_delay(300, 600)
 
             # Capture button count BEFORE sending (to ensure we wait for a NEW one)
-            pre_send_count = await self.page.locator(self.SELECTORS["copy_btn"]).count()
+            copy_selector = self._get_selector("copy_btn")
+            pre_send_count = await self.page.locator(copy_selector).count()
 
             # 4. Click Send - VERIFIED
             worker_id = self.worker_id  # Capture for closure
@@ -971,14 +1141,14 @@ class GeminiWebAutomation(BaseAutomation):
                     elif after_len < before_len / 2:
                         return True  # Input cleared = send worked
                     else:
-                        log(f"⚠️ Send failed: input not cleared ({after_len} chars remain)", f"Worker {worker_id}")
+                        log(f"Send failed: input not cleared ({after_len} chars remain)", f"Worker {worker_id}")
                         return False
                 except Exception as e:
-                    log(f"⚠️ Send verification error: {e}", f"Worker {worker_id}")
+                    log(f"Send verification error: {e}", f"Worker {worker_id}")
                     return False  # Don't assume success on error
             
             send_success = await self._verified_click(
-                self.SELECTORS["send_btn"],
+                self._get_selector("send_btn"),
                 "Send",
                 verify_before=get_input_text,
                 verify_after=verify_send_worked,
@@ -986,7 +1156,8 @@ class GeminiWebAutomation(BaseAutomation):
             )
             
             if not send_success:
-                log(f"❌ Send button click failed", f"Worker {self.worker_id}")
+                log(f"Send button click failed", f"Worker {self.worker_id}")
+                self._track_error("Send button click failed", "send_btn", "send_message")
                 return {"success": False, "error": "Send button click failed"}
             
             # 5. Wait for Response (Copy button to appear)
@@ -998,7 +1169,7 @@ class GeminiWebAutomation(BaseAutomation):
             max_wait = 180 # Extended for thinking models
             copy_btn = None
             while (time.time() - start_time) < max_wait:
-                btns = self.page.locator(self.SELECTORS["copy_btn"])
+                btns = self.page.locator(copy_selector)
                 current_count = await btns.count()
                 
                 # We need to find a new button (more than we started with)
@@ -1011,18 +1182,19 @@ class GeminiWebAutomation(BaseAutomation):
                 await asyncio.sleep(1)  # Reduced from 2s
             
             if not copy_btn:
-                log(f"❌ Timeout after {max_wait}s waiting for response", f"Worker {self.worker_id}")
+                log(f"Timeout after {max_wait}s waiting for response", f"Worker {self.worker_id}")
+                self._track_error(f"Timeout after {max_wait}s", "copy_btn", "wait_for_response")
                 return {"success": False, "error": f"Timeout after {max_wait}s waiting for response"}
 
             # Auto-scroll to ensure copy button is visible
-            await self.page.evaluate('''
-                () => {
-                    const copyButtons = document.querySelectorAll('button[aria-label="Copy"]');
-                    if (copyButtons.length > 0) {
+            await self.page.evaluate(f'''
+                () => {{
+                    const copyButtons = document.querySelectorAll('{copy_selector}');
+                    if (copyButtons.length > 0) {{
                         const lastBtn = copyButtons[copyButtons.length - 1];
-                        lastBtn.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                    }
-                }
+                        lastBtn.scrollIntoView({{ behavior: 'smooth', block: 'center' }});
+                    }}
+                }}
             ''')
             await self._human_delay(150, 300)
 
@@ -1076,35 +1248,40 @@ class GeminiWebAutomation(BaseAutomation):
     async def _select_model(self, model_name: str):
         """Select model from dropdown (Fast, Thinking, Pro)."""
         try:
-            # Click the pill
-            btn = self.page.locator(self.SELECTORS["model_btn"])
+            # Find model button using fallback selectors
+            btn, _ = await self._find_element("model_btn", timeout=3000, description="Model button")
+            if not btn:
+                log(f"Model button not found, skipping model selection", f"Worker {self.worker_id}")
+                return
+            
             current = await btn.inner_text()
             if model_name.lower() in current.lower():
-                return
+                return  # Already selected
             
             await btn.click()
             await self._human_delay(400, 600)
             
-            # Select from menu
-            items = self.page.locator(self.SELECTORS["menu_item"])
+            # Select from menu using fallback selectors
+            menu_selector = self._get_selector("menu_item")
+            items = self.page.locator(menu_selector)
             for i in range(await items.count()):
                 item = items.nth(i)
                 text = await item.inner_text()
                 if model_name.lower() in text.lower():
                     await item.click()
-                    print(f"[Worker {self.worker_id}] ✅ Selected model: {model_name}")
+                    log(f"Selected model: {model_name}", f"Worker {self.worker_id}")
                     await self._human_delay(300, 600)
                     return
             # If not found, close menu
             await self.page.keyboard.press("Escape")
             await self._human_delay(100, 300)
         except Exception as e:
-            print(f"[Worker {self.worker_id}] ⚠️ Model selection failed: {e}")
+            log(f"Model selection failed: {e}", f"Worker {self.worker_id}")
 
     async def _paste_image(self, image_path: str):
         """Paste an image via clipboard into Gemini Web."""
         try:
-            print(f"[Worker {self.worker_id}] Pasting image: {image_path}")
+            log(f"Pasting image: {image_path}", f"Worker {self.worker_id}")
             
             with open(image_path, 'rb') as f:
                 image_data = f.read()
@@ -1121,10 +1298,11 @@ class GeminiWebAutomation(BaseAutomation):
             }
             mime_type = mime_map.get(ext, 'image/png')
             
-            # Focus input first
-            input_area = self.page.locator(self.SELECTORS["input"])
-            await input_area.click()
-            await asyncio.sleep(0.1)
+            # Focus input first using fallback selectors
+            input_area, _ = await self._find_element("input", timeout=3000, description="Input for image paste")
+            if input_area:
+                await input_area.click()
+                await asyncio.sleep(0.1)
             
             # Write image to clipboard
             await self.page.evaluate(f'''
@@ -1145,7 +1323,7 @@ class GeminiWebAutomation(BaseAutomation):
             
             await self.page.keyboard.press("Control+v")
             await asyncio.sleep(1.0)
-            print(f"[Worker {self.worker_id}] ✅ Image pasted")
+            log(f"Image pasted", f"Worker {self.worker_id}")
         except Exception as e:
             print(f"[Worker {self.worker_id}] ⚠️ Image paste warning: {e}")
 
