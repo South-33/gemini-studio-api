@@ -657,6 +657,15 @@ class GeminiWebAutomation(BaseAutomation):
             cls._clipboard_lock = asyncio.Lock()
         return cls._clipboard_lock
     
+    # Keyword synonyms for resilient model matching
+    # If Google changes "Thinking" to "Deep Thinking", the "think" keyword still matches
+    MODEL_KEYWORDS = {
+        "thinking": ["think", "reason", "complex", "problem", "deep"],
+        "pro": ["pro", "advanced", "longer", "math", "code"],
+        "fast": ["fast", "quick", "flash", "answer", "speed"],
+        "auto": ["auto", "default", "automatic"],
+    }
+    
     # Selectors with fallbacks - each key maps to a list of selectors to try in order
     # STRATEGY: Put STABLE structural selectors FIRST, volatile text-based ones LAST
     # Structural (role, contenteditable) > Class-based > aria-label text
@@ -729,8 +738,9 @@ class GeminiWebAutomation(BaseAutomation):
             '.mat-mdc-menu-panel',  # Angular Material
         ],
         "menu_item": [
-            '[role="menuitem"]',  # STABLE: accessibility standard
-            '[role="option"]',  # Alternative pattern
+            '[role="option"]',  # Listbox pattern (Gemini uses this)
+            '[role="menuitem"]',  # Standard menu pattern
+            '[role="listitem"]',  # Alternative
             '.mat-mdc-menu-item',  # Angular Material
         ],
         # OVERLAY: Angular CDK internal - stable
@@ -796,6 +806,37 @@ class GeminiWebAutomation(BaseAutomation):
         # Track the failure
         await self._track_error(f"Element not found: {desc}", key, desc)
         return None, None
+    
+    def _matches_model(self, item_text: str, model_name: str) -> bool:
+        """Check if menu item matches requested model using keyword matching."""
+        text_lower = item_text.lower()
+        model_lower = model_name.lower()
+        
+        # Direct match first
+        if model_lower in text_lower:
+            return True
+        
+        # Keyword fallback
+        keywords = self.MODEL_KEYWORDS.get(model_lower, [])
+        return any(kw in text_lower for kw in keywords)
+
+    def _get_position_fallback(self, model_name: str, item_count: int) -> int:
+        """Get position-based fallback index (cheap to expensive = top to bottom)."""
+        model_lower = model_name.lower()
+
+        if item_count <= 0:
+            return -1
+
+        if model_lower == "pro":
+            return item_count - 1
+        if model_lower == "thinking":
+            return max(0, item_count - 2)
+        if model_lower == "fast":
+            return 1 if item_count > 3 else 0
+        if model_lower == "auto":
+            return 0
+
+        return -1
     
     async def _track_error(self, error: str, selector_key: str, action: str):
         """Track error for diagnostics endpoint and send Discord notification."""
@@ -1257,7 +1298,7 @@ class GeminiWebAutomation(BaseAutomation):
         return {"success": False, "error": "Extraction failed"}
 
     async def _select_model(self, model_name: str):
-        """Select model from dropdown (Fast, Thinking, Pro)."""
+        """Select model from dropdown (Fast, Thinking, Pro) with resilient matching."""
         try:
             # Find model button using fallback selectors
             btn, _ = await self._find_element("model_btn", timeout=3000, description="Model button")
@@ -1266,28 +1307,103 @@ class GeminiWebAutomation(BaseAutomation):
                 await self._track_error("Model button not found", "model_btn", "select_model")
                 return
             
+            # Check if already selected
             current = await btn.inner_text()
-            if model_name.lower() in current.lower():
-                return  # Already selected
+            if self._matches_model(current, model_name):
+                log(f"Model '{model_name}' already selected", f"Worker {self.worker_id}")
+                return
             
+            # Open dropdown
             await btn.click()
             await self._human_delay(400, 600)
             
-            # Select from menu using fallback selectors
-            menu_selector = self._get_selector("menu_item")
-            items = self.page.locator(menu_selector)
-            for i in range(await items.count()):
+            # Wait for menu panel to appear
+            for selector in self._get_all_selectors("menu_panel"):
+                try:
+                    await self.page.wait_for_selector(selector, state="visible", timeout=2000)
+                    break
+                except:
+                    continue
+            
+            # Try each menu_item selector until we find items
+            items = None
+            used_selector = None
+            for selector in self._get_all_selectors("menu_item"):
+                try:
+                    locator = self.page.locator(selector)
+                    count = await locator.count()
+                    if count > 0:
+                        items = locator
+                        used_selector = selector
+                        log(f"Found {count} menu items with: {selector}", f"Worker {self.worker_id}")
+                        break
+                except:
+                    continue
+            
+            if items is None or await items.count() == 0:
+                await self.page.keyboard.press("Escape")
+                await self._human_delay(100, 300)
+                await self._track_error("No menu items found with any selector", "menu_item", "select_model")
+                return
+            
+            # Search through items using keyword matching
+            item_count = await items.count()
+            found_texts = []
+            
+            for i in range(item_count):
                 item = items.nth(i)
-                text = await item.inner_text()
-                if model_name.lower() in text.lower():
+                try:
+                    text = await item.inner_text()
+                    found_texts.append(text.replace('\n', ' ')[:30])
+                    
+                    if self._matches_model(text, model_name):
+                        await item.click()
+                        log(f"Selected model: {model_name} (matched: '{text[:30]}')", f"Worker {self.worker_id}")
+                        await self._human_delay(300, 600)
+                        return
+                except:
+                    continue
+
+            # Position fallback if no keyword match (assumes cheap to expensive order)
+            fallback_index = self._get_position_fallback(model_name, item_count)
+            if 0 <= fallback_index < item_count:
+                try:
+                    item = items.nth(fallback_index)
+                    fallback_text = ""
+                    try:
+                        fallback_text = await item.inner_text()
+                    except:
+                        pass
                     await item.click()
-                    log(f"Selected model: {model_name}", f"Worker {self.worker_id}")
+                    text_preview = fallback_text.replace("\n", " ")[:30] if fallback_text else "unknown"
+                    log(
+                        f"Selected model: {model_name} (position: {fallback_index}, item: '{text_preview}')",
+                        f"Worker {self.worker_id}"
+                    )
                     await self._human_delay(300, 600)
+
+                    warning = (
+                        f"Model selection used position fallback for '{model_name}'. "
+                        f"Position {fallback_index}/{item_count}. "
+                        f"Items: {found_texts}"
+                    )
+                    if used_selector:
+                        warning = f"{warning} Selector: {used_selector}"
+
+                    try:
+                        await notify_error(warning, "menu_item", "select_model_fallback", self.worker_id)
+                    except Exception as notify_err:
+                        log(f"Fallback notification failed: {notify_err}", f"Worker {self.worker_id}")
                     return
-            # If not found, close menu
+                except Exception as click_err:
+                    log(f"Position fallback failed: {click_err}", f"Worker {self.worker_id}")
+
+            # No match found - close menu and log what we saw
             await self.page.keyboard.press("Escape")
             await self._human_delay(100, 300)
-            await self._track_error(f"Model '{model_name}' not found in menu", "model_btn", "select_model")
+            log(f"Model '{model_name}' not found. Available: {found_texts}", f"Worker {self.worker_id}")
+            await self._track_error(f"Model '{model_name}' not found in menu", "menu_item", "select_model")
+            
         except Exception as e:
             log(f"Model selection failed: {e}", f"Worker {self.worker_id}")
             await self._track_error(f"Model selection failed: {e}", "model_btn", "select_model")
