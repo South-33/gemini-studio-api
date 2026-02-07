@@ -22,7 +22,7 @@ Copy the `gemini-studio-api` folder to your old PC (USB, network, etc.).
 From your laptop, RDP into the old PC, then run:
 
 ```powershell
-pip install fastapi uvicorn playwright python-dotenv pydantic
+pip install -r requirements.txt
 playwright install chromium
 ```
 

@@ -1,27 +1,23 @@
 # Gemini Studio API
 
-A lightweight API that automates Google AI Studio to provide OpenAI-compatible endpoints. Use Gemini Pro/Flash with thinking levels directly from Roo Code, Cline, or any OpenAI-compatible tool.
+A lightweight API that automates Gemini Web to provide OpenAI-compatible endpoints. Use Gemini's thinking, pro, or fast models directly from Roo Code, Cline, or any OpenAI-compatible tool.
 
 - **OpenAI Compatible** - Works with Roo Code, Cline, Continue, etc.
-- **Simplified Models** - Use `thinking`, `pro`, or `fast` with Gemini Web (recommended)
+- **Simplified Models** - Use `thinking`, `pro`, or `fast`
 - **Image Upload** - Send images via OpenAI Vision API format
 - **Session Persistence** - Login once via Chrome, stays authenticated forever
 - **ngrok Tunnel** - Expose your local API to the internet with a static domain
 - **Self-Healing** - Auto-recovers from stuck UI states and errors
-
-> ⚠️ **Note**: AI Studio has bot detection that may block automation. **Gemini Web models (`thinking`, `pro`, `fast`) are recommended** for reliable operation.
+- **Discord Alerts** - Get notified on your phone when errors occur
+- **Resilient Selectors** - Fallback selectors that survive Google UI changes
 
 ---
 
-## 🖥️ Local Server Deployment
-
-Run on your own hardware — no cloud costs, session never expires!
-
-### Quick Start
+## Quick Start
 
 ```bash
 # Install dependencies
-pip install fastapi uvicorn playwright python-dotenv pydantic
+pip install -r requirements.txt
 
 # Install browser
 playwright install chromium
@@ -32,25 +28,17 @@ python main.py
 # After logging in, set HEADLESS=true in .env for background operation
 ```
 
-### Expose to Internet (ngrok)
+---
+
+## Expose to Internet (ngrok)
 
 ```bash
 # One-time setup: Create free account at ngrok.com and get auth token
 ngrok config add-authtoken YOUR_AUTH_TOKEN
 
 # Optional: Claim a free static domain at dashboard.ngrok.com/domains
-# Then run with your domain:
 ngrok http 8000 --domain=your-subdomain.ngrok-free.app
 ```
-
-You'll get a public URL like: `https://your-subdomain.ngrok-free.app`
-
-### Auto-Start on Boot
-
-1. Copy `autostart.bat` shortcut to: `Win+R` → `shell:startup`
-2. Enable auto-login: `Win+R` → `netplwiz` → uncheck password requirement
-
-See [DEPLOY_LOCAL.md](DEPLOY_LOCAL.md) for full headless server setup guide.
 
 ---
 
@@ -61,6 +49,7 @@ See [DEPLOY_LOCAL.md](DEPLOY_LOCAL.md) for full headless server setup guide.
 | `GET /health` | Health check |
 | `GET /v1/models` | List available models |
 | `POST /v1/chat/completions` | OpenAI-compatible chat |
+| `GET /v1/diagnostics` | Worker status and error details |
 
 ---
 
@@ -75,149 +64,8 @@ See [DEPLOY_LOCAL.md](DEPLOY_LOCAL.md) for full headless server setup guide.
 
 ---
 
-## How to Use as an API
+## Available Models
 
-This API is fully **OpenAI-compatible** and can be used from any programming language or tool that supports OpenAI's chat completions endpoint.
-
-> **Note**: Replace `http://localhost:8000` in the examples below with:
-> - Your ngrok URL: `https://your-subdomain.ngrok-free.app`
-> - Or your deployed API URL (if hosted elsewhere)
-
-> **Model Routing**: The API automatically routes to the correct provider based on the model name:
-> - Use `thinking`, `pro`, or `fast` → Routes to **Gemini Web**
-> - Use `gemini-3-*` models → Routes to **AI Studio**
-
-### Basic Chat Request (curl)
-
-```bash
-curl -X POST http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer anything" \
-  -d '{
-    "model": "gemini-3-flash-preview",
-    "messages": [
-      {"role": "user", "content": "Hello, how are you?"}
-    ]
-  }'
-```
-
-### Python Example
-
-```python
-import requests
-
-response = requests.post(
-    "http://localhost:8000/v1/chat/completions",
-    headers={"Authorization": "Bearer anything"},
-    json={
-        "model": "gemini-3-flash-preview",
-        "messages": [
-            {"role": "user", "content": "Explain quantum computing"}
-        ]
-    }
-)
-print(response.json()["choices"][0]["message"]["content"])
-```
-
-### Using OpenAI Python SDK
-
-```python
-from openai import OpenAI
-
-client = OpenAI(
-    base_url="http://localhost:8000/v1",
-    api_key="anything"  # API key is ignored but required by SDK
-)
-
-response = client.chat.completions.create(
-    model="gemini-3-flash-preview",
-    messages=[
-        {"role": "user", "content": "Write a poem about coding"}
-    ]
-)
-print(response.choices[0].message.content)
-```
-
-### JavaScript/TypeScript Example
-
-```javascript
-const response = await fetch('http://localhost:8000/v1/chat/completions', {
-  method: 'POST',
-  headers: {
-    'Content-Type': 'application/json',
-    'Authorization': 'Bearer anything'
-  },
-  body: JSON.stringify({
-    model: 'gemini-3-flash-preview',
-    messages: [
-      { role: 'user', content: 'Hello!' }
-    ]
-  })
-});
-
-const data = await response.json();
-console.log(data.choices[0].message.content);
-```
-
-### Image Upload (Vision API)
-
-```python
-import base64
-from openai import OpenAI
-
-client = OpenAI(base_url="http://localhost:8000/v1", api_key="anything")
-
-# Read and encode image
-with open("image.png", "rb") as f:
-    image_b64 = base64.b64encode(f.read()).decode()
-
-response = client.chat.completions.create(
-    model="gemini-3-flash-preview",
-    messages=[
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": "What's in this image?"},
-                {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/png;base64,{image_b64}"}
-                }
-            ]
-        }
-    ]
-)
-print(response.choices[0].message.content)
-```
-
-### Response Format
-
-```json
-{
-  "id": "chatcmpl-1234567890",
-  "object": "chat.completion",
-  "created": 1766152800,
-  "model": "gemini-3-flash-preview",
-  "choices": [
-    {
-      "index": 0,
-      "message": {
-        "role": "assistant",
-        "content": "Hello! I'm doing well, thank you for asking..."
-      },
-      "finish_reason": "stop"
-    }
-  ],
-  "usage": {
-    "prompt_tokens": 12,
-    "completion_tokens": 45,
-    "total_tokens": 57
-  }
-}
-```
-
----
-
-### Available Models
 | Model | Description |
 |-------|-------------|
 | `fast` | Quick responses |
@@ -228,15 +76,86 @@ print(response.choices[0].message.content)
 
 ## Configuration (.env)
 
+Copy `.env.example` to `.env` and configure:
+
 ```env
-HEADLESS=true      # false to see the browser
-WORKER_COUNT=2     # Number of parallel tabs (1 worker = 1 tab)
+# Browser
+HEADLESS=true           # false to see the browser
+WORKER_COUNT=2          # Number of parallel tabs (1 worker = 1 tab)
+
+# Discord Notifications (optional)
+DISCORD_WEBHOOK=https://discord.com/api/webhooks/...
+DISCORD_USER_ID=123456789  # For @mentions (optional)
+DISCORD_COOLDOWN=300       # Seconds between same error alerts
 ```
 
-| Setting | Description |
-|---------|-------------|
-| `WORKER_COUNT` | Number of concurrent browser tabs. Each can handle one request. |
-| `HEADLESS` | Run browser invisibly (recommended for servers) |
+### Discord Notifications Setup
+
+Get notified on your phone when errors occur:
+
+1. In Discord: Server Settings > Integrations > Webhooks > New Webhook
+2. Copy the webhook URL
+3. Add to `.env`: `DISCORD_WEBHOOK=https://discord.com/api/webhooks/...`
+4. Test: `python test_discord.py`
+
+---
+
+## API Usage Examples
+
+### Basic Chat Request (curl)
+
+```bash
+curl -X POST http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer anything" \
+  -d '{
+    "model": "thinking",
+    "messages": [
+      {"role": "user", "content": "Hello, how are you?"}
+    ]
+  }'
+```
+
+### Python with OpenAI SDK
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8000/v1",
+    api_key="anything"
+)
+
+response = client.chat.completions.create(
+    model="thinking",
+    messages=[{"role": "user", "content": "Write a poem about coding"}]
+)
+print(response.choices[0].message.content)
+```
+
+### Image Upload (Vision API)
+
+```python
+import base64
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="anything")
+
+with open("image.png", "rb") as f:
+    image_b64 = base64.b64encode(f.read()).decode()
+
+response = client.chat.completions.create(
+    model="thinking",
+    messages=[{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "What's in this image?"},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}}
+        ]
+    }]
+)
+print(response.choices[0].message.content)
+```
 
 ---
 
@@ -244,8 +163,10 @@ WORKER_COUNT=2     # Number of parallel tabs (1 worker = 1 tab)
 
 | File | Purpose |
 |------|---------|
-| `main.py` | Main API server |
-| `core.py` | Browser automation logic |
+| `main.py` | FastAPI server |
+| `core.py` | Browser automation with fallback selectors |
+| `notifier.py` | Discord webhook notifications |
+| `test_discord.py` | Test Discord webhook connection |
 | `test_api.html` | Web UI for testing the API |
 | `autostart.bat` | Auto-start on Windows boot |
 
@@ -255,24 +176,40 @@ WORKER_COUNT=2     # Number of parallel tabs (1 worker = 1 tab)
 
 | Issue | Solution |
 |-------|----------|
-| Session expired | Set `HEADLESS=false` in .env, restart, and login again |
+| Session expired | Set `HEADLESS=false`, restart, login again |
 | 502 Bad Gateway | Make sure API is running (`python main.py`) |
-| ngrok connection refused | Ensure API is running before starting ngrok |
-| Extraction failed (500 errors) | Usually auto-recovers. If persistent, restart the API |
-| High CPU usage | Normal during generation. Polling is optimized to reduce load |
-| Stuck overlay/modal | Auto-dismissed on next request. Hard refresh every 10 requests |
+| Selector errors | Check `/v1/diagnostics` for details |
+| No Discord alerts | Run `python test_discord.py` to verify webhook |
 
-### Automatic Recovery Features
+### Diagnostics Endpoint
 
-The API includes several self-healing mechanisms:
+Check worker status and errors:
 
-- **Request-Level Retry**: If a worker fails, automatically retries on a different worker (up to 3 attempts)
-- **Response Validation**: Detects empty/invalid responses and triggers retry
-- **Chrome Anti-Throttling**: Browser flags prevent Chrome from suspending background tabs during idle
-- **Overlay Dismissal**: Automatically clears stuck Angular Material modals/menus before each request
-- **Periodic Hard Refresh**: Browser tab refreshes every 10 requests to clear memory/cache buildup
-- **Error Recovery**: On failure, the page automatically refreshes to reset state for the next request
-- **Optimized Polling**: Reduced polling frequency to minimize CPU pressure on low-resource hosts
+```bash
+curl http://localhost:8000/v1/diagnostics
+```
+
+Returns:
+```json
+{
+  "status": "ok",
+  "workers": [
+    {"worker_id": 1, "initialized": true, "busy": false, "last_error": null}
+  ],
+  "errors": {}
+}
+```
+
+---
+
+## Self-Healing Features
+
+- **Fallback Selectors** - Uses structural selectors (`role`, `contenteditable`) that survive UI text changes
+- **Request-Level Retry** - Failed requests automatically retry on different workers
+- **Periodic Refresh** - Browser tabs refresh every 10 requests to clear cache
+- **Overlay Dismissal** - Clears stuck modals/menus before each request
+- **Error Tracking** - All errors logged with selector, action, and timestamp
+- **Discord Alerts** - Optional notifications with 5-minute cooldown to prevent spam
 
 ---
 
@@ -284,14 +221,13 @@ The API includes several self-healing mechanisms:
 │  ┌──────────────────────────────────────────┐   │
 │  │  main.py (FastAPI)                       │   │
 │  │            ↓                             │   │
-│  │  core.py (Playwright Automation)         │   │
+│  │  core.py (Playwright + Fallback Selectors│   │
 │  │            ↓                             │   │
-│  │  .browser_session/ (saved login)         │   │
+│  │  notifier.py (Discord Alerts)            │   │
 │  └──────────────────────────────────────────┘   │
 │                      ↓                          │
 │  ┌──────────────────────────────────────────┐   │
-│  │  ngrok Tunnel                             │   │
-│  │  (Public HTTPS URL)                       │   │
+│  │  ngrok Tunnel (Public HTTPS URL)         │   │
 │  └──────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────┘
                        ↓
