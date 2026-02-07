@@ -1030,6 +1030,7 @@ class GeminiWebAutomation(BaseAutomation):
                     
         except Exception as e:
             log(f"Temp chat error: {e}", f"Worker {self.worker_id}")
+            await self._track_error(f"Temp chat toggle failed: {e}", "temp_chat", "enable_temp_chat")
 
     async def send_message(self, prompt: str, model: str = None, thinking_level: str = None, use_search: bool = False, images: List[str] = None) -> Dict:
         if not self._initialized: 
@@ -1216,7 +1217,8 @@ class GeminiWebAutomation(BaseAutomation):
             self._generation_in_progress = False
             
             if not markdown:
-                log(f"⚠️ Clipboard empty, using fallback", f"Worker {self.worker_id}")
+                log(f"Clipboard empty, using fallback extraction", f"Worker {self.worker_id}")
+                await self._track_error("Clipboard extraction failed, using DOM fallback", "copy_btn", "extract_response")
                 return await self._fallback_extract()
 
             log(f"✅ Response: {len(markdown)} chars", f"Worker {self.worker_id}")
@@ -1261,6 +1263,7 @@ class GeminiWebAutomation(BaseAutomation):
             btn, _ = await self._find_element("model_btn", timeout=3000, description="Model button")
             if not btn:
                 log(f"Model button not found, skipping model selection", f"Worker {self.worker_id}")
+                await self._track_error("Model button not found", "model_btn", "select_model")
                 return
             
             current = await btn.inner_text()
@@ -1284,8 +1287,10 @@ class GeminiWebAutomation(BaseAutomation):
             # If not found, close menu
             await self.page.keyboard.press("Escape")
             await self._human_delay(100, 300)
+            await self._track_error(f"Model '{model_name}' not found in menu", "model_btn", "select_model")
         except Exception as e:
             log(f"Model selection failed: {e}", f"Worker {self.worker_id}")
+            await self._track_error(f"Model selection failed: {e}", "model_btn", "select_model")
 
     async def _paste_image(self, image_path: str):
         """Paste an image via clipboard into Gemini Web."""
@@ -1334,7 +1339,8 @@ class GeminiWebAutomation(BaseAutomation):
             await asyncio.sleep(1.0)
             log(f"Image pasted", f"Worker {self.worker_id}")
         except Exception as e:
-            print(f"[Worker {self.worker_id}] ⚠️ Image paste warning: {e}")
+            log(f"Image paste failed: {e}", f"Worker {self.worker_id}")
+            await self._track_error(f"Image paste failed: {e}", "input", "paste_image")
 
     async def close(self):
         await super().close()
