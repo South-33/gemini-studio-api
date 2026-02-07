@@ -9,6 +9,9 @@ from datetime import datetime
 from typing import List, Dict, Optional, Tuple
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page, Route
 
+# Import notifier (won't crash if aiohttp not installed)
+from notifier import notify_error
+
 # --- Timestamped Logging (use stderr - always unbuffered) ---
 def log(msg: str, tag: str = "Core"):
     """Print with timestamp for debugging. Uses stderr for guaranteed immediate output."""
@@ -791,11 +794,11 @@ class GeminiWebAutomation(BaseAutomation):
                 pass
         
         # Track the failure
-        self._track_error(f"Element not found: {desc}", key, desc)
+        await self._track_error(f"Element not found: {desc}", key, desc)
         return None, None
     
-    def _track_error(self, error: str, selector_key: str, action: str):
-        """Track error for diagnostics endpoint."""
+    async def _track_error(self, error: str, selector_key: str, action: str):
+        """Track error for diagnostics endpoint and send Discord notification."""
         GeminiWebAutomation._last_errors[self.worker_id] = {
             "error": error,
             "selector_key": selector_key,
@@ -804,6 +807,12 @@ class GeminiWebAutomation(BaseAutomation):
             "worker_id": self.worker_id
         }
         log(f"Error tracked: {error} (selector: {selector_key}, action: {action})", f"Worker {self.worker_id}")
+        
+        # Send Discord notification (non-blocking, won't crash if fails)
+        try:
+            await notify_error(error, selector_key, action, self.worker_id)
+        except Exception as e:
+            log(f"Discord notification failed: {e}", f"Worker {self.worker_id}")
     
     @classmethod
     def get_all_errors(cls) -> Dict[int, Dict]:
@@ -975,7 +984,7 @@ class GeminiWebAutomation(BaseAutomation):
                     await self.page.wait_for_selector(selectors[0], timeout=30000)
                     input_found = True
                 except Exception as e:
-                    self._track_error(f"Input not found: {e}", "input", "init")
+                    await self._track_error(f"Input not found: {e}", "input", "init")
                     raise e
             
             await self._human_delay(500, 1000)
@@ -989,7 +998,7 @@ class GeminiWebAutomation(BaseAutomation):
             return True
         except Exception as e:
             print(f"[GeminiWeb] Init failed: {e}")
-            self._track_error(str(e), "input", "init")
+            await self._track_error(str(e), "input", "init")
             return False
 
     async def _enable_temp_chat(self):
@@ -1090,7 +1099,7 @@ class GeminiWebAutomation(BaseAutomation):
             # 3. Enter Prompt - use fallback selector finding
             input_area, input_selector = await self._find_element("input", timeout=5000, description="Input textbox")
             if not input_area:
-                self._track_error("Input textbox not found", "input", "send_message")
+                await self._track_error("Input textbox not found", "input", "send_message")
                 return {"success": False, "error": "Input textbox not found"}
             
             await input_area.click()
@@ -1157,7 +1166,7 @@ class GeminiWebAutomation(BaseAutomation):
             
             if not send_success:
                 log(f"Send button click failed", f"Worker {self.worker_id}")
-                self._track_error("Send button click failed", "send_btn", "send_message")
+                await self._track_error("Send button click failed", "send_btn", "send_message")
                 return {"success": False, "error": "Send button click failed"}
             
             # 5. Wait for Response (Copy button to appear)
@@ -1183,7 +1192,7 @@ class GeminiWebAutomation(BaseAutomation):
             
             if not copy_btn:
                 log(f"Timeout after {max_wait}s waiting for response", f"Worker {self.worker_id}")
-                self._track_error(f"Timeout after {max_wait}s", "copy_btn", "wait_for_response")
+                await self._track_error(f"Timeout after {max_wait}s", "copy_btn", "wait_for_response")
                 return {"success": False, "error": f"Timeout after {max_wait}s waiting for response"}
 
             # Auto-scroll to ensure copy button is visible
