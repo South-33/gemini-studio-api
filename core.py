@@ -837,6 +837,30 @@ class GeminiWebAutomation(BaseAutomation):
             return 0
 
         return -1
+
+    async def _is_generation_active(self) -> bool:
+        """Check if the UI indicates generation is still running."""
+        selectors = list(self._get_all_selectors("send_btn"))
+        selectors.append('button[aria-label*="Stop" i]')
+        selectors.append('button:has-text("Stop")')
+
+        for selector in selectors:
+            try:
+                locator = self.page.locator(selector).first
+                if not await locator.is_visible():
+                    continue
+
+                aria_label = await locator.get_attribute("aria-label")
+                if aria_label and "stop" in aria_label.lower():
+                    return True
+
+                text = await locator.inner_text()
+                if text and "stop" in text.lower():
+                    return True
+            except:
+                continue
+
+        return False
     
     async def _track_error(self, error: str, selector_key: str, action: str):
         """Track error for diagnostics endpoint and send Discord notification."""
@@ -1217,8 +1241,25 @@ class GeminiWebAutomation(BaseAutomation):
             
             # Polling for copy button (Wait until we have MORE buttons than before)
             start_time = time.time()
-            max_wait = 180 # Extended for thinking models
+            max_wait = int(os.getenv("BROWSER_TIMEOUT", "480"))
+            idle_timeout = 60
+            last_activity = time.time()
+            last_length = 0
             copy_btn = None
+
+            async def get_response_length() -> int:
+                try:
+                    return await self.page.evaluate('''
+                        () => {
+                            const responses = document.querySelectorAll('[data-content-type="response"]');
+                            if (responses.length === 0) return 0;
+                            const last = responses[responses.length - 1];
+                            return (last.innerText || '').length;
+                        }
+                    ''')
+                except:
+                    return 0
+
             while (time.time() - start_time) < max_wait:
                 btns = self.page.locator(copy_selector)
                 current_count = await btns.count()
@@ -1229,13 +1270,33 @@ class GeminiWebAutomation(BaseAutomation):
                     copy_btn = btns.nth(current_count - 1)
                     if await copy_btn.is_visible():
                         break
-                        
+
+                current_length = await get_response_length()
+                if current_length > last_length:
+                    last_length = current_length
+                    last_activity = time.time()
+                else:
+                    if await self._is_generation_active():
+                        last_activity = time.time()
+                    elif (time.time() - last_activity) > idle_timeout:
+                        break
+
                 await asyncio.sleep(1)  # Reduced from 2s
             
             if not copy_btn:
-                log(f"Timeout after {max_wait}s waiting for response", f"Worker {self.worker_id}")
-                await self._track_error(f"Timeout after {max_wait}s", "copy_btn", "wait_for_response")
-                return {"success": False, "error": f"Timeout after {max_wait}s waiting for response"}
+                elapsed = int(time.time() - start_time)
+                if elapsed >= max_wait:
+                    timeout_reason = f"Timeout after {max_wait}s waiting for response"
+                else:
+                    timeout_reason = f"Idle timeout after {idle_timeout}s (no activity)"
+
+                log(timeout_reason, f"Worker {self.worker_id}")
+                await self._track_error(timeout_reason, "copy_btn", "wait_for_response")
+
+                fallback = await self._fallback_extract()
+                if fallback.get("success"):
+                    return fallback
+                return {"success": False, "error": timeout_reason}
 
             # Auto-scroll to ensure copy button is visible
             await self.page.evaluate(f'''

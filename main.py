@@ -200,7 +200,7 @@ async def openai_chat(request: Request):
     
     # CRITICAL: Use timeout to prevent infinite blocking
     # The lambda with timeout prevents run_in_executor from blocking forever
-    BROWSER_TIMEOUT = 300  # 5 minutes max for generation
+    BROWSER_TIMEOUT = int(os.getenv("BROWSER_TIMEOUT", "480"))
     
     try:
         log(f"Waiting for browser thread (timeout={BROWSER_TIMEOUT}s)...", "API")
