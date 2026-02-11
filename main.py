@@ -16,8 +16,10 @@ import base64
 import tempfile
 import json
 import time
+import uuid
 from datetime import datetime
 from typing import List, Optional, Dict, Union
+from collections import deque
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict
@@ -44,6 +46,7 @@ PROVIDER = os.getenv("PROVIDER", "auto").lower()  # "auto", "aistudio", or "gemi
 worker_pool: Optional[WorkerPool] = None
 browser_loop: Optional[asyncio.AbstractEventLoop] = None
 browser_thread: Optional[threading.Thread] = None
+RECENT_REQUESTS = deque(maxlen=int(os.getenv("RECENT_REQUEST_LIMIT", "200")))
 
 def run_browser_loop(loop):
     asyncio.set_event_loop(loop)
@@ -120,6 +123,41 @@ def parse_model_and_thinking(model_name: str) -> tuple:
     
     return model_name, "High"
 
+def get_request_source(request: Request, body: Dict) -> Dict[str, str]:
+    """Extract request source metadata for traceability."""
+    headers = request.headers
+    metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
+
+    request_id = (
+        headers.get("x-request-id")
+        or headers.get("x-correlation-id")
+        or body.get("request_id")
+        or uuid.uuid4().hex[:8]
+    )
+
+    source = {
+        "request_id": request_id,
+        "project": (
+            headers.get("x-project-name")
+            or headers.get("x-project-id")
+            or metadata.get("project")
+            or body.get("project")
+            or "unknown"
+        ),
+        "client": (
+            headers.get("x-client-name")
+            or headers.get("x-app-name")
+            or metadata.get("client")
+            or body.get("client")
+            or "unknown"
+        ),
+        "ip": request.client.host if request.client else "unknown",
+        "origin": headers.get("origin") or "",
+        "referer": headers.get("referer") or "",
+        "user_agent": headers.get("user-agent") or "",
+    }
+    return source
+
 # --- Endpoints ---
 
 @app.get("/v1/models")
@@ -137,6 +175,23 @@ async def list_models():
 async def openai_chat(request: Request):
     """OpenAI-compatible chat completions endpoint."""
     body = await request.json()
+    source = get_request_source(request, body)
+
+    log(
+        f"[{source['request_id']}] Source: project={source['project']} client={source['client']} ip={source['ip']}",
+        "API"
+    )
+
+    RECENT_REQUESTS.append({
+        "request_id": source["request_id"],
+        "timestamp": datetime.now().isoformat(),
+        "project": source["project"],
+        "client": source["client"],
+        "ip": source["ip"],
+        "model": body.get("model", ""),
+        "origin": source["origin"],
+        "referer": source["referer"],
+    })
     
     if not worker_pool:
         raise HTTPException(status_code=503, detail="Worker pool not initialized")
@@ -239,7 +294,8 @@ async def openai_chat(request: Request):
             "prompt_tokens": len(prompt),
             "completion_tokens": len(content),
             "total_tokens": len(prompt) + len(content)
-        }
+        },
+        "request_id": source["request_id"]
     }
 
 @app.get("/health")
@@ -271,6 +327,7 @@ async def diagnostics():
         "worker_count": WORKER_COUNT,
         "workers": worker_status,
         "errors": errors,
+        "recent_requests": list(RECENT_REQUESTS),
         "selectors": {
             key: vals[0] if isinstance(vals, list) and vals else vals 
             for key, vals in GeminiWebAutomation.SELECTORS.items()

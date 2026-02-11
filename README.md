@@ -10,6 +10,7 @@ A lightweight API that automates Gemini Web to provide OpenAI-compatible endpoin
 - **Self-Healing** - Auto-recovers from stuck UI states and errors
 - **Discord Alerts** - Get notified on your phone when errors occur
 - **Resilient Selectors** - Fallback selectors that survive Google UI changes
+- **Request Source Tracing** - Track which app/project sent each request
 
 ---
 
@@ -49,7 +50,7 @@ ngrok http 8000 --domain=your-subdomain.ngrok-free.app
 | `GET /health` | Health check |
 | `GET /v1/models` | List available models |
 | `POST /v1/chat/completions` | OpenAI-compatible chat |
-| `GET /v1/diagnostics` | Worker status and error details |
+| `GET /v1/diagnostics` | Worker status, errors, and recent request sources |
 
 ---
 
@@ -82,6 +83,8 @@ Copy `.env.example` to `.env` and configure:
 # Browser
 HEADLESS=true           # false to see the browser
 WORKER_COUNT=2          # Number of parallel tabs (1 worker = 1 tab)
+BROWSER_TIMEOUT=480     # Max seconds for one browser request
+RECENT_REQUEST_LIMIT=200  # Number of recent request traces kept in memory
 
 # Discord Notifications (optional)
 DISCORD_WEBHOOK=https://discord.com/api/webhooks/...
@@ -108,6 +111,9 @@ Get notified on your phone when errors occur:
 curl -X POST http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer anything" \
+  -H "X-Project-Name: project-a" \
+  -H "X-Client-Name: backend-api" \
+  -H "X-Request-ID: req-12345" \
   -d '{
     "model": "thinking",
     "messages": [
@@ -123,7 +129,11 @@ from openai import OpenAI
 
 client = OpenAI(
     base_url="http://localhost:8000/v1",
-    api_key="anything"
+    api_key="anything",
+    default_headers={
+        "X-Project-Name": "project-a",
+        "X-Client-Name": "backend-api"
+    }
 )
 
 response = client.chat.completions.create(
@@ -132,6 +142,21 @@ response = client.chat.completions.create(
 )
 print(response.choices[0].message.content)
 ```
+
+### Request Source Tagging (Project A vs Project B)
+
+To identify where calls come from, send these headers from each client:
+
+- `X-Project-Name`: Your app/project name (example: `project-a`)
+- `X-Client-Name`: Calling service name (example: `api-gateway`)
+- `X-Request-ID` (optional): Your own trace ID
+
+Fallback options if headers are hard to add:
+
+- Body fields: `project`, `client`, `request_id`
+- Body metadata: `metadata.project`, `metadata.client`
+
+The API logs the source and returns `request_id` in each response. Recent request traces are visible in `GET /v1/diagnostics` under `recent_requests`.
 
 ### Image Upload (Vision API)
 
