@@ -669,13 +669,15 @@ class GeminiWebAutomation(BaseAutomation):
     # Selectors with fallbacks - each key maps to a list of selectors to try in order
     # STRATEGY: Put STABLE structural selectors FIRST, volatile text-based ones LAST
     # Structural (role, contenteditable) > Class-based > aria-label text
-    # Last updated: 2026-02-07
+    # Last updated: 2026-02-12
     SELECTORS = {
         # INPUT: Most volatile - Google changes aria-label text frequently
         # Priority: structural > class > partial keywords (NO exact text matches)
         "input": [
+            'div[role="textbox"][aria-label="Enter a prompt for Gemini"]',  # Current Gemini label
             'div[role="textbox"][contenteditable="true"]',  # STABLE: structural attributes
             '.ql-editor.textarea',  # Class-based (Quill editor)
+            '.new-input-ui[role="textbox"]',  # New input UI class fallback
             'div.ql-editor[contenteditable="true"]',  # Quill + structural
             'div[aria-label*="prompt" i][contenteditable="true"]',  # Keyword: "prompt"
             'div[aria-label*="Gemini" i][contenteditable="true"]',  # Keyword: "Gemini"
@@ -686,6 +688,7 @@ class GeminiWebAutomation(BaseAutomation):
         ],
         # SEND: Button near input - use class and partial keywords only
         "send_btn": [
+            'button[aria-label="Send message"]',  # Current Gemini label
             'button.send-button',  # Class-based - more stable
             'button[aria-label*="Send" i]',  # Keyword: "Send"
             'button[aria-label*="Submit" i]',  # Keyword: "Submit"
@@ -693,7 +696,9 @@ class GeminiWebAutomation(BaseAutomation):
         ],
         # MODEL: The dropdown to switch Fast/Pro/Thinking
         "model_btn": [
+            'button[aria-label="Open mode picker"]',  # Current Gemini label
             'button.input-area-switch',  # Class-based
+            'button.mat-mdc-menu-trigger',  # Angular trigger fallback
             '.input-area-switch',  # Any element with this class
             'button:has-text("Fast")',  # Text-based fallbacks
             'button:has-text("Pro")',
@@ -701,6 +706,7 @@ class GeminiWebAutomation(BaseAutomation):
         ],
         # NEW CHAT: Now an <a> tag - use URL and keywords
         "new_chat": [
+            'a[aria-label="New chat"]',  # Current Gemini label
             'a[href="/app"]',  # URL-based - very stable!
             '.side-nav-action-button',  # Class-based
             'a[aria-label*="New" i]',  # Keyword: "New"
@@ -709,6 +715,7 @@ class GeminiWebAutomation(BaseAutomation):
         ],
         # TEMP CHAT: Toggle button - keywords only
         "temp_chat": [
+            'button[aria-label="Temporary chat"]',  # Current Gemini label
             'button.temp-chat-button',  # Class-based
             '[aria-label*="Temporary" i]',  # Keyword: "Temporary"
             '[aria-label*="temp" i]',  # Keyword: "temp"
@@ -720,6 +727,8 @@ class GeminiWebAutomation(BaseAutomation):
         ],
         # SIDEBAR: Hamburger menu - keywords only
         "sidebar_toggle": [
+            'button[aria-label="Main menu"]',  # Current Gemini label
+            'button.main-menu-button',  # Class-based fallback
             'button[aria-label*="menu" i]',  # Keyword: "menu"
             'button[aria-label*="Menu" i]',  # Keyword: "Menu" (case variation)
             'button[aria-label*="sidebar" i]',  # Keyword: "sidebar"
@@ -746,6 +755,7 @@ class GeminiWebAutomation(BaseAutomation):
         # OVERLAY: Angular CDK internal - stable
         "overlay_backdrop": [
             '.cdk-overlay-backdrop',  # STABLE: Angular CDK
+            '.cdk-overlay-backdrop-showing',  # Visible backdrop class
             '.cdk-overlay-container .cdk-overlay-backdrop',  # More specific
         ]
     }
@@ -777,7 +787,7 @@ class GeminiWebAutomation(BaseAutomation):
             return [selectors]
         return []
     
-    async def _find_element(self, key: str, timeout: int = 5000, description: str = None):
+    async def _find_element(self, key: str, timeout: int = 5000, description: str = None, track_error: bool = True):
         """
         Try all selectors for a key until one finds a visible element.
         Returns (locator, selector_used) or (None, None) if all fail.
@@ -803,8 +813,9 @@ class GeminiWebAutomation(BaseAutomation):
             except:
                 pass
         
-        # Track the failure
-        await self._track_error(f"Element not found: {desc}", key, desc)
+        # Track the failure (optional for non-critical probes)
+        if track_error:
+            await self._track_error(f"Element not found: {desc}", key, desc)
         return None, None
     
     def _matches_model(self, item_text: str, model_name: str) -> bool:
@@ -841,6 +852,7 @@ class GeminiWebAutomation(BaseAutomation):
     async def _is_generation_active(self) -> bool:
         """Check if the UI indicates generation is still running."""
         selectors = list(self._get_all_selectors("send_btn"))
+        selectors.append('button[aria-label="Stop response"]')
         selectors.append('button[aria-label*="Stop" i]')
         selectors.append('button:has-text("Stop")')
 
@@ -1072,26 +1084,45 @@ class GeminiWebAutomation(BaseAutomation):
             # Check if temp chat is already enabled using fallback selectors
             for selector in self._get_all_selectors("temp_chat_active"):
                 try:
-                    if await self.page.locator(selector).count() > 0:
+                    locator = self.page.locator(selector).first
+                    if await locator.is_visible():
                         return  # Already enabled
                 except:
                     continue
             
-            # Try to find temp chat button
-            temp_btn, _ = await self._find_element("temp_chat", timeout=2000, description="Temporary chat button")
+            # Try to find temp chat button (non-critical, so avoid immediate Discord error spam)
+            temp_btn, _ = await self._find_element(
+                "temp_chat",
+                timeout=3000,
+                description="Temporary chat button",
+                track_error=False,
+            )
             
             if temp_btn is None:
                 # Expand sidebar if button not visible
-                sidebar_btn, _ = await self._find_element("sidebar_toggle", timeout=2000, description="Sidebar toggle")
+                sidebar_btn, _ = await self._find_element(
+                    "sidebar_toggle",
+                    timeout=2500,
+                    description="Sidebar toggle",
+                    track_error=False,
+                )
                 if sidebar_btn:
                     await sidebar_btn.click()
                     await self._human_delay(300, 500)
                     # Try again
-                    temp_btn, _ = await self._find_element("temp_chat", timeout=2000, description="Temporary chat button")
+                    temp_btn, _ = await self._find_element(
+                        "temp_chat",
+                        timeout=3000,
+                        description="Temporary chat button",
+                        track_error=False,
+                    )
             
             if temp_btn and await temp_btn.is_visible():
                 await temp_btn.click()
                 await self._human_delay(200, 400)
+            else:
+                # Temporary chat is optional and may be hidden by UI/account state
+                log("Temporary chat toggle not visible; continuing", f"Worker {self.worker_id}")
                     
         except Exception as e:
             log(f"Temp chat error: {e}", f"Worker {self.worker_id}")
@@ -1124,7 +1155,17 @@ class GeminiWebAutomation(BaseAutomation):
             if self._request_count >= self.REFRESH_EVERY_N_REQUESTS:
                 log(f"Hard refresh (request #{self._request_count})", f"Worker {self.worker_id}")
                 await self.page.reload(wait_until="domcontentloaded", timeout=30000)
-                await self._human_delay(1000, 1500)
+                input_ready = False
+                for selector in self._get_all_selectors("input"):
+                    try:
+                        await self.page.wait_for_selector(selector, state="visible", timeout=6000)
+                        input_ready = True
+                        break
+                    except:
+                        continue
+                if not input_ready:
+                    log("Input not immediately visible after hard refresh; continuing", f"Worker {self.worker_id}")
+                await self._human_delay(500, 900)
                 self._request_count = 0
             
             # 1. New Chat (starts fresh) - VERIFIED
