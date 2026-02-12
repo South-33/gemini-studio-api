@@ -873,21 +873,133 @@ class GeminiWebAutomation(BaseAutomation):
                 continue
 
         return False
+
+    async def _collect_error_context(self) -> Dict:
+        """Collect compact UI state for error diagnostics."""
+        context = {
+            "request_id": self._request_id,
+            "url": "",
+            "overlay_count": 0,
+            "copy_count": 0,
+            "response_count": 0,
+            "last_response_len": 0,
+            "last_response_tail": "",
+            "stop_visible": False,
+            "active_button": "",
+        }
+
+        if not self.page:
+            return context
+
+        try:
+            context["url"] = self.page.url
+        except:
+            pass
+
+        try:
+            context["overlay_count"] = await self.page.locator('.cdk-overlay-backdrop').count()
+        except:
+            pass
+
+        try:
+            copy_selector = self._get_selector("copy_btn")
+            context["copy_count"] = await self.page.locator(copy_selector).count()
+        except:
+            pass
+
+        try:
+            metrics = await self.page.evaluate('''
+                () => {
+                    const responses = document.querySelectorAll('[data-content-type="response"]');
+                    const last = responses.length ? responses[responses.length - 1] : null;
+                    const text = last ? (last.innerText || '') : '';
+
+                    const hasStop = Array.from(document.querySelectorAll('button')).some((btn) => {
+                        const label = (btn.getAttribute('aria-label') || '').toLowerCase();
+                        const inner = (btn.innerText || '').toLowerCase();
+                        return label.includes('stop') || inner.includes('stop');
+                    });
+
+                    return {
+                        response_count: responses.length,
+                        last_response_len: text.length,
+                        last_response_tail: text.slice(-160),
+                        stop_visible: hasStop,
+                    };
+                }
+            ''')
+
+            context["response_count"] = metrics.get("response_count", 0)
+            context["last_response_len"] = metrics.get("last_response_len", 0)
+            context["last_response_tail"] = metrics.get("last_response_tail", "")
+            context["stop_visible"] = metrics.get("stop_visible", False)
+        except:
+            pass
+
+        selectors = ['button[aria-label="Stop response"]'] + self._get_all_selectors("send_btn")
+        for selector in selectors:
+            try:
+                locator = self.page.locator(selector).first
+                if not await locator.is_visible():
+                    continue
+
+                aria_label = await locator.get_attribute("aria-label")
+                text = await locator.inner_text()
+                label = (aria_label or text or "").strip().replace("\n", " ")
+                context["active_button"] = label[:80]
+                break
+            except:
+                continue
+
+        return context
+
+    def _format_error_context(self, context: Dict) -> str:
+        """Format compact error context for logs/notifications."""
+        tail = (context.get("last_response_tail") or "").replace("\n", " ").strip()
+        if len(tail) > 120:
+            tail = tail[-120:]
+
+        parts = [
+            f"req={context.get('request_id') or 'unknown'}",
+            f"url={context.get('url') or 'unknown'}",
+            f"btn={context.get('active_button') or 'none'}",
+            f"stop={context.get('stop_visible')}",
+            f"copy={context.get('copy_count', 0)}",
+            f"resp={context.get('response_count', 0)}",
+            f"resp_len={context.get('last_response_len', 0)}",
+            f"overlay={context.get('overlay_count', 0)}",
+        ]
+
+        if tail:
+            parts.append(f"tail={tail}")
+
+        return " | ".join(parts)
     
     async def _track_error(self, error: str, selector_key: str, action: str):
         """Track error for diagnostics endpoint and send Discord notification."""
+        context = await self._collect_error_context()
+        context_line = self._format_error_context(context)
+
         GeminiWebAutomation._last_errors[self.worker_id] = {
             "error": error,
             "selector_key": selector_key,
             "action": action,
             "timestamp": datetime.now().isoformat(),
-            "worker_id": self.worker_id
+            "worker_id": self.worker_id,
+            "request_id": self._request_id,
+            "context": context,
         }
         log(f"Error tracked: {error} (selector: {selector_key}, action: {action})", f"Worker {self.worker_id}")
+        log(f"Error context: {context_line}", f"Worker {self.worker_id}")
+
+        try:
+            await self._screenshot_on_failure(f"error_{action}")
+        except:
+            pass
         
         # Send Discord notification (non-blocking, won't crash if fails)
         try:
-            await notify_error(error, selector_key, action, self.worker_id)
+            await notify_error(error, selector_key, action, self.worker_id, diagnostics=context)
         except Exception as e:
             log(f"Discord notification failed: {e}", f"Worker {self.worker_id}")
     

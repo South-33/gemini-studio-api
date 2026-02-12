@@ -7,6 +7,7 @@ import os
 import time
 import hashlib
 import asyncio
+import json
 from datetime import datetime
 from typing import Optional, Dict
 
@@ -104,7 +105,8 @@ class DiscordNotifier:
         error: str,
         selector_key: str,
         action: str,
-        worker_id: int = 0
+        worker_id: int = 0,
+        diagnostics: Optional[Dict] = None,
     ) -> bool:
         """
         Send error notification to Discord.
@@ -142,6 +144,22 @@ class DiscordNotifier:
             "timestamp": datetime.utcnow().isoformat(),
             "footer": {"text": "Gemini Studio API"}
         }
+
+        # Add structured diagnostics context when provided
+        if diagnostics:
+            try:
+                diag_text = json.dumps(diagnostics, ensure_ascii=True, separators=(",", ":"))
+            except Exception:
+                diag_text = str(diagnostics)
+
+            if len(diag_text) > 1000:
+                diag_text = diag_text[:997] + "..."
+
+            embed["fields"].append({
+                "name": "Diagnostics",
+                "value": diag_text,
+                "inline": False,
+            })
         
         # Add squelched count if there were suppressed occurrences
         if squelched > 0:
@@ -223,6 +241,12 @@ def get_notifier() -> DiscordNotifier:
     return _notifier
 
 
-async def notify_error(error: str, selector_key: str, action: str, worker_id: int = 0) -> bool:
+async def notify_error(
+    error: str,
+    selector_key: str,
+    action: str,
+    worker_id: int = 0,
+    diagnostics: Optional[Dict] = None,
+) -> bool:
     """Convenience function to send error notification."""
-    return await get_notifier().send_error(error, selector_key, action, worker_id)
+    return await get_notifier().send_error(error, selector_key, action, worker_id, diagnostics)
