@@ -1464,10 +1464,25 @@ class GeminiWebAutomation(BaseAutomation):
             await self._human_delay(150, 300)
 
             # 6. Extraction via Copy Button (with lock to prevent clipboard race condition)
+            lock_started = time.time()
             async with GeminiWebAutomation._get_clipboard_lock():
+                lock_wait_ms = int((time.time() - lock_started) * 1000)
+                if lock_wait_ms > 1000:
+                    log(f"Clipboard lock wait: {lock_wait_ms}ms", f"Worker {self.worker_id}")
+
                 await copy_btn.click()
-                await self._human_delay(100, 200)
-                markdown = await self.page.evaluate("navigator.clipboard.readText()")
+                markdown = ""
+
+                # Keep lock scope short but robust: retry clipboard read briefly
+                for _ in range(5):
+                    try:
+                        markdown = await self.page.evaluate("navigator.clipboard.readText()")
+                    except:
+                        markdown = ""
+
+                    if markdown and markdown.strip():
+                        break
+                    await asyncio.sleep(0.06)
             
             self._generation_in_progress = False
             
@@ -1648,24 +1663,32 @@ class GeminiWebAutomation(BaseAutomation):
                 await input_area.click()
                 await asyncio.sleep(0.1)
             
-            # Write image to clipboard
-            await self.page.evaluate(f'''
-                async () => {{
-                    const base64 = "{base64_image}";
-                    const mimeType = "{mime_type}";
-                    const byteCharacters = atob(base64);
-                    const byteNumbers = new Array(byteCharacters.length);
-                    for (let i = 0; i < byteCharacters.length; i++) {{
-                        byteNumbers[i] = byteCharacters.charCodeAt(i);
+            # Clipboard is shared across tabs, so lock write+paste to avoid collisions
+            lock_started = time.time()
+            async with GeminiWebAutomation._get_clipboard_lock():
+                waited_ms = int((time.time() - lock_started) * 1000)
+                if waited_ms > 1000:
+                    log(f"Clipboard lock wait (image): {waited_ms}ms", f"Worker {self.worker_id}")
+
+                await self.page.evaluate(f'''
+                    async () => {{
+                        const base64 = "{base64_image}";
+                        const mimeType = "{mime_type}";
+                        const byteCharacters = atob(base64);
+                        const byteNumbers = new Array(byteCharacters.length);
+                        for (let i = 0; i < byteCharacters.length; i++) {{
+                            byteNumbers[i] = byteCharacters.charCodeAt(i);
+                        }}
+                        const byteArray = new Uint8Array(byteNumbers);
+                        const blob = new Blob([byteArray], {{ type: mimeType }});
+                        const item = new ClipboardItem({{ [mimeType]: blob }});
+                        await navigator.clipboard.write([item]);
                     }}
-                    const byteArray = new Uint8Array(byteNumbers);
-                    const blob = new Blob([byteArray], {{ type: mimeType }});
-                    const item = new ClipboardItem({{ [mimeType]: blob }});
-                    await navigator.clipboard.write([item]);
-                }}
-            ''')
-            
-            await self.page.keyboard.press("Control+v")
+                ''')
+
+                await self.page.keyboard.press("Control+v")
+
+            # Let Gemini process pasted image outside lock
             await asyncio.sleep(1.0)
             log(f"Image pasted", f"Worker {self.worker_id}")
         except Exception as e:

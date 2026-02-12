@@ -262,6 +262,13 @@
                 <option value="pro">Pro</option>
             </select>
         </div>
+        <div class="config-item">
+            <label>Prompt Size</label>
+            <select id="prompt-size">
+                <option value="normal" selected>Normal</option>
+                <option value="150000">150k chars</option>
+            </select>
+        </div>
         <div class="config-item" style="align-self: flex-end;">
             <button class="btn btn-primary" id="run-btn" onclick="runStressTest()">
                 🚀 Run Stress Test
@@ -313,6 +320,7 @@
             const apiUrl = document.getElementById('api-url').value.trim();
             const count = parseInt(document.getElementById('request-count').value);
             const model = document.getElementById('model').value;
+            const promptSize = document.getElementById('prompt-size').value;
             const runBtn = document.getElementById('run-btn');
 
             if (!apiUrl) {
@@ -331,10 +339,12 @@
             const prompts = [];
             for (let i = 0; i < count; i++) {
                 const uniqueId = `ID_${i + 1}_${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
+                const prompt = buildPrompt(uniqueId, promptSize);
                 prompts.push({
                     id: i + 1,
                     uniqueId: uniqueId,
-                    prompt: `Reply with ONLY this exact text, nothing else: ${uniqueId}`
+                    prompt: prompt,
+                    promptChars: prompt.length,
                 });
             }
 
@@ -350,6 +360,9 @@
                     </div>
                     <div style="font-size: 0.75rem; color: var(--dim);">
                         ID: <code>${p.uniqueId}</code>
+                    </div>
+                    <div style="font-size: 0.75rem; color: var(--dim); margin-top: 2px;">
+                        Prompt: ${p.promptChars.toLocaleString()} chars
                     </div>
                     <div class="result-content">Waiting for response...</div>
                     <div class="result-time"></div>
@@ -451,6 +464,33 @@
                     duration: duration
                 });
             }
+        }
+
+        function buildPrompt(uniqueId, promptSize) {
+            const instruction = `Reply with ONLY this exact text, nothing else: ${uniqueId}`;
+
+            if (promptSize !== '150000') {
+                return instruction;
+            }
+
+            const targetChars = 150000;
+            const fillerChunk = [
+                'This is deterministic filler context for stress testing long prompt behavior.',
+                'Ignore all filler and follow the first instruction only.',
+                'No additional explanation is needed in the output.',
+                'This block exists only to increase prompt length and test latency/stability.'
+            ].join(' ');
+
+            let prompt = `${instruction}\n\n`;
+            const remaining = targetChars - prompt.length;
+
+            if (remaining <= 0) {
+                return prompt.slice(0, targetChars);
+            }
+
+            const repeats = Math.ceil(remaining / (fillerChunk.length + 1));
+            const filler = (`${fillerChunk}\n`).repeat(repeats).slice(0, remaining);
+            return prompt + filler;
         }
     </script>
 </body>
