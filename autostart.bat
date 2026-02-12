@@ -62,7 +62,7 @@ if %errorlevel% neq 0 (
 netstat -ano | findstr ":%PORT% " | findstr "LISTENING" >nul
 if %errorlevel% neq 0 (
     echo [%time%] ⚠️ API port not listening! Restarting...
-    start "GeminiAPI" /min cmd /c "python main.py"
+    start "GeminiAPI" /min cmd /c "set PYTHONUNBUFFERED=1 && python -u main.py"
     timeout /t 5 /nobreak >nul
 )
 
