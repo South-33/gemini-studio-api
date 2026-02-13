@@ -786,6 +786,16 @@ class GeminiWebAutomation(BaseAutomation):
         elif isinstance(selectors, str):
             return [selectors]
         return []
+
+    async def _resolve_visible_selector(self, key: str, timeout: int = 1500) -> str:
+        """Resolve the first visible selector from a selector group."""
+        for selector in self._get_all_selectors(key):
+            try:
+                await self.page.wait_for_selector(selector, state="visible", timeout=timeout)
+                return selector
+            except:
+                continue
+        return self._get_selector(key)
     
     async def _find_element(self, key: str, timeout: int = 5000, description: str = None, track_error: bool = True):
         """
@@ -873,6 +883,70 @@ class GeminiWebAutomation(BaseAutomation):
                 continue
 
         return False
+
+    async def _stop_generation_if_active(self, wait_timeout_ms: int = 8000) -> bool:
+        """Attempt to stop active generation and wait until UI leaves Stop state."""
+        try:
+            if not await self._is_generation_active():
+                return True
+
+            stop_selectors = [
+                'button[aria-label="Stop response"]',
+                'button[aria-label*="Stop" i]',
+                'button:has-text("Stop")',
+            ]
+
+            clicked = False
+            for selector in stop_selectors:
+                try:
+                    locator = self.page.locator(selector).first
+                    if not await locator.is_visible():
+                        continue
+                    await locator.click(timeout=2000)
+                    clicked = True
+                    break
+                except:
+                    continue
+
+            if not clicked:
+                return False
+
+            end = time.time() + (wait_timeout_ms / 1000)
+            while time.time() < end:
+                if not await self._is_generation_active():
+                    await self._human_delay(120, 250)
+                    return True
+                await asyncio.sleep(0.25)
+
+            return False
+        except:
+            return False
+
+    async def _recover_stuck_generation(self) -> bool:
+        """Recover worker if previous request left the tab stuck in Stop state."""
+        try:
+            if not await self._is_generation_active():
+                return True
+
+            log("Detected active generation from previous state; recovering", f"Worker {self.worker_id}")
+
+            if await self._stop_generation_if_active(wait_timeout_ms=8000):
+                return True
+
+            log("Stop click did not recover state, reloading tab", f"Worker {self.worker_id}")
+            await self.page.reload(wait_until="domcontentloaded", timeout=30000)
+
+            for selector in self._get_all_selectors("input"):
+                try:
+                    await self.page.wait_for_selector(selector, state="visible", timeout=6000)
+                    break
+                except:
+                    continue
+
+            return not await self._is_generation_active()
+        except Exception as e:
+            log(f"Recovery failed: {e}", f"Worker {self.worker_id}")
+            return False
 
     async def _collect_error_context(self) -> Dict:
         """Collect compact UI state for error diagnostics."""
@@ -1262,6 +1336,14 @@ class GeminiWebAutomation(BaseAutomation):
                     await self._human_delay(200, 400)
             except:
                 pass
+
+            # 0.25 Recover if previous request left tab in Stop state
+            recovered = await self._recover_stuck_generation()
+            if not recovered:
+                reason = "Failed to recover from stuck generation state"
+                log(reason, f"Worker {self.worker_id}")
+                await self._track_error(reason, "send_btn", "preflight_recover")
+                return {"success": False, "error": reason}
             
             # 0.5 Periodic hard refresh to clear browser cache/memory
             if self._request_count >= self.REFRESH_EVERY_N_REQUESTS:
@@ -1281,22 +1363,35 @@ class GeminiWebAutomation(BaseAutomation):
                 self._request_count = 0
             
             # 1. New Chat (starts fresh) - VERIFIED
+            async def get_copy_state() -> Tuple[int, str]:
+                best_count = 0
+                best_selector = self._get_selector("copy_btn")
+                for selector in self._get_all_selectors("copy_btn"):
+                    try:
+                        count = await self.page.locator(selector).count()
+                        if count > best_count:
+                            best_count = count
+                            best_selector = selector
+                    except:
+                        continue
+                return best_count, best_selector
+
             async def get_copy_count():
-                copy_selector = self._get_selector("copy_btn")
-                return await self.page.locator(copy_selector).count()
+                count, _ = await get_copy_state()
+                return count
             
             worker_id_for_closure = self.worker_id  # Capture for nested functions
             
             async def verify_chat_cleared(before_count):
                 # Give extra time for chat to clear
                 await self._human_delay(500, 800)
-                copy_selector = self._get_selector("copy_btn")
-                after_count = await self.page.locator(copy_selector).count()
+                after_count, _ = await get_copy_state()
                 # Success if count dropped (ideally to 0, but at least fewer than before)
                 return after_count == 0 or after_count < before_count
-            
+
+            new_chat_selector = await self._resolve_visible_selector("new_chat", timeout=2000)
             new_chat_success = await self._verified_click(
-                self._get_selector("new_chat"),
+                new_chat_selector,
                 "New Chat",
                 verify_before=get_copy_count,
                 verify_after=verify_chat_cleared,
@@ -1304,7 +1399,10 @@ class GeminiWebAutomation(BaseAutomation):
             )
             
             if not new_chat_success:
-                log("⚠️ New Chat click failed, proceeding anyway", f"Worker {self.worker_id}")
+                error_msg = "New Chat click failed"
+                log(error_msg, f"Worker {self.worker_id}")
+                await self._track_error(error_msg, "new_chat", "send_message")
+                return {"success": False, "error": error_msg}
 
             
             # 1.5 Enable Temporary Chat
@@ -1334,8 +1432,7 @@ class GeminiWebAutomation(BaseAutomation):
             await self._human_delay(300, 600)
 
             # Capture button count BEFORE sending (to ensure we wait for a NEW one)
-            copy_selector = self._get_selector("copy_btn")
-            pre_send_count = await self.page.locator(copy_selector).count()
+            pre_send_count, copy_selector = await get_copy_state()
 
             # 4. Click Send - VERIFIED
             worker_id = self.worker_id  # Capture for closure
@@ -1350,6 +1447,10 @@ class GeminiWebAutomation(BaseAutomation):
                 # Wait a moment then check if input is cleared
                 await self._human_delay(200, 400)  # Reduced for speed
                 try:
+                    # If generation started, send succeeded even if input text lags in UI
+                    if await self._is_generation_active():
+                        return True
+
                     # Try multiple methods to get input text (contenteditable vs textarea)
                     after_text = ""
                     try:
@@ -1375,8 +1476,9 @@ class GeminiWebAutomation(BaseAutomation):
                     log(f"Send verification error: {e}", f"Worker {worker_id}")
                     return False  # Don't assume success on error
             
+            send_selector = await self._resolve_visible_selector("send_btn", timeout=2000)
             send_success = await self._verified_click(
-                self._get_selector("send_btn"),
+                send_selector,
                 "Send",
                 verify_before=get_input_text,
                 verify_after=verify_send_worked,
@@ -1414,14 +1516,15 @@ class GeminiWebAutomation(BaseAutomation):
                     return 0
 
             while (time.time() - start_time) < max_wait:
-                btns = self.page.locator(copy_selector)
-                current_count = await btns.count()
+                current_count, active_copy_selector = await get_copy_state()
                 
                 # We need to find a new button (more than we started with)
                 if current_count > pre_send_count:
+                    btns = self.page.locator(active_copy_selector)
                     # Get the LAST button (the new one)
                     copy_btn = btns.nth(current_count - 1)
                     if await copy_btn.is_visible():
+                        copy_selector = active_copy_selector
                         break
 
                 current_length = await get_response_length()
@@ -1438,10 +1541,15 @@ class GeminiWebAutomation(BaseAutomation):
             
             if not copy_btn:
                 elapsed = int(time.time() - start_time)
+                generation_active = await self._is_generation_active()
                 if elapsed >= max_wait:
                     timeout_reason = f"Timeout after {max_wait}s waiting for response"
                 else:
                     timeout_reason = f"Idle timeout after {idle_timeout}s (no activity)"
+
+                if generation_active:
+                    timeout_reason = f"{timeout_reason} (generation still active)"
+                    await self._stop_generation_if_active(wait_timeout_ms=6000)
 
                 log(timeout_reason, f"Worker {self.worker_id}")
                 await self._track_error(timeout_reason, "copy_btn", "wait_for_response")
@@ -1492,6 +1600,8 @@ class GeminiWebAutomation(BaseAutomation):
             
             # Retry extraction once via DOM fallback
             return await self._fallback_extract()
+        finally:
+            self._generation_in_progress = False
 
     async def _fallback_extract(self) -> Dict:
         """Fallback extraction via DOM if copy button fails."""
