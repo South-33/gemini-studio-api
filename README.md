@@ -11,6 +11,7 @@ A lightweight API that automates Gemini Web to provide OpenAI-compatible endpoin
 - **Discord Alerts** - Get notified on your phone when errors occur
 - **Resilient Selectors** - Fallback selectors that survive Google UI changes
 - **Request Source Tracing** - Track which app/project sent each request
+- **Optional Tab Keepalive** - Prevent idle headless tabs from drifting into stale states
 
 ---
 
@@ -85,6 +86,9 @@ HEADLESS=true           # false to see the browser
 WORKER_COUNT=2          # Number of parallel tabs (1 worker = 1 tab)
 BROWSER_TIMEOUT=480     # Max seconds for one browser request
 RECENT_REQUEST_LIMIT=200  # Number of recent request traces kept in memory
+ENABLE_TAB_KEEPALIVE=false  # Keep idle tabs warm/recover stale stop state
+TAB_KEEPALIVE_INTERVAL=75   # Seconds between keepalive checks
+TAB_IDLE_RECOVER_SECONDS=300  # Only maintain workers idle this long
 
 # Discord Notifications (optional)
 DISCORD_WEBHOOK=https://discord.com/api/webhooks/...
@@ -233,6 +237,7 @@ Returns:
 - **Request-Level Retry** - Failed requests automatically retry on different workers
 - **Periodic Refresh** - Browser tabs refresh every 10 requests to clear cache
 - **Overlay Dismissal** - Clears stuck modals/menus before each request
+- **Idle Keepalive (optional)** - Detects/recover stale `Stop response` states while idle
 - **Error Tracking** - All errors logged with selector, action, and timestamp
 - **Discord Alerts** - Optional notifications with 5-minute cooldown to prevent spam
 

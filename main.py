@@ -328,6 +328,14 @@ async def diagnostics():
         "workers": worker_status,
         "errors": errors,
         "recent_requests": list(RECENT_REQUESTS),
+        "keepalive": {
+            "enabled": getattr(worker_pool, "keepalive_enabled", False) if worker_pool else False,
+            "interval_seconds": getattr(worker_pool, "keepalive_interval", 0) if worker_pool else 0,
+            "idle_recover_seconds": getattr(worker_pool, "keepalive_idle_recover_seconds", 0) if worker_pool else 0,
+            "runs": getattr(worker_pool, "_keepalive_runs", 0) if worker_pool else 0,
+            "recoveries": getattr(worker_pool, "_keepalive_recoveries", 0) if worker_pool else 0,
+            "reloads": getattr(worker_pool, "_keepalive_reloads", 0) if worker_pool else 0,
+        },
         "selectors": {
             key: vals[0] if isinstance(vals, list) and vals else vals 
             for key, vals in GeminiWebAutomation.SELECTORS.items()

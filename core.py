@@ -1798,6 +1798,7 @@ class WorkerPool:
         # Array of Gemini Web workers (1 worker = 1 tab)
         self.workers: List[GeminiWebAutomation] = []
         self._worker_busy: List[bool] = []  # Track which workers are busy
+        self._worker_last_request: List[float] = []  # Last real request completion per worker
         self._worker_lock = asyncio.Lock()  # Lock for worker assignment
         
         self.shared_context = None
@@ -1806,6 +1807,15 @@ class WorkerPool:
         
         self._browser_semaphore = asyncio.Semaphore(worker_count)  # Allow N concurrent requests
         self._last_activity = time.time()
+
+        # Optional tab keepalive (prevents idle/cold tab drift in headless mode)
+        self.keepalive_enabled = os.getenv("ENABLE_TAB_KEEPALIVE", "false").lower() == "true"
+        self.keepalive_interval = max(30, int(os.getenv("TAB_KEEPALIVE_INTERVAL", "75")))
+        self.keepalive_idle_recover_seconds = max(60, int(os.getenv("TAB_IDLE_RECOVER_SECONDS", "300")))
+        self._keepalive_task = None
+        self._keepalive_runs = 0
+        self._keepalive_recoveries = 0
+        self._keepalive_reloads = 0
     
     async def _get_available_worker(self, exclude: set = None) -> Tuple[int, GeminiWebAutomation]:
         """Get first available worker (round-robin). Waits if all are busy."""
@@ -1828,11 +1838,96 @@ class WorkerPool:
         log(f"⚠️ Worker assignment timeout", "WorkerPool")
         return None, None
     
-    async def _release_worker(self, index: int):
+    async def _release_worker(self, index: int, mark_request_activity: bool = True):
         """Mark worker as available."""
         async with self._worker_lock:
             if 0 <= index < len(self._worker_busy):
                 self._worker_busy[index] = False
+                if mark_request_activity and index < len(self._worker_last_request):
+                    self._worker_last_request[index] = time.time()
+
+    async def _acquire_worker_for_keepalive(self, index: int) -> bool:
+        """Temporarily reserve an idle worker for keepalive maintenance."""
+        async with self._worker_lock:
+            if not (0 <= index < len(self._worker_busy)):
+                return False
+            if self._worker_busy[index]:
+                return False
+            worker = self.workers[index] if index < len(self.workers) else None
+            if not worker or not worker._initialized:
+                return False
+            self._worker_busy[index] = True
+            return True
+
+    async def _keepalive_worker(self, index: int, worker: GeminiWebAutomation):
+        """Run lightweight keepalive and stuck-state recovery for one worker."""
+        self._keepalive_runs += 1
+
+        try:
+            # Lightweight tab pulse (no model/token usage)
+            await worker.page.evaluate("() => { window.__gemini_keepalive_ts = Date.now(); return document.visibilityState; }")
+            try:
+                await worker.page.keyboard.press("Escape")
+            except:
+                pass
+
+            if await worker._is_generation_active():
+                self._keepalive_recoveries += 1
+                log(f"Keepalive: stuck generation detected on worker {index+1}", "WorkerPool")
+
+                stopped = await worker._stop_generation_if_active(wait_timeout_ms=5000)
+                if not stopped:
+                    self._keepalive_reloads += 1
+                    log(f"Keepalive: reloading worker {index+1}", "WorkerPool")
+                    await worker.page.reload(wait_until="domcontentloaded", timeout=30000)
+
+                    for selector in worker._get_all_selectors("input"):
+                        try:
+                            await worker.page.wait_for_selector(selector, state="visible", timeout=6000)
+                            break
+                        except:
+                            continue
+        except Exception as e:
+            log(f"Keepalive warning on worker {index+1}: {e}", "WorkerPool")
+
+    async def _run_keepalive_loop(self):
+        """Background keepalive loop to prevent idle tab drift in headless mode."""
+        log(
+            f"Keepalive enabled (interval={self.keepalive_interval}s, idle_recover={self.keepalive_idle_recover_seconds}s)",
+            "WorkerPool"
+        )
+
+        try:
+            while self._initialized:
+                await asyncio.sleep(self.keepalive_interval)
+                if not self._initialized:
+                    break
+
+                now = time.time()
+                for index, worker in enumerate(self.workers):
+                    if not worker or not worker._initialized:
+                        continue
+
+                    if index < len(self._worker_last_request):
+                        idle_for = now - self._worker_last_request[index]
+                    else:
+                        idle_for = 0
+
+                    if idle_for < self.keepalive_idle_recover_seconds:
+                        continue
+
+                    acquired = await self._acquire_worker_for_keepalive(index)
+                    if not acquired:
+                        continue
+
+                    try:
+                        await self._keepalive_worker(index, worker)
+                    finally:
+                        await self._release_worker(index, mark_request_activity=False)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            log(f"Keepalive loop failed: {e}", "WorkerPool")
 
     async def init(self, cookies: List[Dict]) -> bool:
         """Launch shared browser and N Gemini Web tabs."""
@@ -1924,6 +2019,7 @@ class WorkerPool:
                     workers_ok += 1
                 self.workers.append(worker)
                 self._worker_busy.append(False)
+                self._worker_last_request.append(time.time())
                 
                 # Stagger tab creation to avoid rate limiting
                 if i < self.worker_count - 1:
@@ -1932,6 +2028,10 @@ class WorkerPool:
             print(f"[WorkerPool] ✅ {workers_ok}/{self.worker_count} workers ready")
             
             self._initialized = True
+
+            if self.keepalive_enabled:
+                self._keepalive_task = asyncio.create_task(self._run_keepalive_loop())
+
             return workers_ok > 0  # Success if at least one works
         except Exception as e:
             print(f"[WorkerPool] Init error: {e}")
@@ -2005,6 +2105,15 @@ class WorkerPool:
 
 
     async def close(self):
+        self._initialized = False
+
+        if self._keepalive_task and not self._keepalive_task.done():
+            self._keepalive_task.cancel()
+            try:
+                await self._keepalive_task
+            except asyncio.CancelledError:
+                pass
+
         # Close all workers
         for w in self.workers:
             await w.close()
