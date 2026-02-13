@@ -976,8 +976,8 @@ class GeminiWebAutomation(BaseAutomation):
             pass
 
         try:
-            copy_selector = self._get_selector("copy_btn")
-            context["copy_count"] = await self.page.locator(copy_selector).count()
+            # Count response copy buttons only (exclude "Copy prompt")
+            context["copy_count"] = await self.page.locator('[data-content-type="response"] button[aria-label="Copy"]').count()
         except:
             pass
 
@@ -1364,17 +1364,24 @@ class GeminiWebAutomation(BaseAutomation):
             
             # 1. New Chat (starts fresh) - VERIFIED
             async def get_copy_state() -> Tuple[int, str]:
-                best_count = 0
-                best_selector = self._get_selector("copy_btn")
-                for selector in self._get_all_selectors("copy_btn"):
+                # Prefer assistant-response copy buttons. Avoid user "Copy prompt" buttons.
+                candidate_selectors = [
+                    '[data-content-type="response"] button[aria-label="Copy"]',
+                    '[data-content-type="response"] button[aria-label*="Copy" i]:not([aria-label*="prompt" i])',
+                    '[data-content-type="response"] button.copy-button',
+                    'button[aria-label="Copy"]',
+                    'button[aria-label*="Copy" i]:not([aria-label*="prompt" i])',
+                ]
+
+                for selector in candidate_selectors:
                     try:
                         count = await self.page.locator(selector).count()
-                        if count > best_count:
-                            best_count = count
-                            best_selector = selector
+                        if count > 0:
+                            return count, selector
                     except:
                         continue
-                return best_count, best_selector
+
+                return 0, candidate_selectors[0]
 
             async def get_copy_count():
                 count, _ = await get_copy_state()
