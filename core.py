@@ -2,6 +2,7 @@ import asyncio
 import base64
 import os
 import sys
+import re
 import random
 import time
 import uuid
@@ -829,17 +830,43 @@ class GeminiWebAutomation(BaseAutomation):
         return None, None
     
     def _matches_model(self, item_text: str, model_name: str) -> bool:
-        """Check if menu item matches requested model using keyword matching."""
-        text_lower = item_text.lower()
-        model_lower = model_name.lower()
-        
-        # Direct match first
-        if model_lower in text_lower:
+        """Check if menu item matches requested model using token-safe matching."""
+        model_lower = model_name.lower().strip()
+
+        # Menu items often contain two lines: title + description.
+        # Prefer title for matching, then fall back to full text tokens.
+        lines = [line.strip().lower() for line in item_text.splitlines() if line.strip()]
+        title_text = lines[0] if lines else item_text.lower().strip()
+        full_text = " ".join(lines) if lines else item_text.lower().strip()
+
+        title_tokens = re.findall(r"[a-z0-9]+", title_text)
+        full_tokens = re.findall(r"[a-z0-9]+", full_text)
+
+        def token_match(token: str, keyword: str) -> bool:
+            # Short keywords like "pro" must match exactly (avoid matching "problems").
+            if len(keyword) <= 3:
+                return token == keyword
+            # Longer keywords can match simple inflections like "problem" -> "problems".
+            return token == keyword or token.startswith(keyword)
+
+        # Direct model match: strict token match first on title, then full text.
+        if any(token_match(token, model_lower) for token in title_tokens):
             return True
-        
-        # Keyword fallback
+        if any(token_match(token, model_lower) for token in full_tokens):
+            return True
+
+        # Keyword fallback (token-safe)
         keywords = self.MODEL_KEYWORDS.get(model_lower, [])
-        return any(kw in text_lower for kw in keywords)
+        for keyword in keywords:
+            kw = keyword.lower().strip()
+            if not kw:
+                continue
+            if any(token_match(token, kw) for token in title_tokens):
+                return True
+            if any(token_match(token, kw) for token in full_tokens):
+                return True
+
+        return False
 
     def _get_position_fallback(self, model_name: str, item_count: int) -> int:
         """Get position-based fallback index (cheap to expensive = top to bottom)."""
