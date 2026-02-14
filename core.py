@@ -788,6 +788,14 @@ class GeminiWebAutomation(BaseAutomation):
             return [selectors]
         return []
 
+    def _get_response_copy_selectors(self) -> List[str]:
+        """Selectors that target assistant response copy buttons only."""
+        return [
+            '[data-content-type="response"] button[aria-label="Copy"]',
+            'model-response button[aria-label="Copy"]',
+            'assistant-message-content button[aria-label="Copy"]',
+        ]
+
     async def _resolve_visible_selector(self, key: str, timeout: int = 1500) -> str:
         """Resolve the first visible selector from a selector group."""
         for selector in self._get_all_selectors(key):
@@ -797,6 +805,131 @@ class GeminiWebAutomation(BaseAutomation):
             except:
                 continue
         return self._get_selector(key)
+
+    async def _find_latest_response_copy_button(self, min_count: int = 0):
+        """Find the latest assistant response copy button, above a baseline count."""
+        best_selector = None
+        best_count = 0
+        best_locator = None
+
+        for selector in self._get_response_copy_selectors():
+            try:
+                locator = self.page.locator(selector)
+                count = await locator.count()
+                if count > best_count:
+                    best_count = count
+                    best_selector = selector
+                    best_locator = locator
+            except:
+                continue
+
+        if not best_locator or best_count <= min_count:
+            return None, best_selector, best_count
+
+        for i in range(best_count - 1, -1, -1):
+            try:
+                candidate = best_locator.nth(i)
+                if await candidate.is_visible():
+                    return candidate, best_selector, best_count
+            except:
+                continue
+
+        return None, best_selector, best_count
+
+    async def _get_generation_snapshot(self) -> Dict:
+        """Capture current generation lifecycle signals from Gemini UI."""
+        snapshot = {
+            "stop_visible": False,
+            "send_visible": False,
+            "response_count": 0,
+            "last_response_len": 0,
+            "last_response_tail": "",
+            "response_copy_count": 0,
+            "prompt_copy_count": 0,
+            "error_banner_text": "",
+        }
+
+        if not self.page:
+            return snapshot
+
+        try:
+            metrics = await self.page.evaluate('''
+                () => {
+                    const isVisible = (el) => {
+                        if (!el) return false;
+                        const style = window.getComputedStyle(el);
+                        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+                            return false;
+                        }
+                        return !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                    };
+
+                    const findButton = (predicate) => {
+                        const buttons = Array.from(document.querySelectorAll('button'));
+                        return buttons.find((btn) => {
+                            if (!isVisible(btn)) return false;
+                            const label = (btn.getAttribute('aria-label') || '').toLowerCase();
+                            const text = (btn.innerText || '').toLowerCase();
+                            return predicate(label, text);
+                        }) || null;
+                    };
+
+                    let responses = document.querySelectorAll('[data-content-type="response"]');
+                    if (responses.length === 0) {
+                        responses = document.querySelectorAll('model-response, assistant-message-content');
+                    }
+                    const last = responses.length ? responses[responses.length - 1] : null;
+                    const lastText = last ? (last.innerText || '') : '';
+
+                    const responseCopy = document.querySelectorAll(
+                        '[data-content-type="response"] button[aria-label="Copy"], ' +
+                        'model-response button[aria-label="Copy"], ' +
+                        'assistant-message-content button[aria-label="Copy"]'
+                    );
+
+                    const promptCopy = document.querySelectorAll('button[aria-label*="Copy prompt" i]');
+
+                    const bannerSelectors = [
+                        '[role="alert"]',
+                        '[aria-live="polite"]',
+                        '[aria-live="assertive"]',
+                        '.mat-mdc-snack-bar-container',
+                        '.toast',
+                        '.error',
+                        '.warning'
+                    ];
+
+                    const bannerTexts = [];
+                    for (const selector of bannerSelectors) {
+                        const nodes = Array.from(document.querySelectorAll(selector));
+                        for (const node of nodes) {
+                            if (!isVisible(node)) continue;
+                            const text = (node.innerText || '').trim();
+                            if (text) bannerTexts.push(text);
+                        }
+                    }
+
+                    const stopBtn = findButton((label, text) => label.includes('stop response') || label === 'stop' || text.includes('stop'));
+                    const sendBtn = findButton((label, text) => label.includes('send message') || label === 'send' || text.includes('send'));
+
+                    return {
+                        stop_visible: !!stopBtn,
+                        send_visible: !!sendBtn,
+                        response_count: responses.length,
+                        last_response_len: lastText.length,
+                        last_response_tail: lastText.slice(-160),
+                        response_copy_count: responseCopy.length,
+                        prompt_copy_count: promptCopy.length,
+                        error_banner_text: bannerTexts.join(' | ').slice(0, 400),
+                    };
+                }
+            ''')
+
+            snapshot.update(metrics or {})
+        except:
+            pass
+
+        return snapshot
     
     async def _find_element(self, key: str, timeout: int = 5000, description: str = None, track_error: bool = True):
         """
@@ -888,6 +1021,10 @@ class GeminiWebAutomation(BaseAutomation):
 
     async def _is_generation_active(self) -> bool:
         """Check if the UI indicates generation is still running."""
+        snapshot = await self._get_generation_snapshot()
+        if snapshot.get("stop_visible"):
+            return True
+
         selectors = list(self._get_all_selectors("send_btn"))
         selectors.append('button[aria-label="Stop response"]')
         selectors.append('button[aria-label*="Stop" i]')
@@ -982,10 +1119,13 @@ class GeminiWebAutomation(BaseAutomation):
             "url": "",
             "overlay_count": 0,
             "copy_count": 0,
+            "prompt_copy_count": 0,
             "response_count": 0,
             "last_response_len": 0,
             "last_response_tail": "",
             "stop_visible": False,
+            "send_visible": False,
+            "error_banner_text": "",
             "active_button": "",
         }
 
@@ -1003,37 +1143,15 @@ class GeminiWebAutomation(BaseAutomation):
             pass
 
         try:
-            # Count response copy buttons only (exclude "Copy prompt")
-            context["copy_count"] = await self.page.locator('[data-content-type="response"] button[aria-label="Copy"]').count()
-        except:
-            pass
-
-        try:
-            metrics = await self.page.evaluate('''
-                () => {
-                    const responses = document.querySelectorAll('[data-content-type="response"]');
-                    const last = responses.length ? responses[responses.length - 1] : null;
-                    const text = last ? (last.innerText || '') : '';
-
-                    const hasStop = Array.from(document.querySelectorAll('button')).some((btn) => {
-                        const label = (btn.getAttribute('aria-label') || '').toLowerCase();
-                        const inner = (btn.innerText || '').toLowerCase();
-                        return label.includes('stop') || inner.includes('stop');
-                    });
-
-                    return {
-                        response_count: responses.length,
-                        last_response_len: text.length,
-                        last_response_tail: text.slice(-160),
-                        stop_visible: hasStop,
-                    };
-                }
-            ''')
-
-            context["response_count"] = metrics.get("response_count", 0)
-            context["last_response_len"] = metrics.get("last_response_len", 0)
-            context["last_response_tail"] = metrics.get("last_response_tail", "")
-            context["stop_visible"] = metrics.get("stop_visible", False)
+            snapshot = await self._get_generation_snapshot()
+            context["copy_count"] = snapshot.get("response_copy_count", 0)
+            context["response_count"] = snapshot.get("response_count", 0)
+            context["last_response_len"] = snapshot.get("last_response_len", 0)
+            context["last_response_tail"] = snapshot.get("last_response_tail", "")
+            context["stop_visible"] = snapshot.get("stop_visible", False)
+            context["send_visible"] = snapshot.get("send_visible", False)
+            context["prompt_copy_count"] = snapshot.get("prompt_copy_count", 0)
+            context["error_banner_text"] = snapshot.get("error_banner_text", "")
         except:
             pass
 
@@ -1065,11 +1183,16 @@ class GeminiWebAutomation(BaseAutomation):
             f"url={context.get('url') or 'unknown'}",
             f"btn={context.get('active_button') or 'none'}",
             f"stop={context.get('stop_visible')}",
+            f"send={context.get('send_visible')}",
             f"copy={context.get('copy_count', 0)}",
+            f"prompt_copy={context.get('prompt_copy_count', 0)}",
             f"resp={context.get('response_count', 0)}",
             f"resp_len={context.get('last_response_len', 0)}",
             f"overlay={context.get('overlay_count', 0)}",
         ]
+
+        if context.get("error_banner_text"):
+            parts.append(f"banner={context.get('error_banner_text')[:120]}")
 
         if tail:
             parts.append(f"tail={tail}")
@@ -1396,8 +1519,6 @@ class GeminiWebAutomation(BaseAutomation):
                     '[data-content-type="response"] button[aria-label="Copy"]',
                     '[data-content-type="response"] button[aria-label*="Copy" i]:not([aria-label*="prompt" i])',
                     '[data-content-type="response"] button.copy-button',
-                    'button[aria-label="Copy"]',
-                    'button[aria-label*="Copy" i]:not([aria-label*="prompt" i])',
                 ]
 
                 for selector in candidate_selectors:
@@ -1465,8 +1586,12 @@ class GeminiWebAutomation(BaseAutomation):
             await input_area.fill(prompt)
             await self._human_delay(300, 600)
 
-            # Capture button count BEFORE sending (to ensure we wait for a NEW one)
-            pre_send_count, copy_selector = await get_copy_state()
+            # Capture response state BEFORE sending (to detect new assistant output)
+            pre_send_snapshot = await self._get_generation_snapshot()
+            pre_send_count = pre_send_snapshot.get("response_copy_count", 0)
+            pre_send_response_count = pre_send_snapshot.get("response_count", 0)
+            pre_send_last_len = pre_send_snapshot.get("last_response_len", 0)
+            copy_selector = self._get_response_copy_selectors()[0]
 
             # 4. Click Send - VERIFIED
             worker_id = self.worker_id  # Capture for closure
@@ -1524,62 +1649,168 @@ class GeminiWebAutomation(BaseAutomation):
                 await self._track_error("Send button click failed", "send_btn", "send_message")
                 return {"success": False, "error": "Send button click failed"}
             
-            # 5. Wait for Response (Copy button to appear)
+            # 5. Wait for response lifecycle completion
             log(f"Waiting for response...", f"Worker {self.worker_id}")
             await self._human_delay(300, 600)  # Reduced initial wait
             
-            # Polling for copy button (Wait until we have MORE buttons than before)
             start_time = time.time()
             max_wait = int(os.getenv("BROWSER_TIMEOUT", "480"))
-            idle_timeout = 60
-            last_activity = time.time()
-            last_length = 0
-            copy_btn = None
+            idle_timeout = int(os.getenv("IDLE_TIMEOUT_SECONDS", "60"))
+            stuck_empty_seconds = int(os.getenv("STUCK_EMPTY_SECONDS", "45"))
+            stuck_no_progress_seconds = int(os.getenv("STUCK_NO_PROGRESS_SECONDS", "90"))
+            terminal_grace_seconds = int(os.getenv("TERMINAL_GRACE_SECONDS", "5"))
+            wait_log_interval = int(os.getenv("WAIT_LOG_INTERVAL_SECONDS", "10"))
 
-            async def get_response_length() -> int:
-                try:
-                    return await self.page.evaluate('''
-                        () => {
-                            const responses = document.querySelectorAll('[data-content-type="response"]');
-                            if (responses.length === 0) return 0;
-                            const last = responses[responses.length - 1];
-                            return (last.innerText || '').length;
-                        }
-                    ''')
-                except:
-                    return 0
+            copy_btn = None
+            wait_failure_reason = None
+
+            saw_stop = False
+            terminal_started_at = None
+            empty_stuck_started_at = None
+            no_progress_started_at = None
+
+            last_snapshot = pre_send_snapshot
+            last_progress = time.time()
+            last_log = start_time
+
+            def has_progress(prev: Dict, curr: Dict) -> bool:
+                return (
+                    curr.get("response_count", 0) > prev.get("response_count", 0)
+                    or curr.get("last_response_len", 0) > prev.get("last_response_len", 0)
+                    or curr.get("response_copy_count", 0) > prev.get("response_copy_count", 0)
+                )
 
             while (time.time() - start_time) < max_wait:
-                current_count, active_copy_selector = await get_copy_state()
-                
-                # We need to find a new button (more than we started with)
-                if current_count > pre_send_count:
-                    btns = self.page.locator(active_copy_selector)
-                    # Get the LAST button (the new one)
-                    copy_btn = btns.nth(current_count - 1)
-                    if await copy_btn.is_visible():
-                        copy_selector = active_copy_selector
+                now = time.time()
+                snapshot = await self._get_generation_snapshot()
+
+                if has_progress(last_snapshot, snapshot):
+                    last_progress = now
+                    no_progress_started_at = None
+                    empty_stuck_started_at = None
+                else:
+                    if snapshot.get("stop_visible"):
+                        if no_progress_started_at is None:
+                            no_progress_started_at = now
+
+                if snapshot.get("stop_visible"):
+                    saw_stop = True
+
+                # New assistant copy button is the strongest terminal signal
+                if snapshot.get("response_copy_count", 0) > pre_send_count:
+                    latest_btn, active_copy_selector, _ = await self._find_latest_response_copy_button(pre_send_count)
+                    if latest_btn and (not snapshot.get("stop_visible") or snapshot.get("send_visible")):
+                        copy_btn = latest_btn
+                        copy_selector = active_copy_selector or copy_selector
                         break
 
-                current_length = await get_response_length()
-                if current_length > last_length:
-                    last_length = current_length
-                    last_activity = time.time()
-                else:
-                    if await self._is_generation_active():
-                        last_activity = time.time()
-                    elif (time.time() - last_activity) > idle_timeout:
+                # Detect terminal state from send/stop lifecycle
+                if saw_stop and (not snapshot.get("stop_visible")) and snapshot.get("send_visible"):
+                    if terminal_started_at is None:
+                        terminal_started_at = now
+
+                    has_new_output = (
+                        snapshot.get("response_count", 0) > pre_send_response_count
+                        or snapshot.get("last_response_len", 0) > (pre_send_last_len + 20)
+                    )
+
+                    # No copy button, but assistant text exists -> terminal without copy
+                    if has_new_output and snapshot.get("last_response_len", 0) > 20:
+                        wait_failure_reason = "terminal_no_copy_button"
                         break
+
+                    if (now - terminal_started_at) >= terminal_grace_seconds:
+                        if snapshot.get("error_banner_text"):
+                            wait_failure_reason = f"terminal_error_banner: {snapshot.get('error_banner_text')[:120]}"
+                        else:
+                            wait_failure_reason = "terminal_no_output_after_stop"
+                        break
+                else:
+                    terminal_started_at = None
+
+                # Early stuck detection (prevents burning full max_wait on ghost runs)
+                is_empty = (
+                    snapshot.get("response_count", 0) <= pre_send_response_count
+                    and snapshot.get("last_response_len", 0) <= pre_send_last_len
+                    and snapshot.get("response_copy_count", 0) <= pre_send_count
+                )
+                if snapshot.get("stop_visible") and is_empty:
+                    if empty_stuck_started_at is None:
+                        empty_stuck_started_at = now
+                    elif (now - empty_stuck_started_at) >= stuck_empty_seconds:
+                        wait_failure_reason = f"stuck_empty_no_output_{stuck_empty_seconds}s"
+                        break
+
+                if snapshot.get("stop_visible") and no_progress_started_at is not None:
+                    if (now - no_progress_started_at) >= stuck_no_progress_seconds:
+                        wait_failure_reason = f"stuck_no_progress_{stuck_no_progress_seconds}s"
+                        break
+
+                # Idle wait timeout when generation is not active and no progress observed
+                if (not snapshot.get("stop_visible")) and ((now - last_progress) > idle_timeout):
+                    wait_failure_reason = f"idle_timeout_{idle_timeout}s"
+                    break
+
+                if (now - last_log) >= wait_log_interval:
+                    log(
+                        "Wait state: "
+                        f"elapsed={int(now-start_time)}s "
+                        f"stop={snapshot.get('stop_visible')} send={snapshot.get('send_visible')} "
+                        f"resp={snapshot.get('response_count', 0)} len={snapshot.get('last_response_len', 0)} "
+                        f"copy={snapshot.get('response_copy_count', 0)} prompt_copy={snapshot.get('prompt_copy_count', 0)}",
+                        f"Worker {self.worker_id}"
+                    )
+                    last_log = now
+
+                last_snapshot = snapshot
 
                 await asyncio.sleep(1)  # Reduced from 2s
             
             if not copy_btn:
                 elapsed = int(time.time() - start_time)
-                generation_active = await self._is_generation_active()
-                if elapsed >= max_wait:
+                end_snapshot = await self._get_generation_snapshot()
+                generation_active = end_snapshot.get("stop_visible") or await self._is_generation_active()
+
+                if not wait_failure_reason:
+                    if elapsed >= max_wait:
+                        wait_failure_reason = f"timeout_{max_wait}s"
+                    else:
+                        wait_failure_reason = f"idle_timeout_{idle_timeout}s"
+
+                reason_code = wait_failure_reason
+                timeout_reason = wait_failure_reason
+
+                if timeout_reason.startswith("terminal_no_copy") or timeout_reason.startswith("terminal_error_banner"):
+                    has_new_output = (
+                        end_snapshot.get("response_count", 0) > pre_send_response_count
+                        or end_snapshot.get("last_response_len", 0) > (pre_send_last_len + 20)
+                    )
+
+                    fallback = await self._fallback_extract() if has_new_output else {"success": False}
+                    if fallback.get("success"):
+                        log(
+                            f"Completed without response copy button ({timeout_reason}); used DOM fallback",
+                            f"Worker {self.worker_id}"
+                        )
+                        return fallback
+
+                if timeout_reason.startswith("timeout_"):
                     timeout_reason = f"Timeout after {max_wait}s waiting for response"
-                else:
+                elif timeout_reason.startswith("idle_timeout_"):
                     timeout_reason = f"Idle timeout after {idle_timeout}s (no activity)"
+                elif timeout_reason.startswith("stuck_empty"):
+                    timeout_reason = f"Stuck generation: no output while running ({stuck_empty_seconds}s)"
+                elif timeout_reason.startswith("stuck_no_progress"):
+                    timeout_reason = f"Stuck generation: no progress while running ({stuck_no_progress_seconds}s)"
+                elif timeout_reason.startswith("terminal_no_output"):
+                    timeout_reason = "Generation ended without assistant output"
+                elif timeout_reason.startswith("terminal_error_banner"):
+                    timeout_reason = f"Generation ended with banner: {end_snapshot.get('error_banner_text', '')[:120]}"
+
+                else:
+                    timeout_reason = f"Wait failed: {timeout_reason}"
+
+                timeout_reason = f"{timeout_reason} [code={reason_code}]"
 
                 if generation_active:
                     timeout_reason = f"{timeout_reason} (generation still active)"

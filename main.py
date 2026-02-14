@@ -256,17 +256,28 @@ async def openai_chat(request: Request):
     # CRITICAL: Use timeout to prevent infinite blocking
     # The lambda with timeout prevents run_in_executor from blocking forever
     BROWSER_TIMEOUT = int(os.getenv("BROWSER_TIMEOUT", "480"))
+    API_TIMEOUT_HEADROOM = int(os.getenv("API_TIMEOUT_HEADROOM", "30"))
+    api_wait_timeout = BROWSER_TIMEOUT + max(0, API_TIMEOUT_HEADROOM)
     
     try:
-        log(f"Waiting for browser thread (timeout={BROWSER_TIMEOUT}s)...", "API")
+        log(
+            f"Waiting for browser thread (worker_timeout={BROWSER_TIMEOUT}s, api_timeout={api_wait_timeout}s)...",
+            "API"
+        )
         result = await asyncio.get_event_loop().run_in_executor(
             None, 
-            lambda: future.result(timeout=BROWSER_TIMEOUT)
+            lambda: future.result(timeout=api_wait_timeout)
         )
         log(f"Browser thread returned", "API")
     except TimeoutError:
-        log(f"❌ BROWSER TIMEOUT after {BROWSER_TIMEOUT}s - request stuck in browser thread", "API")
-        raise HTTPException(status_code=504, detail=f"Browser operation timed out after {BROWSER_TIMEOUT}s")
+        log(
+            f"❌ BROWSER TIMEOUT after {api_wait_timeout}s - request stuck in browser thread",
+            "API"
+        )
+        raise HTTPException(
+            status_code=504,
+            detail=f"Browser operation timed out after {api_wait_timeout}s"
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:

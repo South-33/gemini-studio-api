@@ -85,10 +85,15 @@ Copy `.env.example` to `.env` and configure:
 HEADLESS=true           # false to see the browser
 WORKER_COUNT=2          # Number of parallel tabs (1 worker = 1 tab)
 BROWSER_TIMEOUT=480     # Max seconds for one browser request
+API_TIMEOUT_HEADROOM=30 # Extra API-side timeout buffer above worker timeout
 RECENT_REQUEST_LIMIT=200  # Number of recent request traces kept in memory
 ENABLE_TAB_KEEPALIVE=false  # Keep idle tabs warm/recover stale stop state
 TAB_KEEPALIVE_INTERVAL=75   # Seconds between keepalive checks
 TAB_IDLE_RECOVER_SECONDS=300  # Only maintain workers idle this long
+WAIT_LOG_INTERVAL_SECONDS=10  # Wait-loop telemetry interval
+STUCK_EMPTY_SECONDS=45        # Stop-visible + zero-output stuck threshold
+STUCK_NO_PROGRESS_SECONDS=90  # Stop-visible + no-progress stuck threshold
+TERMINAL_GRACE_SECONDS=5      # Grace after Stop->Send before terminal decision
 
 # Discord Notifications (optional)
 DISCORD_WEBHOOK=https://discord.com/api/webhooks/...
