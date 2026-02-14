@@ -330,6 +330,8 @@ async def diagnostics():
                 "initialized": worker._initialized,
                 "busy": worker_pool._worker_busy[i] if i < len(worker_pool._worker_busy) else False,
                 "request_count": worker._request_count,
+                "current_request_id": worker._request_id,
+                "timeline_tail": worker._timeline_tail(10) if hasattr(worker, "_timeline_tail") else [],
                 "last_error": errors.get(i + 1)
             })
     

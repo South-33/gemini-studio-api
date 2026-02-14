@@ -769,6 +769,12 @@ class GeminiWebAutomation(BaseAutomation):
         self.worker_id = worker_id  # For logging
         self._request_count = 0
         self._request_id = None  # Set per-request for log tracing
+        self._request_start_ts = 0.0
+        self._last_request_finished_ts = time.time()
+        self._idle_wake_refresh_seconds = max(0, int(os.getenv("IDLE_WAKE_REFRESH_SECONDS", "1200")))
+        self._timeline_limit = max(20, int(os.getenv("REQUEST_TIMELINE_LIMIT", "80")))
+        self._request_timeline: List[Dict] = []
+        self._diag_hooks_attached = False
 
     def _get_selector(self, key: str) -> str:
         """Get the first selector from a selector group (for backward compatibility)."""
@@ -835,6 +841,114 @@ class GeminiWebAutomation(BaseAutomation):
                 continue
 
         return None, best_selector, best_count
+
+    def _mark_timeline(self, event: str, **data):
+        """Record request lifecycle events for diagnostics."""
+        now = time.time()
+        entry = {
+            "ts": datetime.now().isoformat(),
+            "event": event,
+        }
+        if self._request_start_ts:
+            entry["t_ms"] = int((now - self._request_start_ts) * 1000)
+        if data:
+            entry.update(data)
+
+        self._request_timeline.append(entry)
+        if len(self._request_timeline) > self._timeline_limit:
+            self._request_timeline = self._request_timeline[-self._timeline_limit:]
+
+    def _timeline_tail(self, count: int = 12) -> List[str]:
+        """Compact timeline tail for logs/Discord diagnostics."""
+        tail = self._request_timeline[-count:]
+        compact = []
+        for item in tail:
+            t_ms = item.get("t_ms", 0)
+            event = item.get("event", "unknown")
+            compact.append(f"{t_ms}ms:{event}")
+        return compact
+
+    async def _idle_wake_refresh_if_needed(self):
+        """Refresh tab before request if worker has been idle for long enough."""
+        if self._idle_wake_refresh_seconds <= 0:
+            return
+
+        idle_for = time.time() - self._last_request_finished_ts
+        if idle_for < self._idle_wake_refresh_seconds:
+            return
+
+        self._mark_timeline("idle_refresh_triggered", idle_for_s=int(idle_for))
+        log(
+            f"Idle wake refresh after {int(idle_for)}s idle",
+            f"Worker {self.worker_id}"
+        )
+
+        await self.page.reload(wait_until="domcontentloaded", timeout=30000)
+        input_ready = False
+        for selector in self._get_all_selectors("input"):
+            try:
+                await self.page.wait_for_selector(selector, state="visible", timeout=6000)
+                input_ready = True
+                break
+            except:
+                continue
+
+        if not input_ready:
+            self._mark_timeline("idle_refresh_input_not_ready")
+            log("Input not immediately visible after idle refresh", f"Worker {self.worker_id}")
+        else:
+            self._mark_timeline("idle_refresh_done")
+
+        await self._human_delay(400, 700)
+
+    def _attach_page_diagnostics(self):
+        """Attach browser-level diagnostics hooks once per worker page."""
+        if self._diag_hooks_attached or not self.page:
+            return
+
+        def on_page_error(exc):
+            try:
+                msg = str(exc).replace("\n", " ")[:220]
+                log(f"[{self._request_id or 'no-req'}] Page error: {msg}", f"Worker {self.worker_id}")
+            except:
+                pass
+
+        def on_request_failed(req):
+            try:
+                url = (getattr(req, "url", "") or "")[:160]
+                resource = getattr(req, "resource_type", "") or ""
+                failure = ""
+                try:
+                    failure_obj = req.failure
+                    if isinstance(failure_obj, dict):
+                        failure = (failure_obj.get("errorText") or "")[:160]
+                except:
+                    pass
+
+                if resource in ["xhr", "fetch", "websocket", "document"]:
+                    log(
+                        f"[{self._request_id or 'no-req'}] Request failed: {resource} {url} {failure}",
+                        f"Worker {self.worker_id}"
+                    )
+            except:
+                pass
+
+        def on_console(msg):
+            try:
+                msg_type = (getattr(msg, "type", "") or "").lower()
+                text = (getattr(msg, "text", "") or "").replace("\n", " ")[:220]
+                if msg_type in ["error", "warning"]:
+                    log(
+                        f"[{self._request_id or 'no-req'}] Console {msg_type}: {text}",
+                        f"Worker {self.worker_id}"
+                    )
+            except:
+                pass
+
+        self.page.on("pageerror", on_page_error)
+        self.page.on("requestfailed", on_request_failed)
+        self.page.on("console", on_console)
+        self._diag_hooks_attached = True
 
     async def _get_generation_snapshot(self) -> Dict:
         """Capture current generation lifecycle signals from Gemini UI."""
@@ -1127,6 +1241,7 @@ class GeminiWebAutomation(BaseAutomation):
             "send_visible": False,
             "error_banner_text": "",
             "active_button": "",
+            "timeline": [],
         }
 
         if not self.page:
@@ -1170,6 +1285,8 @@ class GeminiWebAutomation(BaseAutomation):
             except:
                 continue
 
+        context["timeline"] = self._timeline_tail(12)
+
         return context
 
     def _format_error_context(self, context: Dict) -> str:
@@ -1193,6 +1310,10 @@ class GeminiWebAutomation(BaseAutomation):
 
         if context.get("error_banner_text"):
             parts.append(f"banner={context.get('error_banner_text')[:120]}")
+
+        timeline_tail = context.get("timeline") or []
+        if timeline_tail:
+            parts.append(f"timeline={';'.join(timeline_tail[-4:])}")
 
         if tail:
             parts.append(f"tail={tail}")
@@ -1377,6 +1498,7 @@ class GeminiWebAutomation(BaseAutomation):
     async def init_with_page(self, page: Page, context: BrowserContext) -> bool:
         self.page = page
         self.context = context
+        self._attach_page_diagnostics()
         try:
             # Wait for input to be ready (login check) - try all selectors
             input_found = False
@@ -1472,8 +1594,20 @@ class GeminiWebAutomation(BaseAutomation):
             self._generation_in_progress = True
             self._request_count += 1
             self._request_id = uuid.uuid4().hex[:8]  # Short ID for log tracing
+            self._request_start_ts = time.time()
+            self._request_timeline = []
+            idle_before = int(self._request_start_ts - self._last_request_finished_ts)
+            self._mark_timeline(
+                "request_start",
+                model=(model or "default"),
+                prompt_chars=len(prompt),
+                idle_before_s=max(0, idle_before),
+            )
             log(f"[{self._request_id}] Request: model={model}, prompt={len(prompt)} chars", f"Worker {self.worker_id}")
-            
+
+            # Idle wake refresh after long inactivity
+            await self._idle_wake_refresh_if_needed()
+             
             # 0. Dismiss any stuck overlays/modals (Angular Material CDK overlays block clicks)
             try:
                 await self.page.keyboard.press("Escape")
@@ -1491,13 +1625,16 @@ class GeminiWebAutomation(BaseAutomation):
             recovered = await self._recover_stuck_generation()
             if not recovered:
                 reason = "Failed to recover from stuck generation state"
+                self._mark_timeline("preflight_recover_failed")
                 log(reason, f"Worker {self.worker_id}")
                 await self._track_error(reason, "send_btn", "preflight_recover")
                 return {"success": False, "error": reason}
+            self._mark_timeline("preflight_recover_ok")
             
             # 0.5 Periodic hard refresh to clear browser cache/memory
             if self._request_count >= self.REFRESH_EVERY_N_REQUESTS:
                 log(f"Hard refresh (request #{self._request_count})", f"Worker {self.worker_id}")
+                self._mark_timeline("periodic_refresh_start", request_count=self._request_count)
                 await self.page.reload(wait_until="domcontentloaded", timeout=30000)
                 input_ready = False
                 for selector in self._get_all_selectors("input"):
@@ -1511,6 +1648,7 @@ class GeminiWebAutomation(BaseAutomation):
                     log("Input not immediately visible after hard refresh; continuing", f"Worker {self.worker_id}")
                 await self._human_delay(500, 900)
                 self._request_count = 0
+                self._mark_timeline("periodic_refresh_done")
             
             # 1. New Chat (starts fresh) - VERIFIED
             async def get_copy_state() -> Tuple[int, str]:
@@ -1555,22 +1693,27 @@ class GeminiWebAutomation(BaseAutomation):
             
             if not new_chat_success:
                 error_msg = "New Chat click failed"
+                self._mark_timeline("new_chat_failed")
                 log(error_msg, f"Worker {self.worker_id}")
                 await self._track_error(error_msg, "new_chat", "send_message")
                 return {"success": False, "error": error_msg}
+            self._mark_timeline("new_chat_ok")
 
             
             # 1.5 Enable Temporary Chat
             await self._enable_temp_chat()
             await self._human_delay()
+            self._mark_timeline("temp_chat_checked")
 
             # 2. Select Model
             if model:
                 await self._select_model(model)
+                self._mark_timeline("model_selected", model=model)
 
             # 3. Enter Prompt - use fallback selector finding
             input_area, input_selector = await self._find_element("input", timeout=5000, description="Input textbox")
             if not input_area:
+                self._mark_timeline("input_not_found")
                 await self._track_error("Input textbox not found", "input", "send_message")
                 return {"success": False, "error": "Input textbox not found"}
             
@@ -1585,6 +1728,7 @@ class GeminiWebAutomation(BaseAutomation):
             
             await input_area.fill(prompt)
             await self._human_delay(300, 600)
+            self._mark_timeline("prompt_filled", input_selector=input_selector or "")
 
             # Capture response state BEFORE sending (to detect new assistant output)
             pre_send_snapshot = await self._get_generation_snapshot()
@@ -1645,9 +1789,11 @@ class GeminiWebAutomation(BaseAutomation):
             )
             
             if not send_success:
+                self._mark_timeline("send_failed")
                 log(f"Send button click failed", f"Worker {self.worker_id}")
                 await self._track_error("Send button click failed", "send_btn", "send_message")
                 return {"success": False, "error": "Send button click failed"}
+            self._mark_timeline("send_clicked")
             
             # 5. Wait for response lifecycle completion
             log(f"Waiting for response...", f"Worker {self.worker_id}")
@@ -1665,9 +1811,13 @@ class GeminiWebAutomation(BaseAutomation):
             wait_failure_reason = None
 
             saw_stop = False
+            stop_logged = False
             terminal_started_at = None
             empty_stuck_started_at = None
             no_progress_started_at = None
+            first_response_node_logged = False
+            first_response_char_logged = False
+            copy_seen_logged = False
 
             last_snapshot = pre_send_snapshot
             last_progress = time.time()
@@ -1695,11 +1845,25 @@ class GeminiWebAutomation(BaseAutomation):
 
                 if snapshot.get("stop_visible"):
                     saw_stop = True
+                    if not stop_logged:
+                        stop_logged = True
+                        self._mark_timeline("stop_visible")
+
+                if (not first_response_node_logged) and snapshot.get("response_count", 0) > pre_send_response_count:
+                    first_response_node_logged = True
+                    self._mark_timeline("first_response_node")
+
+                if (not first_response_char_logged) and snapshot.get("last_response_len", 0) > (pre_send_last_len + 20):
+                    first_response_char_logged = True
+                    self._mark_timeline("first_response_char", chars=snapshot.get("last_response_len", 0))
 
                 # New assistant copy button is the strongest terminal signal
                 if snapshot.get("response_copy_count", 0) > pre_send_count:
                     latest_btn, active_copy_selector, _ = await self._find_latest_response_copy_button(pre_send_count)
                     if latest_btn and (not snapshot.get("stop_visible") or snapshot.get("send_visible")):
+                        if not copy_seen_logged:
+                            copy_seen_logged = True
+                            self._mark_timeline("response_copy_seen")
                         copy_btn = latest_btn
                         copy_selector = active_copy_selector or copy_selector
                         break
@@ -1717,6 +1881,7 @@ class GeminiWebAutomation(BaseAutomation):
                     # No copy button, but assistant text exists -> terminal without copy
                     if has_new_output and snapshot.get("last_response_len", 0) > 20:
                         wait_failure_reason = "terminal_no_copy_button"
+                        self._mark_timeline("terminal_no_copy")
                         break
 
                     if (now - terminal_started_at) >= terminal_grace_seconds:
@@ -1724,6 +1889,7 @@ class GeminiWebAutomation(BaseAutomation):
                             wait_failure_reason = f"terminal_error_banner: {snapshot.get('error_banner_text')[:120]}"
                         else:
                             wait_failure_reason = "terminal_no_output_after_stop"
+                        self._mark_timeline("terminal_without_output")
                         break
                 else:
                     terminal_started_at = None
@@ -1739,16 +1905,19 @@ class GeminiWebAutomation(BaseAutomation):
                         empty_stuck_started_at = now
                     elif (now - empty_stuck_started_at) >= stuck_empty_seconds:
                         wait_failure_reason = f"stuck_empty_no_output_{stuck_empty_seconds}s"
+                        self._mark_timeline("stuck_empty", seconds=stuck_empty_seconds)
                         break
 
                 if snapshot.get("stop_visible") and no_progress_started_at is not None:
                     if (now - no_progress_started_at) >= stuck_no_progress_seconds:
                         wait_failure_reason = f"stuck_no_progress_{stuck_no_progress_seconds}s"
+                        self._mark_timeline("stuck_no_progress", seconds=stuck_no_progress_seconds)
                         break
 
                 # Idle wait timeout when generation is not active and no progress observed
                 if (not snapshot.get("stop_visible")) and ((now - last_progress) > idle_timeout):
                     wait_failure_reason = f"idle_timeout_{idle_timeout}s"
+                    self._mark_timeline("idle_timeout", seconds=idle_timeout)
                     break
 
                 if (now - last_log) >= wait_log_interval:
@@ -1792,6 +1961,7 @@ class GeminiWebAutomation(BaseAutomation):
                             f"Completed without response copy button ({timeout_reason}); used DOM fallback",
                             f"Worker {self.worker_id}"
                         )
+                        self._mark_timeline("done_via_dom_fallback")
                         return fallback
 
                 if timeout_reason.startswith("timeout_"):
@@ -1811,6 +1981,7 @@ class GeminiWebAutomation(BaseAutomation):
                     timeout_reason = f"Wait failed: {timeout_reason}"
 
                 timeout_reason = f"{timeout_reason} [code={reason_code}]"
+                self._mark_timeline("wait_failed", code=reason_code)
 
                 if generation_active:
                     timeout_reason = f"{timeout_reason} (generation still active)"
@@ -1821,6 +1992,7 @@ class GeminiWebAutomation(BaseAutomation):
 
                 fallback = await self._fallback_extract()
                 if fallback.get("success"):
+                    self._mark_timeline("done_via_final_fallback")
                     return fallback
                 return {"success": False, "error": timeout_reason}
 
@@ -1846,14 +2018,17 @@ class GeminiWebAutomation(BaseAutomation):
             
             if not markdown:
                 log(f"Clipboard empty, using fallback extraction", f"Worker {self.worker_id}")
+                self._mark_timeline("clipboard_empty")
                 await self._track_error("Clipboard extraction failed, using DOM fallback", "copy_btn", "extract_response")
                 return await self._fallback_extract()
 
             log(f"✅ Response: {len(markdown)} chars", f"Worker {self.worker_id}")
+            self._mark_timeline("done_success", response_chars=len(markdown))
             return {"success": True, "response": markdown.strip()}
 
         except Exception as e:
             self._generation_in_progress = False
+            self._mark_timeline("exception", error=str(e)[:120])
             log(f"❌ Error: {e}", f"Worker {self.worker_id}")
             
             # Force refresh to reset page state for next request
@@ -1867,6 +2042,7 @@ class GeminiWebAutomation(BaseAutomation):
             return await self._fallback_extract()
         finally:
             self._generation_in_progress = False
+            self._last_request_finished_ts = time.time()
 
     async def _fallback_extract(self) -> Dict:
         """Fallback extraction via DOM if copy button fails."""
@@ -2328,17 +2504,25 @@ class WorkerPool:
         
         for attempt in range(MAX_RETRIES):
             # Acquire semaphore (limits concurrent requests to N workers)
+            semaphore_wait_start = time.time()
             async with self._browser_semaphore:
-                
+                semaphore_wait_ms = int((time.time() - semaphore_wait_start) * 1000)
+                if semaphore_wait_ms > 2000:
+                    log(f"Semaphore wait: {semaphore_wait_ms}ms", "WorkerPool")
+                 
                 # Get available worker, excluding already-tried workers
+                assignment_start = time.time()
                 worker_index, worker = await self._get_available_worker(exclude=tried_workers)
-                
+                assignment_wait_ms = int((time.time() - assignment_start) * 1000)
+                if assignment_wait_ms > 2000:
+                    log(f"Worker assignment wait: {assignment_wait_ms}ms", "WorkerPool")
+                 
                 if worker is None:
                     log(f"⚠️ No available workers left to try", "WorkerPool")
                     break
-                
+                 
                 tried_workers.add(worker_index)
-                
+                 
                 try:
                     result = await worker.send_message(prompt, model, thinking_level, use_search, images)
                     

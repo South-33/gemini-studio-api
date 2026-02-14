@@ -94,6 +94,8 @@ WAIT_LOG_INTERVAL_SECONDS=10  # Wait-loop telemetry interval
 STUCK_EMPTY_SECONDS=45        # Stop-visible + zero-output stuck threshold
 STUCK_NO_PROGRESS_SECONDS=90  # Stop-visible + no-progress stuck threshold
 TERMINAL_GRACE_SECONDS=5      # Grace after Stop->Send before terminal decision
+IDLE_WAKE_REFRESH_SECONDS=1200 # Refresh tab before request after long idle
+REQUEST_TIMELINE_LIMIT=80      # Timeline events stored per request for diagnostics
 
 # Discord Notifications (optional)
 DISCORD_WEBHOOK=https://discord.com/api/webhooks/...
@@ -241,8 +243,10 @@ Returns:
 - **Fallback Selectors** - Uses structural selectors (`role`, `contenteditable`) that survive UI text changes
 - **Request-Level Retry** - Failed requests automatically retry on different workers
 - **Periodic Refresh** - Browser tabs refresh every 10 requests to clear cache
+- **Idle Wake Refresh** - Refreshes long-idle tabs before handling a new request
 - **Overlay Dismissal** - Clears stuck modals/menus before each request
 - **Idle Keepalive (optional)** - Detects/recover stale `Stop response` states while idle
+- **Timeline Diagnostics** - Request lifecycle timeline included in diagnostics/error context
 - **Error Tracking** - All errors logged with selector, action, and timestamp
 - **Discord Alerts** - Optional notifications with 5-minute cooldown to prevent spam
 
