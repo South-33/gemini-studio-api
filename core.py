@@ -2,7 +2,6 @@ import asyncio
 import base64
 import os
 import sys
-import re
 import random
 import time
 import uuid
@@ -10,7 +9,7 @@ from datetime import datetime
 from typing import List, Dict, Optional, Tuple
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page, Route
 
-# Import notifier (won't crash if aiohttp not installed)
+# Import notifier (optional runtime dependency)
 from notifier import notify_error
 
 # --- Timestamped Logging (use stderr - always unbuffered) ---
@@ -658,335 +657,74 @@ class GeminiWebAutomation(BaseAutomation):
             cls._clipboard_lock = asyncio.Lock()
         return cls._clipboard_lock
     
-    # Keyword synonyms for resilient model matching
-    # If Google changes "Thinking" to "Deep Thinking", the "think" keyword still matches
-    MODEL_KEYWORDS = {
-        "thinking": ["think", "reason", "complex", "problem", "deep"],
-        "pro": ["pro", "advanced", "longer", "math", "code"],
-        "fast": ["fast", "quick", "flash", "answer", "speed"],
-        "auto": ["auto", "default", "automatic"],
-    }
-    
-    # Selectors with fallbacks - each key maps to a list of selectors to try in order
-    # STRATEGY: Put STABLE structural selectors FIRST, volatile text-based ones LAST
-    # Structural (role, contenteditable) > Class-based > aria-label text
-    # Last updated: 2026-02-12
+    # Stable selectors (minimal fallbacks only)
     SELECTORS = {
-        # INPUT: Most volatile - Google changes aria-label text frequently
-        # Priority: structural > class > partial keywords (NO exact text matches)
-        "input": [
-            'div[role="textbox"][aria-label="Enter a prompt for Gemini"]',  # Current Gemini label
-            'div[role="textbox"][contenteditable="true"]',  # STABLE: structural attributes
-            '.ql-editor.textarea',  # Class-based (Quill editor)
-            '.new-input-ui[role="textbox"]',  # New input UI class fallback
-            'div.ql-editor[contenteditable="true"]',  # Quill + structural
-            'div[aria-label*="prompt" i][contenteditable="true"]',  # Keyword: "prompt"
-            'div[aria-label*="Gemini" i][contenteditable="true"]',  # Keyword: "Gemini"
-            'div[aria-label*="Ask" i][contenteditable="true"]',  # Keyword: "Ask"
-            'div[aria-label*="Enter" i][contenteditable="true"]',  # Keyword: "Enter"
-            'div[aria-label*="message" i][contenteditable="true"]',  # Keyword: "message"
-            'div[aria-label*="chat" i][contenteditable="true"]',  # Keyword: "chat"
-        ],
-        # SEND: Button near input - use class and partial keywords only
-        "send_btn": [
-            'button[aria-label="Send message"]',  # Current Gemini label
-            'button.send-button',  # Class-based - more stable
-            'button[aria-label*="Send" i]',  # Keyword: "Send"
-            'button[aria-label*="Submit" i]',  # Keyword: "Submit"
-            '[aria-label*="Send" i]',  # Any element with Send
-        ],
-        # MODEL: The dropdown to switch Fast/Pro/Thinking
-        "model_btn": [
-            'button[aria-label="Open mode picker"]',  # Current Gemini label
-            'button.input-area-switch',  # Class-based
-            'button.mat-mdc-menu-trigger',  # Angular trigger fallback
-            '.input-area-switch',  # Any element with this class
-            'button:has-text("Fast")',  # Text-based fallbacks
-            'button:has-text("Pro")',
-            'button:has-text("Thinking")',
-        ],
-        # NEW CHAT: Now an <a> tag - use URL and keywords
-        "new_chat": [
-            'a[aria-label="New chat"]',  # Current Gemini label
-            'a[href="/app"]',  # URL-based - very stable!
-            '.side-nav-action-button',  # Class-based
-            'a[aria-label*="New" i]',  # Keyword: "New"
-            'button[aria-label*="New" i]',  # Button fallback with keyword
-            'a[aria-label*="chat" i]',  # Keyword: "chat"
-        ],
-        # TEMP CHAT: Toggle button - keywords only
-        "temp_chat": [
-            'button[aria-label="Temporary chat"]',  # Current Gemini label
-            'button.temp-chat-button',  # Class-based
-            '[aria-label*="Temporary" i]',  # Keyword: "Temporary"
-            '[aria-label*="temp" i]',  # Keyword: "temp"
-        ],
-        "temp_chat_active": [
-            'button.temp-chat-button.temp-chat-on',  # Class-based active state
-            'button[aria-label*="Temporary" i][aria-pressed="true"]',  # aria-pressed
-            '[aria-label*="Temporary" i].temp-chat-on',  # Keyword + class
-        ],
-        # SIDEBAR: Hamburger menu - keywords only
-        "sidebar_toggle": [
-            'button[aria-label="Main menu"]',  # Current Gemini label
-            'button.main-menu-button',  # Class-based fallback
-            'button[aria-label*="menu" i]',  # Keyword: "menu"
-            'button[aria-label*="Menu" i]',  # Keyword: "Menu" (case variation)
-            'button[aria-label*="sidebar" i]',  # Keyword: "sidebar"
-            'button[aria-label*="navigation" i]',  # Keyword: "navigation"
-        ],
-        # COPY: Generic action, unlikely to change
-        "copy_btn": [
-            'button[aria-label="Copy"]',  # Exact - "Copy" is universal
-            'button[aria-label*="Copy" i]',  # Partial fallback
-            'button.copy-button',  # Class-based fallback
-        ],
-        # MENU: Standard accessibility roles - very stable
-        "menu_panel": [
-            '[role="menu"]',  # STABLE: accessibility standard
-            '[role="listbox"]',  # Alternative menu pattern
-            '.mat-mdc-menu-panel',  # Angular Material
-        ],
-        "menu_item": [
-            '[role="option"]',  # Listbox pattern (Gemini uses this)
-            '[role="menuitem"]',  # Standard menu pattern
-            '[role="listitem"]',  # Alternative
-            '.mat-mdc-menu-item',  # Angular Material
-        ],
-        # OVERLAY: Angular CDK internal - stable
-        "overlay_backdrop": [
-            '.cdk-overlay-backdrop',  # STABLE: Angular CDK
-            '.cdk-overlay-backdrop-showing',  # Visible backdrop class
-            '.cdk-overlay-container .cdk-overlay-backdrop',  # More specific
-        ]
+        "input": 'div[role="textbox"][aria-label="Enter a prompt for Gemini"]',
+        "input_fallback": 'div[role="textbox"][contenteditable="true"]',
+        "send_btn": 'button[aria-label="Send message"]',
+        "model_btn": 'button[aria-label="Open mode picker"]',
+        "model_btn_fallback": '.input-area-switch',
+        "new_chat": 'a[aria-label="New chat"]',
+        "new_chat_fallback": 'a[href="/app"]',
+        "temp_chat": 'button[aria-label="Temporary chat"]',
+        "temp_chat_active": 'button[aria-label*="Temporary" i][aria-pressed="true"]',
+        "sidebar_toggle": 'button[aria-label="Main menu"]',
+        "copy_btn": 'button[aria-label="Copy"]',
+        "menu_panel": '.mat-mdc-menu-panel',
+        "menu_item": '.mat-mdc-menu-item'
     }
-    
-    # Error tracking for diagnostics
-    _last_errors: Dict[int, Dict] = {}  # worker_id -> {error, selector, action, timestamp}
+
+    # Error tracking for diagnostics endpoint
+    _last_errors: Dict[int, Dict] = {}
     
     def __init__(self, worker_id: int = 0):
         super().__init__()
         self.worker_id = worker_id  # For logging
         self._request_count = 0
         self._request_id = None  # Set per-request for log tracing
-        self._request_start_ts = 0.0
-        self._last_request_finished_ts = time.time()
-        self._idle_wake_refresh_seconds = max(0, int(os.getenv("IDLE_WAKE_REFRESH_SECONDS", "1200")))
-        self._timeline_limit = max(20, int(os.getenv("REQUEST_TIMELINE_LIMIT", "80")))
-        self._request_timeline: List[Dict] = []
-        self._diag_hooks_attached = False
 
-    def _get_selector(self, key: str) -> str:
-        """Get the first selector from a selector group (for backward compatibility)."""
-        selectors = self.SELECTORS.get(key, [])
-        if isinstance(selectors, list) and len(selectors) > 0:
-            return selectors[0]
-        elif isinstance(selectors, str):
-            return selectors
-        return ""
-    
-    def _get_all_selectors(self, key: str) -> List[str]:
-        """Get all selectors for a key as a list."""
-        selectors = self.SELECTORS.get(key, [])
-        if isinstance(selectors, list):
-            return selectors
-        elif isinstance(selectors, str):
-            return [selectors]
-        return []
-
-    def _get_response_copy_selectors(self) -> List[str]:
-        """Selectors that target assistant response copy buttons only."""
-        return [
-            '[data-content-type="response"] button[aria-label="Copy"]',
-            'model-response button[aria-label="Copy"]',
-            'assistant-message-content button[aria-label="Copy"]',
-        ]
-
-    async def _resolve_visible_selector(self, key: str, timeout: int = 1500) -> str:
-        """Resolve the first visible selector from a selector group."""
-        for selector in self._get_all_selectors(key):
-            try:
-                await self.page.wait_for_selector(selector, state="visible", timeout=timeout)
-                return selector
-            except:
-                continue
-        return self._get_selector(key)
-
-    async def _find_latest_response_copy_button(self, min_count: int = 0):
-        """Find the latest assistant response copy button, above a baseline count."""
-        best_selector = None
-        best_count = 0
-        best_locator = None
-
-        for selector in self._get_response_copy_selectors():
-            try:
-                locator = self.page.locator(selector)
-                count = await locator.count()
-                if count > best_count:
-                    best_count = count
-                    best_selector = selector
-                    best_locator = locator
-            except:
-                continue
-
-        if not best_locator or best_count <= min_count:
-            return None, best_selector, best_count
-
-        for i in range(best_count - 1, -1, -1):
-            try:
-                candidate = best_locator.nth(i)
-                if await candidate.is_visible():
-                    return candidate, best_selector, best_count
-            except:
-                continue
-
-        return None, best_selector, best_count
-
-    def _mark_timeline(self, event: str, **data):
-        """Record request lifecycle events for diagnostics."""
-        now = time.time()
-        entry = {
-            "ts": datetime.now().isoformat(),
-            "event": event,
-        }
-        if self._request_start_ts:
-            entry["t_ms"] = int((now - self._request_start_ts) * 1000)
-        if data:
-            entry.update(data)
-
-        self._request_timeline.append(entry)
-        if len(self._request_timeline) > self._timeline_limit:
-            self._request_timeline = self._request_timeline[-self._timeline_limit:]
-
-    def _timeline_tail(self, count: int = 12) -> List[str]:
-        """Compact timeline tail for logs/Discord diagnostics."""
-        tail = self._request_timeline[-count:]
-        compact = []
-        for item in tail:
-            t_ms = item.get("t_ms", 0)
-            event = item.get("event", "unknown")
-            compact.append(f"{t_ms}ms:{event}")
-        return compact
-
-    async def _idle_wake_refresh_if_needed(self):
-        """Refresh tab before request if worker has been idle for long enough."""
-        if self._idle_wake_refresh_seconds <= 0:
-            return
-
-        idle_for = time.time() - self._last_request_finished_ts
-        if idle_for < self._idle_wake_refresh_seconds:
-            return
-
-        self._mark_timeline("idle_refresh_triggered", idle_for_s=int(idle_for))
-        log(
-            f"Idle wake refresh after {int(idle_for)}s idle",
-            f"Worker {self.worker_id}"
-        )
-
-        await self.page.reload(wait_until="domcontentloaded", timeout=30000)
-        input_ready = False
-        for selector in self._get_all_selectors("input"):
-            try:
-                await self.page.wait_for_selector(selector, state="visible", timeout=6000)
-                input_ready = True
-                break
-            except:
-                continue
-
-        if not input_ready:
-            self._mark_timeline("idle_refresh_input_not_ready")
-            log("Input not immediately visible after idle refresh", f"Worker {self.worker_id}")
-        else:
-            self._mark_timeline("idle_refresh_done")
-
-        await self._human_delay(400, 700)
-
-    def _attach_page_diagnostics(self):
-        """Attach browser-level diagnostics hooks once per worker page."""
-        if self._diag_hooks_attached or not self.page:
-            return
-
-        def on_page_error(exc):
-            try:
-                msg = str(exc).replace("\n", " ")[:220]
-                log(f"[{self._request_id or 'no-req'}] Page error: {msg}", f"Worker {self.worker_id}")
-            except:
-                pass
-
-        def on_request_failed(req):
-            try:
-                url = (getattr(req, "url", "") or "")[:160]
-                resource = getattr(req, "resource_type", "") or ""
-                failure = ""
-                try:
-                    failure_obj = req.failure
-                    if isinstance(failure_obj, dict):
-                        failure = (failure_obj.get("errorText") or "")[:160]
-                except:
-                    pass
-
-                if resource in ["xhr", "fetch", "websocket", "document"]:
-                    log(
-                        f"[{self._request_id or 'no-req'}] Request failed: {resource} {url} {failure}",
-                        f"Worker {self.worker_id}"
-                    )
-            except:
-                pass
-
-        def on_console(msg):
-            try:
-                msg_type = (getattr(msg, "type", "") or "").lower()
-                text = (getattr(msg, "text", "") or "").replace("\n", " ")[:220]
-                if msg_type in ["error", "warning"]:
-                    log(
-                        f"[{self._request_id or 'no-req'}] Console {msg_type}: {text}",
-                        f"Worker {self.worker_id}"
-                    )
-            except:
-                pass
-
-        self.page.on("pageerror", on_page_error)
-        self.page.on("requestfailed", on_request_failed)
-        self.page.on("console", on_console)
-        self._diag_hooks_attached = True
-
-    async def _get_generation_snapshot(self) -> Dict:
-        """Capture current generation lifecycle signals from Gemini UI."""
+    async def _capture_state_snapshot(self) -> Dict:
+        """Capture compact UI state for timeout/stuck diagnostics."""
         snapshot = {
+            "url": "",
             "stop_visible": False,
             "send_visible": False,
+            "copy_count": 0,
             "response_count": 0,
             "last_response_len": 0,
             "last_response_tail": "",
-            "response_copy_count": 0,
-            "prompt_copy_count": 0,
-            "error_banner_text": "",
+            "active_button": "",
         }
 
         if not self.page:
             return snapshot
 
         try:
-            metrics = await self.page.evaluate('''
+            snapshot["url"] = self.page.url
+        except:
+            pass
+
+        try:
+            data = await self.page.evaluate('''
                 () => {
                     const isVisible = (el) => {
                         if (!el) return false;
                         const style = window.getComputedStyle(el);
-                        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
-                            return false;
-                        }
+                        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
                         return !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
                     };
 
-                    const findButton = (predicate) => {
-                        const buttons = Array.from(document.querySelectorAll('button'));
-                        return buttons.find((btn) => {
-                            if (!isVisible(btn)) return false;
-                            const label = (btn.getAttribute('aria-label') || '').toLowerCase();
-                            const text = (btn.innerText || '').toLowerCase();
-                            return predicate(label, text);
-                        }) || null;
-                    };
+                    const buttons = Array.from(document.querySelectorAll('button')).filter(isVisible);
+                    const stopBtn = buttons.find((b) => {
+                        const label = (b.getAttribute('aria-label') || '').toLowerCase();
+                        const text = (b.innerText || '').toLowerCase();
+                        return label.includes('stop') || text.includes('stop');
+                    });
+                    const sendBtn = buttons.find((b) => {
+                        const label = (b.getAttribute('aria-label') || '').toLowerCase();
+                        const text = (b.innerText || '').toLowerCase();
+                        return label.includes('send') || text.includes('send');
+                    });
 
                     let responses = document.querySelectorAll('[data-content-type="response"]');
                     if (responses.length === 0) {
@@ -995,368 +733,76 @@ class GeminiWebAutomation(BaseAutomation):
                     const last = responses.length ? responses[responses.length - 1] : null;
                     const lastText = last ? (last.innerText || '') : '';
 
-                    const responseCopy = document.querySelectorAll(
-                        '[data-content-type="response"] button[aria-label="Copy"], ' +
-                        'model-response button[aria-label="Copy"], ' +
-                        'assistant-message-content button[aria-label="Copy"]'
-                    );
-
-                    const promptCopy = document.querySelectorAll('button[aria-label*="Copy prompt" i]');
-
-                    const bannerSelectors = [
-                        '[role="alert"]',
-                        '[aria-live="polite"]',
-                        '[aria-live="assertive"]',
-                        '.mat-mdc-snack-bar-container',
-                        '.toast',
-                        '.error',
-                        '.warning'
-                    ];
-
-                    const bannerTexts = [];
-                    for (const selector of bannerSelectors) {
-                        const nodes = Array.from(document.querySelectorAll(selector));
-                        for (const node of nodes) {
-                            if (!isVisible(node)) continue;
-                            const text = (node.innerText || '').trim();
-                            if (text) bannerTexts.push(text);
-                        }
-                    }
-
-                    const stopBtn = findButton((label, text) => label.includes('stop response') || label === 'stop' || text.includes('stop'));
-                    const sendBtn = findButton((label, text) => label.includes('send message') || label === 'send' || text.includes('send'));
-
                     return {
                         stop_visible: !!stopBtn,
                         send_visible: !!sendBtn,
+                        active_button: (stopBtn?.getAttribute('aria-label') || stopBtn?.innerText || sendBtn?.getAttribute('aria-label') || sendBtn?.innerText || '').trim().slice(0, 80),
+                        copy_count: document.querySelectorAll('button[aria-label="Copy"]').length,
                         response_count: responses.length,
                         last_response_len: lastText.length,
-                        last_response_tail: lastText.slice(-160),
-                        response_copy_count: responseCopy.length,
-                        prompt_copy_count: promptCopy.length,
-                        error_banner_text: bannerTexts.join(' | ').slice(0, 400),
+                        last_response_tail: lastText.slice(-120),
                     };
                 }
             ''')
-
-            snapshot.update(metrics or {})
+            if isinstance(data, dict):
+                snapshot.update(data)
         except:
             pass
 
         return snapshot
-    
-    async def _find_element(self, key: str, timeout: int = 5000, description: str = None, track_error: bool = True):
-        """
-        Try all selectors for a key until one finds a visible element.
-        Returns (locator, selector_used) or (None, None) if all fail.
-        """
-        desc = description or key
-        selectors = self._get_all_selectors(key)
-        
-        for selector in selectors:
-            try:
-                locator = self.page.locator(selector).first
-                # Quick visibility check
-                if await locator.is_visible():
-                    return locator, selector
-            except:
-                continue
-        
-        # None found immediately visible, try waiting for first selector
-        if selectors:
-            try:
-                locator = self.page.locator(selectors[0]).first
-                await locator.wait_for(state="visible", timeout=timeout)
-                return locator, selectors[0]
-            except:
-                pass
-        
-        # Track the failure (optional for non-critical probes)
-        if track_error:
-            await self._track_error(f"Element not found: {desc}", key, desc)
-        return None, None
-    
-    def _matches_model(self, item_text: str, model_name: str) -> bool:
-        """Check if menu item matches requested model using token-safe matching."""
-        model_lower = model_name.lower().strip()
 
-        # Menu items often contain two lines: title + description.
-        # Prefer title for matching, then fall back to full text tokens.
-        lines = [line.strip().lower() for line in item_text.splitlines() if line.strip()]
-        title_text = lines[0] if lines else item_text.lower().strip()
-        full_text = " ".join(lines) if lines else item_text.lower().strip()
-
-        title_tokens = re.findall(r"[a-z0-9]+", title_text)
-        full_tokens = re.findall(r"[a-z0-9]+", full_text)
-
-        def token_match(token: str, keyword: str) -> bool:
-            # Short keywords like "pro" must match exactly (avoid matching "problems").
-            if len(keyword) <= 3:
-                return token == keyword
-            # Longer keywords can match simple inflections like "problem" -> "problems".
-            return token == keyword or token.startswith(keyword)
-
-        # Direct model match: strict token match first on title, then full text.
-        if any(token_match(token, model_lower) for token in title_tokens):
-            return True
-        if any(token_match(token, model_lower) for token in full_tokens):
-            return True
-
-        # Keyword fallback (token-safe)
-        keywords = self.MODEL_KEYWORDS.get(model_lower, [])
-        for keyword in keywords:
-            kw = keyword.lower().strip()
-            if not kw:
-                continue
-            if any(token_match(token, kw) for token in title_tokens):
-                return True
-            if any(token_match(token, kw) for token in full_tokens):
-                return True
-
-        return False
-
-    def _get_position_fallback(self, model_name: str, item_count: int) -> int:
-        """Get position-based fallback index (cheap to expensive = top to bottom)."""
-        model_lower = model_name.lower()
-
-        if item_count <= 0:
-            return -1
-
-        if model_lower == "pro":
-            return item_count - 1
-        if model_lower == "thinking":
-            return max(0, item_count - 2)
-        if model_lower == "fast":
-            return 1 if item_count > 3 else 0
-        if model_lower == "auto":
-            return 0
-
-        return -1
-
-    async def _is_generation_active(self) -> bool:
-        """Check if the UI indicates generation is still running."""
-        snapshot = await self._get_generation_snapshot()
-        if snapshot.get("stop_visible"):
-            return True
-
-        selectors = list(self._get_all_selectors("send_btn"))
-        selectors.append('button[aria-label="Stop response"]')
-        selectors.append('button[aria-label*="Stop" i]')
-        selectors.append('button:has-text("Stop")')
-
-        for selector in selectors:
-            try:
-                locator = self.page.locator(selector).first
-                if not await locator.is_visible():
-                    continue
-
-                aria_label = await locator.get_attribute("aria-label")
-                if aria_label and "stop" in aria_label.lower():
-                    return True
-
-                text = await locator.inner_text()
-                if text and "stop" in text.lower():
-                    return True
-            except:
-                continue
-
-        return False
-
-    async def _stop_generation_if_active(self, wait_timeout_ms: int = 8000) -> bool:
-        """Attempt to stop active generation and wait until UI leaves Stop state."""
-        try:
-            if not await self._is_generation_active():
-                return True
-
-            stop_selectors = [
-                'button[aria-label="Stop response"]',
-                'button[aria-label*="Stop" i]',
-                'button:has-text("Stop")',
-            ]
-
-            clicked = False
-            for selector in stop_selectors:
-                try:
-                    locator = self.page.locator(selector).first
-                    if not await locator.is_visible():
-                        continue
-                    await locator.click(timeout=2000)
-                    clicked = True
-                    break
-                except:
-                    continue
-
-            if not clicked:
-                return False
-
-            end = time.time() + (wait_timeout_ms / 1000)
-            while time.time() < end:
-                if not await self._is_generation_active():
-                    await self._human_delay(120, 250)
-                    return True
-                await asyncio.sleep(0.25)
-
-            return False
-        except:
-            return False
-
-    async def _recover_stuck_generation(self) -> bool:
-        """Recover worker if previous request left the tab stuck in Stop state."""
-        try:
-            if not await self._is_generation_active():
-                return True
-
-            log("Detected active generation from previous state; recovering", f"Worker {self.worker_id}")
-
-            if await self._stop_generation_if_active(wait_timeout_ms=8000):
-                return True
-
-            log("Stop click did not recover state, reloading tab", f"Worker {self.worker_id}")
-            await self.page.reload(wait_until="domcontentloaded", timeout=30000)
-
-            for selector in self._get_all_selectors("input"):
-                try:
-                    await self.page.wait_for_selector(selector, state="visible", timeout=6000)
-                    break
-                except:
-                    continue
-
-            return not await self._is_generation_active()
-        except Exception as e:
-            log(f"Recovery failed: {e}", f"Worker {self.worker_id}")
-            return False
-
-    async def _collect_error_context(self) -> Dict:
-        """Collect compact UI state for error diagnostics."""
-        context = {
-            "request_id": self._request_id,
-            "url": "",
-            "overlay_count": 0,
-            "copy_count": 0,
-            "prompt_copy_count": 0,
-            "response_count": 0,
-            "last_response_len": 0,
-            "last_response_tail": "",
-            "stop_visible": False,
-            "send_visible": False,
-            "error_banner_text": "",
-            "active_button": "",
-            "timeline": [],
-        }
-
-        if not self.page:
-            return context
-
-        try:
-            context["url"] = self.page.url
-        except:
-            pass
-
-        try:
-            context["overlay_count"] = await self.page.locator('.cdk-overlay-backdrop').count()
-        except:
-            pass
-
-        try:
-            snapshot = await self._get_generation_snapshot()
-            context["copy_count"] = snapshot.get("response_copy_count", 0)
-            context["response_count"] = snapshot.get("response_count", 0)
-            context["last_response_len"] = snapshot.get("last_response_len", 0)
-            context["last_response_tail"] = snapshot.get("last_response_tail", "")
-            context["stop_visible"] = snapshot.get("stop_visible", False)
-            context["send_visible"] = snapshot.get("send_visible", False)
-            context["prompt_copy_count"] = snapshot.get("prompt_copy_count", 0)
-            context["error_banner_text"] = snapshot.get("error_banner_text", "")
-        except:
-            pass
-
-        selectors = ['button[aria-label="Stop response"]'] + self._get_all_selectors("send_btn")
-        for selector in selectors:
-            try:
-                locator = self.page.locator(selector).first
-                if not await locator.is_visible():
-                    continue
-
-                aria_label = await locator.get_attribute("aria-label")
-                text = await locator.inner_text()
-                label = (aria_label or text or "").strip().replace("\n", " ")
-                context["active_button"] = label[:80]
-                break
-            except:
-                continue
-
-        context["timeline"] = self._timeline_tail(12)
-
-        return context
-
-    def _format_error_context(self, context: Dict) -> str:
-        """Format compact error context for logs/notifications."""
-        tail = (context.get("last_response_tail") or "").replace("\n", " ").strip()
-        if len(tail) > 120:
-            tail = tail[-120:]
-
-        parts = [
-            f"req={context.get('request_id') or 'unknown'}",
-            f"url={context.get('url') or 'unknown'}",
-            f"btn={context.get('active_button') or 'none'}",
-            f"stop={context.get('stop_visible')}",
-            f"send={context.get('send_visible')}",
-            f"copy={context.get('copy_count', 0)}",
-            f"prompt_copy={context.get('prompt_copy_count', 0)}",
-            f"resp={context.get('response_count', 0)}",
-            f"resp_len={context.get('last_response_len', 0)}",
-            f"overlay={context.get('overlay_count', 0)}",
-        ]
-
-        if context.get("error_banner_text"):
-            parts.append(f"banner={context.get('error_banner_text')[:120]}")
-
-        timeline_tail = context.get("timeline") or []
-        if timeline_tail:
-            parts.append(f"timeline={';'.join(timeline_tail[-4:])}")
-
-        if tail:
-            parts.append(f"tail={tail}")
-
-        return " | ".join(parts)
-    
-    async def _track_error(self, error: str, selector_key: str, action: str):
-        """Track error for diagnostics endpoint and send Discord notification."""
-        context = await self._collect_error_context()
-        context_line = self._format_error_context(context)
-
-        GeminiWebAutomation._last_errors[self.worker_id] = {
+    def _track_error(self, error: str, selector_key: str, action: str, context: Optional[Dict] = None):
+        payload = {
             "error": error,
             "selector_key": selector_key,
             "action": action,
             "timestamp": datetime.now().isoformat(),
             "worker_id": self.worker_id,
             "request_id": self._request_id,
-            "context": context,
+            "context": context or {},
         }
+        GeminiWebAutomation._last_errors[self.worker_id] = payload
         log(f"Error tracked: {error} (selector: {selector_key}, action: {action})", f"Worker {self.worker_id}")
-        log(f"Error context: {context_line}", f"Worker {self.worker_id}")
 
+        # Best-effort async Discord notification (non-blocking)
         try:
-            await self._screenshot_on_failure(f"error_{action}")
+            loop = asyncio.get_running_loop()
+            loop.create_task(
+                notify_error(error, selector_key, action, self.worker_id, diagnostics=payload.get("context") or {})
+            )
         except:
             pass
-        
-        # Send Discord notification (non-blocking, won't crash if fails)
-        try:
-            await notify_error(error, selector_key, action, self.worker_id, diagnostics=context)
-        except Exception as e:
-            log(f"Discord notification failed: {e}", f"Worker {self.worker_id}")
-    
+
     @classmethod
     def get_all_errors(cls) -> Dict[int, Dict]:
-        """Get all tracked errors (for diagnostics endpoint)."""
         return cls._last_errors.copy()
-    
+
     @classmethod
     def clear_errors(cls):
-        """Clear all tracked errors."""
         cls._last_errors.clear()
+
+    def _matches_model(self, item_text: str, model_name: str) -> bool:
+        """Token-safe model matching to avoid 'pro' matching 'problem'."""
+        if not item_text or not model_name:
+            return False
+
+        import re
+
+        text = item_text.lower()
+        tokens = re.findall(r"[a-z0-9]+", text)
+        target = model_name.lower().strip()
+        if target in tokens:
+            return True
+
+        aliases = {
+            "thinking": ["thinking", "reasoning"],
+            "fast": ["fast", "flash"],
+            "pro": ["pro", "advanced"],
+        }
+        for alias in aliases.get(target, [target]):
+            if alias in tokens:
+                return True
+        return False
 
     async def _screenshot_on_failure(self, action_name: str):
         """
@@ -1498,32 +944,25 @@ class GeminiWebAutomation(BaseAutomation):
     async def init_with_page(self, page: Page, context: BrowserContext) -> bool:
         self.page = page
         self.context = context
-        self._attach_page_diagnostics()
         try:
-            # Wait for input to be ready (login check) - try all selectors
-            input_found = False
-            selectors = self._get_all_selectors("input")
-            
-            for selector in selectors:
+            # Wait for input to be ready (login check)
+            input_ready = False
+            for key in ["input", "input_fallback"]:
+                selector = self.SELECTORS.get(key)
+                if not selector:
+                    continue
                 try:
-                    await self.page.wait_for_selector(selector, timeout=10000)
-                    input_found = True
-                    log(f"Input found with selector: {selector}", f"Worker {self.worker_id}")
+                    await self.page.wait_for_selector(selector, timeout=12000)
+                    input_ready = True
                     break
                 except:
                     continue
-            
-            if not input_found:
-                # Last attempt with longer timeout on first selector
-                try:
-                    await self.page.wait_for_selector(selectors[0], timeout=30000)
-                    input_found = True
-                except Exception as e:
-                    await self._track_error(f"Input not found: {e}", "input", "init")
-                    raise e
-            
+
+            if not input_ready:
+                raise Exception("Input textbox not found")
+
             await self._human_delay(500, 1000)
-            print("[GeminiWeb] Logged in and ready")
+            print("[GeminiWeb] ✅ Logged in and ready")
             
             # Default to Temporary Chat if possible for clean sessions
             await self._enable_temp_chat()
@@ -1532,59 +971,40 @@ class GeminiWebAutomation(BaseAutomation):
             self._initialized = True
             return True
         except Exception as e:
-            print(f"[GeminiWeb] Init failed: {e}")
-            await self._track_error(str(e), "input", "init")
+            print(f"[GeminiWeb] ❌ Init failed: {e}")
+            self._track_error(str(e), "input", "init")
             return False
 
     async def _enable_temp_chat(self):
         """Enable temporary chat mode."""
         try:
-            # Check if temp chat is already enabled using fallback selectors
-            for selector in self._get_all_selectors("temp_chat_active"):
-                try:
-                    locator = self.page.locator(selector).first
-                    if await locator.is_visible():
-                        return  # Already enabled
-                except:
-                    continue
+            temp_btn = self.page.locator(self.SELECTORS["temp_chat"])
             
-            # Try to find temp chat button (non-critical, so avoid immediate Discord error spam)
-            temp_btn, _ = await self._find_element(
-                "temp_chat",
-                timeout=3000,
-                description="Temporary chat button",
-                track_error=False,
-            )
+            # Check if temp chat is already enabled
+            temp_active = self.page.locator(self.SELECTORS["temp_chat_active"])
+            if await temp_active.count() > 0:
+                return
             
-            if temp_btn is None:
-                # Expand sidebar if button not visible
-                sidebar_btn, _ = await self._find_element(
-                    "sidebar_toggle",
-                    timeout=2500,
-                    description="Sidebar toggle",
-                    track_error=False,
-                )
-                if sidebar_btn:
+            # Expand sidebar if button not visible
+            if not await temp_btn.is_visible():
+                sidebar_btn = self.page.locator(self.SELECTORS["sidebar_toggle"])
+                if await sidebar_btn.is_visible():
                     await sidebar_btn.click()
                     await self._human_delay(300, 500)
-                    # Try again
-                    temp_btn, _ = await self._find_element(
-                        "temp_chat",
-                        timeout=3000,
-                        description="Temporary chat button",
-                        track_error=False,
-                    )
+                else:
+                    log("Temporary chat toggle hidden; continuing", f"Worker {self.worker_id}")
+                    return
             
-            if temp_btn and await temp_btn.is_visible():
-                await temp_btn.click()
-                await self._human_delay(200, 400)
-            else:
-                # Temporary chat is optional and may be hidden by UI/account state
-                log("Temporary chat toggle not visible; continuing", f"Worker {self.worker_id}")
+            # Click temp chat button
+            if await temp_btn.is_visible():
+                temp_active = self.page.locator(self.SELECTORS["temp_chat_active"])
+                if await temp_active.count() == 0:
+                    await temp_btn.click()
+                    await self._human_delay(200, 400)
                     
         except Exception as e:
-            log(f"Temp chat error: {e}", f"Worker {self.worker_id}")
-            await self._track_error(f"Temp chat toggle failed: {e}", "temp_chat", "enable_temp_chat")
+            log(f"⚠️ Temp chat error: {e}", f"Worker {self.worker_id}")
+            self._track_error(str(e), "temp_chat", "enable_temp_chat")
 
     async def send_message(self, prompt: str, model: str = None, thinking_level: str = None, use_search: bool = False, images: List[str] = None) -> Dict:
         if not self._initialized: 
@@ -1594,20 +1014,8 @@ class GeminiWebAutomation(BaseAutomation):
             self._generation_in_progress = True
             self._request_count += 1
             self._request_id = uuid.uuid4().hex[:8]  # Short ID for log tracing
-            self._request_start_ts = time.time()
-            self._request_timeline = []
-            idle_before = int(self._request_start_ts - self._last_request_finished_ts)
-            self._mark_timeline(
-                "request_start",
-                model=(model or "default"),
-                prompt_chars=len(prompt),
-                idle_before_s=max(0, idle_before),
-            )
             log(f"[{self._request_id}] Request: model={model}, prompt={len(prompt)} chars", f"Worker {self.worker_id}")
-
-            # Idle wake refresh after long inactivity
-            await self._idle_wake_refresh_if_needed()
-             
+            
             # 0. Dismiss any stuck overlays/modals (Angular Material CDK overlays block clicks)
             try:
                 await self.page.keyboard.press("Escape")
@@ -1620,103 +1028,64 @@ class GeminiWebAutomation(BaseAutomation):
                     await self._human_delay(200, 400)
             except:
                 pass
-
-            # 0.25 Recover if previous request left tab in Stop state
-            recovered = await self._recover_stuck_generation()
-            if not recovered:
-                reason = "Failed to recover from stuck generation state"
-                self._mark_timeline("preflight_recover_failed")
-                log(reason, f"Worker {self.worker_id}")
-                await self._track_error(reason, "send_btn", "preflight_recover")
-                return {"success": False, "error": reason}
-            self._mark_timeline("preflight_recover_ok")
             
             # 0.5 Periodic hard refresh to clear browser cache/memory
             if self._request_count >= self.REFRESH_EVERY_N_REQUESTS:
                 log(f"Hard refresh (request #{self._request_count})", f"Worker {self.worker_id}")
-                self._mark_timeline("periodic_refresh_start", request_count=self._request_count)
                 await self.page.reload(wait_until="domcontentloaded", timeout=30000)
-                input_ready = False
-                for selector in self._get_all_selectors("input"):
-                    try:
-                        await self.page.wait_for_selector(selector, state="visible", timeout=6000)
-                        input_ready = True
-                        break
-                    except:
-                        continue
-                if not input_ready:
-                    log("Input not immediately visible after hard refresh; continuing", f"Worker {self.worker_id}")
-                await self._human_delay(500, 900)
+                await self._human_delay(1000, 1500)
                 self._request_count = 0
-                self._mark_timeline("periodic_refresh_done")
             
             # 1. New Chat (starts fresh) - VERIFIED
-            async def get_copy_state() -> Tuple[int, str]:
-                # Prefer assistant-response copy buttons. Avoid user "Copy prompt" buttons.
-                candidate_selectors = [
-                    '[data-content-type="response"] button[aria-label="Copy"]',
-                    '[data-content-type="response"] button[aria-label*="Copy" i]:not([aria-label*="prompt" i])',
-                    '[data-content-type="response"] button.copy-button',
-                ]
-
-                for selector in candidate_selectors:
-                    try:
-                        count = await self.page.locator(selector).count()
-                        if count > 0:
-                            return count, selector
-                    except:
-                        continue
-
-                return 0, candidate_selectors[0]
-
             async def get_copy_count():
-                count, _ = await get_copy_state()
-                return count
+                return await self.page.locator(self.SELECTORS["copy_btn"]).count()
             
             worker_id_for_closure = self.worker_id  # Capture for nested functions
             
             async def verify_chat_cleared(before_count):
                 # Give extra time for chat to clear
                 await self._human_delay(500, 800)
-                after_count, _ = await get_copy_state()
+                after_count = await self.page.locator(self.SELECTORS["copy_btn"]).count()
                 # Success if count dropped (ideally to 0, but at least fewer than before)
                 return after_count == 0 or after_count < before_count
-
-            new_chat_selector = await self._resolve_visible_selector("new_chat", timeout=2000)
+            
             new_chat_success = await self._verified_click(
-                new_chat_selector,
+                self.SELECTORS["new_chat"],
                 "New Chat",
                 verify_before=get_copy_count,
                 verify_after=verify_chat_cleared,
                 timeout=5000
             )
+
+            if (not new_chat_success) and self.SELECTORS.get("new_chat_fallback"):
+                new_chat_success = await self._verified_click(
+                    self.SELECTORS["new_chat_fallback"],
+                    "New Chat Fallback",
+                    verify_before=get_copy_count,
+                    verify_after=verify_chat_cleared,
+                    timeout=5000
+                )
             
             if not new_chat_success:
-                error_msg = "New Chat click failed"
-                self._mark_timeline("new_chat_failed")
-                log(error_msg, f"Worker {self.worker_id}")
-                await self._track_error(error_msg, "new_chat", "send_message")
-                return {"success": False, "error": error_msg}
-            self._mark_timeline("new_chat_ok")
+                log("⚠️ New Chat click failed, proceeding anyway", f"Worker {self.worker_id}")
+                self._track_error("New chat click failed", "new_chat", "send_message")
 
             
             # 1.5 Enable Temporary Chat
             await self._enable_temp_chat()
             await self._human_delay()
-            self._mark_timeline("temp_chat_checked")
 
             # 2. Select Model
             if model:
                 await self._select_model(model)
-                self._mark_timeline("model_selected", model=model)
 
-            # 3. Enter Prompt - use fallback selector finding
-            input_area, input_selector = await self._find_element("input", timeout=5000, description="Input textbox")
-            if not input_area:
-                self._mark_timeline("input_not_found")
-                await self._track_error("Input textbox not found", "input", "send_message")
-                return {"success": False, "error": "Input textbox not found"}
-            
+            # 3. Enter Prompt
+            input_area = self.page.locator(self.SELECTORS["input"])
+            try:
+                if not await input_area.first.is_visible():
+                    input_area = self.page.locator(self.SELECTORS["input_fallback"])
+            except:
+                input_area = self.page.locator(self.SELECTORS["input_fallback"])
             await input_area.click()
             await self._human_delay()
             
@@ -1728,14 +1097,9 @@ class GeminiWebAutomation(BaseAutomation):
             
             await input_area.fill(prompt)
             await self._human_delay(300, 600)
-            self._mark_timeline("prompt_filled", input_selector=input_selector or "")
 
-            # Capture response state BEFORE sending (to detect new assistant output)
-            pre_send_snapshot = await self._get_generation_snapshot()
-            pre_send_count = pre_send_snapshot.get("response_copy_count", 0)
-            pre_send_response_count = pre_send_snapshot.get("response_count", 0)
-            pre_send_last_len = pre_send_snapshot.get("last_response_len", 0)
-            copy_selector = self._get_response_copy_selectors()[0]
+            # Capture button count BEFORE sending (to ensure we wait for a NEW one)
+            pre_send_count = await self.page.locator(self.SELECTORS["copy_btn"]).count()
 
             # 4. Click Send - VERIFIED
             worker_id = self.worker_id  # Capture for closure
@@ -1750,10 +1114,6 @@ class GeminiWebAutomation(BaseAutomation):
                 # Wait a moment then check if input is cleared
                 await self._human_delay(200, 400)  # Reduced for speed
                 try:
-                    # If generation started, send succeeded even if input text lags in UI
-                    if await self._is_generation_active():
-                        return True
-
                     # Try multiple methods to get input text (contenteditable vs textarea)
                     after_text = ""
                     try:
@@ -1773,15 +1133,14 @@ class GeminiWebAutomation(BaseAutomation):
                     elif after_len < before_len / 2:
                         return True  # Input cleared = send worked
                     else:
-                        log(f"Send failed: input not cleared ({after_len} chars remain)", f"Worker {worker_id}")
+                        log(f"⚠️ Send failed: input not cleared ({after_len} chars remain)", f"Worker {worker_id}")
                         return False
                 except Exception as e:
-                    log(f"Send verification error: {e}", f"Worker {worker_id}")
+                    log(f"⚠️ Send verification error: {e}", f"Worker {worker_id}")
                     return False  # Don't assume success on error
             
-            send_selector = await self._resolve_visible_selector("send_btn", timeout=2000)
             send_success = await self._verified_click(
-                send_selector,
+                self.SELECTORS["send_btn"],
                 "Send",
                 verify_before=get_input_text,
                 verify_after=verify_send_worked,
@@ -1789,222 +1148,65 @@ class GeminiWebAutomation(BaseAutomation):
             )
             
             if not send_success:
-                self._mark_timeline("send_failed")
-                log(f"Send button click failed", f"Worker {self.worker_id}")
-                await self._track_error("Send button click failed", "send_btn", "send_message")
+                log(f"❌ Send button click failed", f"Worker {self.worker_id}")
+                snapshot = await self._capture_state_snapshot()
+                self._track_error("Send button click failed", "send_btn", "send_message", snapshot)
                 return {"success": False, "error": "Send button click failed"}
-            self._mark_timeline("send_clicked")
             
-            # 5. Wait for response lifecycle completion
+            # 5. Wait for Response (Copy button to appear)
             log(f"Waiting for response...", f"Worker {self.worker_id}")
             await self._human_delay(300, 600)  # Reduced initial wait
             
+            # Polling for copy button (Wait until we have MORE buttons than before)
             start_time = time.time()
             max_wait = int(os.getenv("BROWSER_TIMEOUT", "480"))
-            idle_timeout = int(os.getenv("IDLE_TIMEOUT_SECONDS", "60"))
-            stuck_empty_seconds = int(os.getenv("STUCK_EMPTY_SECONDS", "45"))
-            stuck_no_progress_seconds = int(os.getenv("STUCK_NO_PROGRESS_SECONDS", "90"))
-            terminal_grace_seconds = int(os.getenv("TERMINAL_GRACE_SECONDS", "5"))
-            wait_log_interval = int(os.getenv("WAIT_LOG_INTERVAL_SECONDS", "10"))
-
             copy_btn = None
-            wait_failure_reason = None
-
-            saw_stop = False
-            stop_logged = False
-            terminal_started_at = None
-            empty_stuck_started_at = None
-            no_progress_started_at = None
-            first_response_node_logged = False
-            first_response_char_logged = False
-            copy_seen_logged = False
-
-            last_snapshot = pre_send_snapshot
-            last_progress = time.time()
             last_log = start_time
-
-            def has_progress(prev: Dict, curr: Dict) -> bool:
-                return (
-                    curr.get("response_count", 0) > prev.get("response_count", 0)
-                    or curr.get("last_response_len", 0) > prev.get("last_response_len", 0)
-                    or curr.get("response_copy_count", 0) > prev.get("response_copy_count", 0)
-                )
-
             while (time.time() - start_time) < max_wait:
+                btns = self.page.locator(self.SELECTORS["copy_btn"])
+                current_count = await btns.count()
+                
+                # We need to find a new button (more than we started with)
+                if current_count > pre_send_count:
+                    # Get the LAST button (the new one)
+                    copy_btn = btns.nth(current_count - 1)
+                    if await copy_btn.is_visible():
+                        break
+
                 now = time.time()
-                snapshot = await self._get_generation_snapshot()
-
-                if has_progress(last_snapshot, snapshot):
-                    last_progress = now
-                    no_progress_started_at = None
-                    empty_stuck_started_at = None
-                else:
-                    if snapshot.get("stop_visible"):
-                        if no_progress_started_at is None:
-                            no_progress_started_at = now
-
-                if snapshot.get("stop_visible"):
-                    saw_stop = True
-                    if not stop_logged:
-                        stop_logged = True
-                        self._mark_timeline("stop_visible")
-
-                if (not first_response_node_logged) and snapshot.get("response_count", 0) > pre_send_response_count:
-                    first_response_node_logged = True
-                    self._mark_timeline("first_response_node")
-
-                if (not first_response_char_logged) and snapshot.get("last_response_len", 0) > (pre_send_last_len + 20):
-                    first_response_char_logged = True
-                    self._mark_timeline("first_response_char", chars=snapshot.get("last_response_len", 0))
-
-                # New assistant copy button is the strongest terminal signal
-                if snapshot.get("response_copy_count", 0) > pre_send_count:
-                    latest_btn, active_copy_selector, _ = await self._find_latest_response_copy_button(pre_send_count)
-                    if latest_btn and (not snapshot.get("stop_visible") or snapshot.get("send_visible")):
-                        if not copy_seen_logged:
-                            copy_seen_logged = True
-                            self._mark_timeline("response_copy_seen")
-                        copy_btn = latest_btn
-                        copy_selector = active_copy_selector or copy_selector
-                        break
-
-                # Detect terminal state from send/stop lifecycle
-                if saw_stop and (not snapshot.get("stop_visible")) and snapshot.get("send_visible"):
-                    if terminal_started_at is None:
-                        terminal_started_at = now
-
-                    has_new_output = (
-                        snapshot.get("response_count", 0) > pre_send_response_count
-                        or snapshot.get("last_response_len", 0) > (pre_send_last_len + 20)
-                    )
-
-                    # No copy button, but assistant text exists -> terminal without copy
-                    if has_new_output and snapshot.get("last_response_len", 0) > 20:
-                        wait_failure_reason = "terminal_no_copy_button"
-                        self._mark_timeline("terminal_no_copy")
-                        break
-
-                    if (now - terminal_started_at) >= terminal_grace_seconds:
-                        if snapshot.get("error_banner_text"):
-                            wait_failure_reason = f"terminal_error_banner: {snapshot.get('error_banner_text')[:120]}"
-                        else:
-                            wait_failure_reason = "terminal_no_output_after_stop"
-                        self._mark_timeline("terminal_without_output")
-                        break
-                else:
-                    terminal_started_at = None
-
-                # Early stuck detection (prevents burning full max_wait on ghost runs)
-                is_empty = (
-                    snapshot.get("response_count", 0) <= pre_send_response_count
-                    and snapshot.get("last_response_len", 0) <= pre_send_last_len
-                    and snapshot.get("response_copy_count", 0) <= pre_send_count
-                )
-                if snapshot.get("stop_visible") and is_empty:
-                    if empty_stuck_started_at is None:
-                        empty_stuck_started_at = now
-                    elif (now - empty_stuck_started_at) >= stuck_empty_seconds:
-                        wait_failure_reason = f"stuck_empty_no_output_{stuck_empty_seconds}s"
-                        self._mark_timeline("stuck_empty", seconds=stuck_empty_seconds)
-                        break
-
-                if snapshot.get("stop_visible") and no_progress_started_at is not None:
-                    if (now - no_progress_started_at) >= stuck_no_progress_seconds:
-                        wait_failure_reason = f"stuck_no_progress_{stuck_no_progress_seconds}s"
-                        self._mark_timeline("stuck_no_progress", seconds=stuck_no_progress_seconds)
-                        break
-
-                # Idle wait timeout when generation is not active and no progress observed
-                if (not snapshot.get("stop_visible")) and ((now - last_progress) > idle_timeout):
-                    wait_failure_reason = f"idle_timeout_{idle_timeout}s"
-                    self._mark_timeline("idle_timeout", seconds=idle_timeout)
-                    break
-
-                if (now - last_log) >= wait_log_interval:
+                if (now - last_log) >= 10:
+                    snapshot = await self._capture_state_snapshot()
                     log(
-                        "Wait state: "
-                        f"elapsed={int(now-start_time)}s "
+                        f"[{self._request_id}] Wait state: elapsed={int(now-start_time)}s "
                         f"stop={snapshot.get('stop_visible')} send={snapshot.get('send_visible')} "
                         f"resp={snapshot.get('response_count', 0)} len={snapshot.get('last_response_len', 0)} "
-                        f"copy={snapshot.get('response_copy_count', 0)} prompt_copy={snapshot.get('prompt_copy_count', 0)}",
+                        f"copy={snapshot.get('copy_count', 0)}",
                         f"Worker {self.worker_id}"
                     )
                     last_log = now
-
-                last_snapshot = snapshot
-
+                         
                 await asyncio.sleep(1)  # Reduced from 2s
             
             if not copy_btn:
-                elapsed = int(time.time() - start_time)
-                end_snapshot = await self._get_generation_snapshot()
-                generation_active = end_snapshot.get("stop_visible") or await self._is_generation_active()
-
-                if not wait_failure_reason:
-                    if elapsed >= max_wait:
-                        wait_failure_reason = f"timeout_{max_wait}s"
-                    else:
-                        wait_failure_reason = f"idle_timeout_{idle_timeout}s"
-
-                reason_code = wait_failure_reason
-                timeout_reason = wait_failure_reason
-
-                if timeout_reason.startswith("terminal_no_copy") or timeout_reason.startswith("terminal_error_banner"):
-                    has_new_output = (
-                        end_snapshot.get("response_count", 0) > pre_send_response_count
-                        or end_snapshot.get("last_response_len", 0) > (pre_send_last_len + 20)
-                    )
-
-                    fallback = await self._fallback_extract() if has_new_output else {"success": False}
-                    if fallback.get("success"):
-                        log(
-                            f"Completed without response copy button ({timeout_reason}); used DOM fallback",
-                            f"Worker {self.worker_id}"
-                        )
-                        self._mark_timeline("done_via_dom_fallback")
-                        return fallback
-
-                if timeout_reason.startswith("timeout_"):
-                    timeout_reason = f"Timeout after {max_wait}s waiting for response"
-                elif timeout_reason.startswith("idle_timeout_"):
-                    timeout_reason = f"Idle timeout after {idle_timeout}s (no activity)"
-                elif timeout_reason.startswith("stuck_empty"):
-                    timeout_reason = f"Stuck generation: no output while running ({stuck_empty_seconds}s)"
-                elif timeout_reason.startswith("stuck_no_progress"):
-                    timeout_reason = f"Stuck generation: no progress while running ({stuck_no_progress_seconds}s)"
-                elif timeout_reason.startswith("terminal_no_output"):
-                    timeout_reason = "Generation ended without assistant output"
-                elif timeout_reason.startswith("terminal_error_banner"):
-                    timeout_reason = f"Generation ended with banner: {end_snapshot.get('error_banner_text', '')[:120]}"
-
-                else:
-                    timeout_reason = f"Wait failed: {timeout_reason}"
-
-                timeout_reason = f"{timeout_reason} [code={reason_code}]"
-                self._mark_timeline("wait_failed", code=reason_code)
-
-                if generation_active:
-                    timeout_reason = f"{timeout_reason} (generation still active)"
-                    await self._stop_generation_if_active(wait_timeout_ms=6000)
-
-                log(timeout_reason, f"Worker {self.worker_id}")
-                await self._track_error(timeout_reason, "copy_btn", "wait_for_response")
-
-                fallback = await self._fallback_extract()
-                if fallback.get("success"):
-                    self._mark_timeline("done_via_final_fallback")
-                    return fallback
-                return {"success": False, "error": timeout_reason}
+                log(f"❌ Timeout after {max_wait}s waiting for response", f"Worker {self.worker_id}")
+                snapshot = await self._capture_state_snapshot()
+                self._track_error(
+                    f"Timeout after {max_wait}s waiting for response",
+                    "copy_btn",
+                    "wait_for_response",
+                    snapshot,
+                )
+                return {"success": False, "error": f"Timeout after {max_wait}s waiting for response"}
 
             # Auto-scroll to ensure copy button is visible
-            await self.page.evaluate(f'''
-                () => {{
-                    const copyButtons = document.querySelectorAll('{copy_selector}');
-                    if (copyButtons.length > 0) {{
+            await self.page.evaluate('''
+                () => {
+                    const copyButtons = document.querySelectorAll('button[aria-label="Copy"]');
+                    if (copyButtons.length > 0) {
                         const lastBtn = copyButtons[copyButtons.length - 1];
-                        lastBtn.scrollIntoView({{ behavior: 'smooth', block: 'center' }});
-                    }}
-                }}
+                        lastBtn.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    }
+                }
             ''')
             await self._human_delay(150, 300)
 
@@ -2017,19 +1219,22 @@ class GeminiWebAutomation(BaseAutomation):
             self._generation_in_progress = False
             
             if not markdown:
-                log(f"Clipboard empty, using fallback extraction", f"Worker {self.worker_id}")
-                self._mark_timeline("clipboard_empty")
-                await self._track_error("Clipboard extraction failed, using DOM fallback", "copy_btn", "extract_response")
+                log(f"⚠️ Clipboard empty, using fallback", f"Worker {self.worker_id}")
+                snapshot = await self._capture_state_snapshot()
+                self._track_error("Clipboard empty", "copy_btn", "extract_response", snapshot)
                 return await self._fallback_extract()
 
             log(f"✅ Response: {len(markdown)} chars", f"Worker {self.worker_id}")
-            self._mark_timeline("done_success", response_chars=len(markdown))
             return {"success": True, "response": markdown.strip()}
 
         except Exception as e:
             self._generation_in_progress = False
-            self._mark_timeline("exception", error=str(e)[:120])
             log(f"❌ Error: {e}", f"Worker {self.worker_id}")
+            try:
+                snapshot = await self._capture_state_snapshot()
+            except:
+                snapshot = {}
+            self._track_error(str(e), "unknown", "send_message", snapshot)
             
             # Force refresh to reset page state for next request
             try:
@@ -2041,8 +1246,7 @@ class GeminiWebAutomation(BaseAutomation):
             # Retry extraction once via DOM fallback
             return await self._fallback_extract()
         finally:
-            self._generation_in_progress = False
-            self._last_request_finished_ts = time.time()
+            self._request_id = None
 
     async def _fallback_extract(self) -> Dict:
         """Fallback extraction via DOM if copy button fails."""
@@ -2063,120 +1267,41 @@ class GeminiWebAutomation(BaseAutomation):
         return {"success": False, "error": "Extraction failed"}
 
     async def _select_model(self, model_name: str):
-        """Select model from dropdown (Fast, Thinking, Pro) with resilient matching."""
+        """Select model from dropdown (Fast, Thinking, Pro)."""
         try:
-            # Find model button using fallback selectors
-            btn, _ = await self._find_element("model_btn", timeout=3000, description="Model button")
-            if not btn:
-                log(f"Model button not found, skipping model selection", f"Worker {self.worker_id}")
-                await self._track_error("Model button not found", "model_btn", "select_model")
-                return
-            
-            # Check if already selected
+            # Click the pill
+            btn = self.page.locator(self.SELECTORS["model_btn"])
+            if not await btn.first.is_visible() and self.SELECTORS.get("model_btn_fallback"):
+                btn = self.page.locator(self.SELECTORS["model_btn_fallback"])
+
             current = await btn.inner_text()
             if self._matches_model(current, model_name):
-                log(f"Model '{model_name}' already selected", f"Worker {self.worker_id}")
                 return
             
-            # Open dropdown
             await btn.click()
             await self._human_delay(400, 600)
             
-            # Wait for menu panel to appear
-            for selector in self._get_all_selectors("menu_panel"):
-                try:
-                    await self.page.wait_for_selector(selector, state="visible", timeout=2000)
-                    break
-                except:
-                    continue
-            
-            # Try each menu_item selector until we find items
-            items = None
-            used_selector = None
-            for selector in self._get_all_selectors("menu_item"):
-                try:
-                    locator = self.page.locator(selector)
-                    count = await locator.count()
-                    if count > 0:
-                        items = locator
-                        used_selector = selector
-                        log(f"Found {count} menu items with: {selector}", f"Worker {self.worker_id}")
-                        break
-                except:
-                    continue
-            
-            if items is None or await items.count() == 0:
-                await self.page.keyboard.press("Escape")
-                await self._human_delay(100, 300)
-                await self._track_error("No menu items found with any selector", "menu_item", "select_model")
-                return
-            
-            # Search through items using keyword matching
-            item_count = await items.count()
-            found_texts = []
-            
-            for i in range(item_count):
+            # Select from menu
+            items = self.page.locator(self.SELECTORS["menu_item"])
+            for i in range(await items.count()):
                 item = items.nth(i)
-                try:
-                    text = await item.inner_text()
-                    found_texts.append(text.replace('\n', ' ')[:30])
-                    
-                    if self._matches_model(text, model_name):
-                        await item.click()
-                        log(f"Selected model: {model_name} (matched: '{text[:30]}')", f"Worker {self.worker_id}")
-                        await self._human_delay(300, 600)
-                        return
-                except:
-                    continue
-
-            # Position fallback if no keyword match (assumes cheap to expensive order)
-            fallback_index = self._get_position_fallback(model_name, item_count)
-            if 0 <= fallback_index < item_count:
-                try:
-                    item = items.nth(fallback_index)
-                    fallback_text = ""
-                    try:
-                        fallback_text = await item.inner_text()
-                    except:
-                        pass
+                text = await item.inner_text()
+                if self._matches_model(text, model_name):
                     await item.click()
-                    text_preview = fallback_text.replace("\n", " ")[:30] if fallback_text else "unknown"
-                    log(
-                        f"Selected model: {model_name} (position: {fallback_index}, item: '{text_preview}')",
-                        f"Worker {self.worker_id}"
-                    )
+                    print(f"[Worker {self.worker_id}] ✅ Selected model: {model_name}")
                     await self._human_delay(300, 600)
-
-                    warning = (
-                        f"Model selection used position fallback for '{model_name}'. "
-                        f"Position {fallback_index}/{item_count}. "
-                        f"Items: {found_texts}"
-                    )
-                    if used_selector:
-                        warning = f"{warning} Selector: {used_selector}"
-
-                    try:
-                        await notify_error(warning, "menu_item", "select_model_fallback", self.worker_id)
-                    except Exception as notify_err:
-                        log(f"Fallback notification failed: {notify_err}", f"Worker {self.worker_id}")
                     return
-                except Exception as click_err:
-                    log(f"Position fallback failed: {click_err}", f"Worker {self.worker_id}")
-
-            # No match found - close menu and log what we saw
+            # If not found, close menu
             await self.page.keyboard.press("Escape")
             await self._human_delay(100, 300)
-            log(f"Model '{model_name}' not found. Available: {found_texts}", f"Worker {self.worker_id}")
-            await self._track_error(f"Model '{model_name}' not found in menu", "menu_item", "select_model")
-            
         except Exception as e:
-            log(f"Model selection failed: {e}", f"Worker {self.worker_id}")
-            await self._track_error(f"Model selection failed: {e}", "model_btn", "select_model")
+            print(f"[Worker {self.worker_id}] ⚠️ Model selection failed: {e}")
+            self._track_error(str(e), "model_btn", "select_model")
 
     async def _paste_image(self, image_path: str):
         """Paste an image via clipboard into Gemini Web."""
         try:
-            log(f"Pasting image: {image_path}", f"Worker {self.worker_id}")
+            print(f"[Worker {self.worker_id}] Pasting image: {image_path}")
             
             with open(image_path, 'rb') as f:
                 image_data = f.read()
@@ -2193,11 +1318,15 @@ class GeminiWebAutomation(BaseAutomation):
             }
             mime_type = mime_map.get(ext, 'image/png')
             
-            # Focus input first using fallback selectors
-            input_area, _ = await self._find_element("input", timeout=3000, description="Input for image paste")
-            if input_area:
-                await input_area.click()
-                await asyncio.sleep(0.1)
+            # Focus input first
+            input_area = self.page.locator(self.SELECTORS["input"])
+            try:
+                if not await input_area.first.is_visible():
+                    input_area = self.page.locator(self.SELECTORS["input_fallback"])
+            except:
+                input_area = self.page.locator(self.SELECTORS["input_fallback"])
+            await input_area.click()
+            await asyncio.sleep(0.1)
             
             # Write image to clipboard
             await self.page.evaluate(f'''
@@ -2218,10 +1347,9 @@ class GeminiWebAutomation(BaseAutomation):
             
             await self.page.keyboard.press("Control+v")
             await asyncio.sleep(1.0)
-            log(f"Image pasted", f"Worker {self.worker_id}")
+            print(f"[Worker {self.worker_id}] ✅ Image pasted")
         except Exception as e:
-            log(f"Image paste failed: {e}", f"Worker {self.worker_id}")
-            await self._track_error(f"Image paste failed: {e}", "input", "paste_image")
+            print(f"[Worker {self.worker_id}] ⚠️ Image paste warning: {e}")
 
     async def close(self):
         await super().close()
@@ -2239,7 +1367,6 @@ class WorkerPool:
         # Array of Gemini Web workers (1 worker = 1 tab)
         self.workers: List[GeminiWebAutomation] = []
         self._worker_busy: List[bool] = []  # Track which workers are busy
-        self._worker_last_request: List[float] = []  # Last real request completion per worker
         self._worker_lock = asyncio.Lock()  # Lock for worker assignment
         
         self.shared_context = None
@@ -2248,15 +1375,6 @@ class WorkerPool:
         
         self._browser_semaphore = asyncio.Semaphore(worker_count)  # Allow N concurrent requests
         self._last_activity = time.time()
-
-        # Optional tab keepalive (prevents idle/cold tab drift in headless mode)
-        self.keepalive_enabled = os.getenv("ENABLE_TAB_KEEPALIVE", "false").lower() == "true"
-        self.keepalive_interval = max(30, int(os.getenv("TAB_KEEPALIVE_INTERVAL", "75")))
-        self.keepalive_idle_recover_seconds = max(60, int(os.getenv("TAB_IDLE_RECOVER_SECONDS", "300")))
-        self._keepalive_task = None
-        self._keepalive_runs = 0
-        self._keepalive_recoveries = 0
-        self._keepalive_reloads = 0
     
     async def _get_available_worker(self, exclude: set = None) -> Tuple[int, GeminiWebAutomation]:
         """Get first available worker (round-robin). Waits if all are busy."""
@@ -2279,96 +1397,11 @@ class WorkerPool:
         log(f"⚠️ Worker assignment timeout", "WorkerPool")
         return None, None
     
-    async def _release_worker(self, index: int, mark_request_activity: bool = True):
+    async def _release_worker(self, index: int):
         """Mark worker as available."""
         async with self._worker_lock:
             if 0 <= index < len(self._worker_busy):
                 self._worker_busy[index] = False
-                if mark_request_activity and index < len(self._worker_last_request):
-                    self._worker_last_request[index] = time.time()
-
-    async def _acquire_worker_for_keepalive(self, index: int) -> bool:
-        """Temporarily reserve an idle worker for keepalive maintenance."""
-        async with self._worker_lock:
-            if not (0 <= index < len(self._worker_busy)):
-                return False
-            if self._worker_busy[index]:
-                return False
-            worker = self.workers[index] if index < len(self.workers) else None
-            if not worker or not worker._initialized:
-                return False
-            self._worker_busy[index] = True
-            return True
-
-    async def _keepalive_worker(self, index: int, worker: GeminiWebAutomation):
-        """Run lightweight keepalive and stuck-state recovery for one worker."""
-        self._keepalive_runs += 1
-
-        try:
-            # Lightweight tab pulse (no model/token usage)
-            await worker.page.evaluate("() => { window.__gemini_keepalive_ts = Date.now(); return document.visibilityState; }")
-            try:
-                await worker.page.keyboard.press("Escape")
-            except:
-                pass
-
-            if await worker._is_generation_active():
-                self._keepalive_recoveries += 1
-                log(f"Keepalive: stuck generation detected on worker {index+1}", "WorkerPool")
-
-                stopped = await worker._stop_generation_if_active(wait_timeout_ms=5000)
-                if not stopped:
-                    self._keepalive_reloads += 1
-                    log(f"Keepalive: reloading worker {index+1}", "WorkerPool")
-                    await worker.page.reload(wait_until="domcontentloaded", timeout=30000)
-
-                    for selector in worker._get_all_selectors("input"):
-                        try:
-                            await worker.page.wait_for_selector(selector, state="visible", timeout=6000)
-                            break
-                        except:
-                            continue
-        except Exception as e:
-            log(f"Keepalive warning on worker {index+1}: {e}", "WorkerPool")
-
-    async def _run_keepalive_loop(self):
-        """Background keepalive loop to prevent idle tab drift in headless mode."""
-        log(
-            f"Keepalive enabled (interval={self.keepalive_interval}s, idle_recover={self.keepalive_idle_recover_seconds}s)",
-            "WorkerPool"
-        )
-
-        try:
-            while self._initialized:
-                await asyncio.sleep(self.keepalive_interval)
-                if not self._initialized:
-                    break
-
-                now = time.time()
-                for index, worker in enumerate(self.workers):
-                    if not worker or not worker._initialized:
-                        continue
-
-                    if index < len(self._worker_last_request):
-                        idle_for = now - self._worker_last_request[index]
-                    else:
-                        idle_for = 0
-
-                    if idle_for < self.keepalive_idle_recover_seconds:
-                        continue
-
-                    acquired = await self._acquire_worker_for_keepalive(index)
-                    if not acquired:
-                        continue
-
-                    try:
-                        await self._keepalive_worker(index, worker)
-                    finally:
-                        await self._release_worker(index, mark_request_activity=False)
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            log(f"Keepalive loop failed: {e}", "WorkerPool")
 
     async def init(self, cookies: List[Dict]) -> bool:
         """Launch shared browser and N Gemini Web tabs."""
@@ -2460,7 +1493,6 @@ class WorkerPool:
                     workers_ok += 1
                 self.workers.append(worker)
                 self._worker_busy.append(False)
-                self._worker_last_request.append(time.time())
                 
                 # Stagger tab creation to avoid rate limiting
                 if i < self.worker_count - 1:
@@ -2469,10 +1501,6 @@ class WorkerPool:
             print(f"[WorkerPool] ✅ {workers_ok}/{self.worker_count} workers ready")
             
             self._initialized = True
-
-            if self.keepalive_enabled:
-                self._keepalive_task = asyncio.create_task(self._run_keepalive_loop())
-
             return workers_ok > 0  # Success if at least one works
         except Exception as e:
             print(f"[WorkerPool] Init error: {e}")
@@ -2504,25 +1532,17 @@ class WorkerPool:
         
         for attempt in range(MAX_RETRIES):
             # Acquire semaphore (limits concurrent requests to N workers)
-            semaphore_wait_start = time.time()
             async with self._browser_semaphore:
-                semaphore_wait_ms = int((time.time() - semaphore_wait_start) * 1000)
-                if semaphore_wait_ms > 2000:
-                    log(f"Semaphore wait: {semaphore_wait_ms}ms", "WorkerPool")
-                 
+                
                 # Get available worker, excluding already-tried workers
-                assignment_start = time.time()
                 worker_index, worker = await self._get_available_worker(exclude=tried_workers)
-                assignment_wait_ms = int((time.time() - assignment_start) * 1000)
-                if assignment_wait_ms > 2000:
-                    log(f"Worker assignment wait: {assignment_wait_ms}ms", "WorkerPool")
-                 
+                
                 if worker is None:
                     log(f"⚠️ No available workers left to try", "WorkerPool")
                     break
-                 
+                
                 tried_workers.add(worker_index)
-                 
+                
                 try:
                     result = await worker.send_message(prompt, model, thinking_level, use_search, images)
                     
@@ -2554,15 +1574,6 @@ class WorkerPool:
 
 
     async def close(self):
-        self._initialized = False
-
-        if self._keepalive_task and not self._keepalive_task.done():
-            self._keepalive_task.cancel()
-            try:
-                await self._keepalive_task
-            except asyncio.CancelledError:
-                pass
-
         # Close all workers
         for w in self.workers:
             await w.close()
