@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import math
 import os
 import sys
 import random
@@ -1435,6 +1436,11 @@ class WorkerPool:
         self.worker_count = max(1, worker_count)  # At least 1 worker
         self.provider = provider.lower()
         self.browser_channel = os.getenv("BROWSER_CHANNEL", "").strip()
+        self.headed_split_windows = os.getenv("HEADED_SPLIT_WINDOWS", "true").lower() == "true"
+        self.headed_screen_width = max(800, int(os.getenv("HEADED_SCREEN_WIDTH", "1920")))
+        self.headed_screen_height = max(600, int(os.getenv("HEADED_SCREEN_HEIGHT", "1080")))
+        self.headed_screen_left = int(os.getenv("HEADED_SCREEN_LEFT", "0"))
+        self.headed_screen_top = int(os.getenv("HEADED_SCREEN_TOP", "0"))
         
         # Array of Gemini Web workers (1 worker = 1 tab)
         self.workers: List[GeminiWebAutomation] = []
@@ -1476,12 +1482,108 @@ class WorkerPool:
             if 0 <= index < len(self._worker_busy):
                 self._worker_busy[index] = False
 
+    async def _close_all_context_pages(self):
+        """Best-effort close of all existing pages in shared context."""
+        if not self.shared_context:
+            return
+
+        pages = list(self.shared_context.pages)
+        for page in pages:
+            try:
+                await page.close()
+            except:
+                pass
+
+    def _window_bounds_for_index(self, index: int) -> Dict[str, int]:
+        """Compute deterministic tiled bounds for headed split windows."""
+        # Two columns by default; more workers spill to additional rows.
+        cols = min(2, max(1, self.worker_count))
+        rows = max(1, math.ceil(self.worker_count / cols))
+
+        width = max(640, self.headed_screen_width // cols)
+        height = max(480, self.headed_screen_height // rows)
+
+        col = index % cols
+        row = index // cols
+
+        return {
+            "left": self.headed_screen_left + (col * width),
+            "top": self.headed_screen_top + (row * height),
+            "width": width,
+            "height": height,
+        }
+
+    async def _position_page_window(self, page: Page, index: int) -> bool:
+        """Use CDP to position the page's native window."""
+        try:
+            session = await self.shared_context.new_cdp_session(page)
+            window_info = await session.send("Browser.getWindowForTarget")
+            window_id = window_info.get("windowId")
+            if not window_id:
+                return False
+
+            bounds = self._window_bounds_for_index(index)
+            await session.send(
+                "Browser.setWindowBounds",
+                {
+                    "windowId": window_id,
+                    "bounds": {
+                        "windowState": "normal",
+                        "left": bounds["left"],
+                        "top": bounds["top"],
+                        "width": bounds["width"],
+                        "height": bounds["height"],
+                    },
+                },
+            )
+            return True
+        except Exception as e:
+            log(f"Window positioning failed for worker {index + 1}: {e}", "WorkerPool")
+            return False
+
+    async def _open_split_window_page(self, index: int) -> Optional[Page]:
+        """Create a new Chromium window (not tab) and return the Page."""
+        try:
+            browser = self.shared_context.browser
+            if not browser:
+                return None
+
+            existing = {id(p) for p in self.shared_context.pages}
+            browser_session = await browser.new_browser_cdp_session()
+            await browser_session.send(
+                "Target.createTarget",
+                {
+                    "url": "about:blank",
+                    "newWindow": True,
+                    "background": False,
+                },
+            )
+
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                for page in self.shared_context.pages:
+                    if id(page) not in existing:
+                        await self._position_page_window(page, index)
+                        return page
+                await asyncio.sleep(0.1)
+
+            return None
+        except Exception as e:
+            log(f"Split-window creation failed for worker {index + 1}: {e}", "WorkerPool")
+            return None
+
     async def init(self, cookies: List[Dict]) -> bool:
         """Launch shared browser and N Gemini Web tabs."""
         try:
             self.playwright = await async_playwright().start()
             
             is_headless = os.getenv("HEADLESS", "false").lower() == "true"
+            use_split_windows = (not is_headless) and self.headed_split_windows and self.worker_count >= 2
+            if use_split_windows:
+                log(
+                    f"Headed split windows enabled ({self.worker_count} workers, {self.headed_screen_width}x{self.headed_screen_height})",
+                    "WorkerPool",
+                )
             
             # Use GeminiWebAutomation constants (AI Studio code removed)
             browser_args = [
@@ -1515,14 +1617,21 @@ class WorkerPool:
             if self.browser_channel:
                 launch_kwargs["channel"] = self.browser_channel
                 log(f"Using browser channel: {self.browser_channel}", "WorkerPool")
+
+            context_kwargs: Dict[str, Any] = {
+                "permissions": ["clipboard-read", "clipboard-write"],
+            }
+            if use_split_windows:
+                context_kwargs["no_viewport"] = True
+            else:
+                context_kwargs["viewport"] = {"width": 1920, "height": 1080}
             
             self.shared_context = await self.playwright.chromium.launch_persistent_context(
                 user_data_dir,
                 headless=is_headless,
                 args=browser_args,
-                viewport={"width": 1920, "height": 1080},
-                permissions=["clipboard-read", "clipboard-write"],
                 **launch_kwargs,
+                **context_kwargs,
             )
             
             # Inject cookies if provided
@@ -1554,13 +1663,25 @@ class WorkerPool:
             if LOW_MEMORY_MODE:
                 await self.shared_context.route("**/*", self._block_resources)
 
+            if use_split_windows:
+                await self._close_all_context_pages()
+
             # Create N Gemini Web workers (1 worker = 1 tab)
             print(f"[WorkerPool] Creating {self.worker_count} Gemini Web worker(s)...")
             
             workers_ok = 0
             for i in range(self.worker_count):
                 print(f"[WorkerPool] Opening tab {i+1}/{self.worker_count}...")
-                page = await self.shared_context.new_page()
+
+                page: Optional[Page] = None
+                if use_split_windows:
+                    page = await self._open_split_window_page(i)
+
+                if page is None:
+                    page = await self.shared_context.new_page()
+                    if use_split_windows:
+                        await self._position_page_window(page, i)
+
                 try:
                     await page.goto(GeminiWebAutomation.URL, timeout=60000, wait_until="domcontentloaded")
                     print(f"[WorkerPool] ✅ Tab {i+1} loaded: {page.url}")
@@ -1676,6 +1797,7 @@ class WorkerPool:
             "worker_count": self.worker_count,
             "active_requests": self._active_requests,
             "browser_channel": self.browser_channel or "default",
+            "headed_split_windows": self.headed_split_windows,
             "workers": workers,
             "errors": errors,
             "last_activity_unix": int(self._last_activity),
