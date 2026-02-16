@@ -16,6 +16,8 @@ import base64
 import tempfile
 import json
 import time
+import uuid
+from collections import deque
 from datetime import datetime
 from typing import List, Optional, Dict, Union
 from fastapi import FastAPI, HTTPException, Request
@@ -39,11 +41,15 @@ from core import WorkerPool
 # Configuration
 WORKER_COUNT = int(os.getenv("WORKER_COUNT", "1"))
 PROVIDER = os.getenv("PROVIDER", "auto").lower()  # "auto", "aistudio", or "gemini-web"
+BROWSER_TIMEOUT = int(os.getenv("BROWSER_TIMEOUT", "480"))
+API_TIMEOUT_HEADROOM = int(os.getenv("API_TIMEOUT_HEADROOM", "30"))
+RECENT_REQUEST_LIMIT = int(os.getenv("RECENT_REQUEST_LIMIT", "200"))
 
 # Global State
 worker_pool: Optional[WorkerPool] = None
 browser_loop: Optional[asyncio.AbstractEventLoop] = None
 browser_thread: Optional[threading.Thread] = None
+recent_requests = deque(maxlen=max(20, RECENT_REQUEST_LIMIT))
 
 def run_browser_loop(loop):
     asyncio.set_event_loop(loop)
@@ -120,6 +126,36 @@ def parse_model_and_thinking(model_name: str) -> tuple:
     
     return model_name, "High"
 
+
+def extract_request_source(request: Request, body: Dict) -> Dict[str, str]:
+    """Extract source labels from headers/body for diagnostics."""
+    headers = request.headers
+    project = (
+        headers.get("x-project-name")
+        or body.get("project")
+        or (body.get("metadata") or {}).get("project")
+        or "unknown"
+    )
+    client = (
+        headers.get("x-client-name")
+        or body.get("client")
+        or (body.get("metadata") or {}).get("client")
+        or "unknown"
+    )
+    req_id = (
+        headers.get("x-request-id")
+        or body.get("request_id")
+        or (body.get("metadata") or {}).get("request_id")
+        or str(uuid.uuid4())
+    )
+
+    return {
+        "project": str(project),
+        "client": str(client),
+        "request_id": str(req_id),
+        "ip": request.client.host if request.client else "unknown",
+    }
+
 # --- Endpoints ---
 
 @app.get("/v1/models")
@@ -141,6 +177,19 @@ async def openai_chat(request: Request):
     if not worker_pool:
         raise HTTPException(status_code=503, detail="Worker pool not initialized")
     
+    source = extract_request_source(request, body)
+    trace_id = source["request_id"]
+    trace = {
+        "request_id": trace_id,
+        "project": source["project"],
+        "client": source["client"],
+        "ip": source["ip"],
+        "model": body.get("model", ""),
+        "status": "started",
+        "started_at": datetime.utcnow().isoformat(),
+    }
+    recent_requests.append(trace)
+
     # Extract fields
     model = body.get("model", "gemini-3-flash-preview")
     messages = body.get("messages", [])
@@ -152,6 +201,7 @@ async def openai_chat(request: Request):
     if thinking_level_explicit:
         thinking_level = thinking_level_explicit
 
+    log(f"[{trace_id}] Source: project={source['project']} client={source['client']} ip={source['ip']}", "API")
     log(f"Model: {base_model} | Thinking: {thinking_level} | Messages: {len(messages)}", "API")
 
     # Combine messages and extract images
@@ -198,21 +248,24 @@ async def openai_chat(request: Request):
     )
     future = asyncio.run_coroutine_threadsafe(coro, browser_loop)
     
-    # CRITICAL: Use timeout to prevent infinite blocking
-    # The lambda with timeout prevents run_in_executor from blocking forever
-    BROWSER_TIMEOUT = 300  # 5 minutes max for generation
+    api_timeout = BROWSER_TIMEOUT + API_TIMEOUT_HEADROOM
     
     try:
-        log(f"Waiting for browser thread (timeout={BROWSER_TIMEOUT}s)...", "API")
+        log(f"Waiting for browser thread (worker_timeout={BROWSER_TIMEOUT}s, api_timeout={api_timeout}s)...", "API")
         result = await asyncio.get_event_loop().run_in_executor(
             None, 
-            lambda: future.result(timeout=BROWSER_TIMEOUT)
+            lambda: future.result(timeout=api_timeout)
         )
         log(f"Browser thread returned", "API")
     except TimeoutError:
-        log(f"❌ BROWSER TIMEOUT after {BROWSER_TIMEOUT}s - request stuck in browser thread", "API")
-        raise HTTPException(status_code=504, detail=f"Browser operation timed out after {BROWSER_TIMEOUT}s")
+        trace["status"] = "timeout"
+        trace["finished_at"] = datetime.utcnow().isoformat()
+        log(f"❌ BROWSER TIMEOUT after {api_timeout}s - request stuck in browser thread", "API")
+        raise HTTPException(status_code=504, detail=f"Browser operation timed out after {api_timeout}s")
     except Exception as e:
+        trace["status"] = "error"
+        trace["error"] = str(e)
+        trace["finished_at"] = datetime.utcnow().isoformat()
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         for img_path in image_paths:
@@ -220,9 +273,15 @@ async def openai_chat(request: Request):
             except: pass
 
     if not result["success"]:
+        trace["status"] = "failed"
+        trace["error"] = result.get("error")
+        trace["finished_at"] = datetime.utcnow().isoformat()
         raise HTTPException(status_code=500, detail=result.get("error"))
 
     content = result["response"] or ""
+    trace["status"] = "ok"
+    trace["response_chars"] = len(content)
+    trace["finished_at"] = datetime.utcnow().isoformat()
     log(f"Got response ({len(content)} chars)", "API")
     
     return {
@@ -230,6 +289,7 @@ async def openai_chat(request: Request):
         "object": "chat.completion",
         "created": int(time.time()),
         "model": model,
+        "request_id": trace_id,
         "choices": [{
             "index": 0,
             "message": {"role": "assistant", "content": content},
@@ -245,6 +305,19 @@ async def openai_chat(request: Request):
 @app.get("/health")
 async def health():
     return {"status": "ok", "workers": WORKER_COUNT}
+
+
+@app.get("/v1/diagnostics")
+async def diagnostics():
+    if not worker_pool:
+        return {"status": "not_initialized"}
+
+    pool_diag = worker_pool.get_diagnostics()
+    return {
+        "status": "ok",
+        "pool": pool_diag,
+        "recent_requests": list(recent_requests),
+    }
 
 if __name__ == "__main__":
     import uvicorn

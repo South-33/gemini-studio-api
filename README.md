@@ -7,11 +7,10 @@ A lightweight API that automates Gemini Web to provide OpenAI-compatible endpoin
 - **Image Upload** - Send images via OpenAI Vision API format
 - **Session Persistence** - Login once via Chrome, stays authenticated forever
 - **ngrok Tunnel** - Expose your local API to the internet with a static domain
-- **Self-Healing** - Auto-recovers from stuck UI states and errors
-- **Discord Alerts** - Get notified on your phone when errors occur
-- **Resilient Selectors** - Fallback selectors that survive Google UI changes
-- **Request Source Tracing** - Track which app/project sent each request
-- **Optional Tab Keepalive** - Prevent idle headless tabs from drifting into stale states
+- **Resilient Selectors** - Stable-first fallback selectors for Gemini UI drift
+- **Discord Alerts** - Error notifications with cooldown and diagnostics payload
+- **Diagnostics Endpoint** - Worker status, error context, and recent request traces
+- **Request Source Tracing** - Track project/client/request-id across logs and diagnostics
 
 ---
 
@@ -81,21 +80,22 @@ ngrok http 8000 --domain=your-subdomain.ngrok-free.app
 Copy `.env.example` to `.env` and configure:
 
 ```env
+# Server
+PORT=8000
+
 # Browser
-HEADLESS=true           # false to see the browser
-WORKER_COUNT=2          # Number of parallel tabs (1 worker = 1 tab)
-BROWSER_TIMEOUT=480     # Max seconds for one browser request
-API_TIMEOUT_HEADROOM=30 # Extra API-side timeout buffer above worker timeout
-RECENT_REQUEST_LIMIT=200  # Number of recent request traces kept in memory
-ENABLE_TAB_KEEPALIVE=false  # Keep idle tabs warm/recover stale stop state
-TAB_KEEPALIVE_INTERVAL=75   # Seconds between keepalive checks
-TAB_IDLE_RECOVER_SECONDS=300  # Only maintain workers idle this long
-WAIT_LOG_INTERVAL_SECONDS=10  # Wait-loop telemetry interval
-STUCK_EMPTY_SECONDS=45        # Stop-visible + zero-output stuck threshold
-STUCK_NO_PROGRESS_SECONDS=90  # Stop-visible + no-progress stuck threshold
-TERMINAL_GRACE_SECONDS=5      # Grace after Stop->Send before terminal decision
-IDLE_WAKE_REFRESH_SECONDS=1200 # Refresh tab before request after long idle
-REQUEST_TIMELINE_LIMIT=80      # Timeline events stored per request for diagnostics
+HEADLESS=true             # false to run headed
+BROWSER_CHANNEL=chromium  # optional: new Chromium headless mode
+WORKER_COUNT=2            # Number of worker tabs
+BROWSER_TIMEOUT=480       # Worker timeout seconds
+API_TIMEOUT_HEADROOM=30   # API timeout buffer above worker timeout
+RECENT_REQUEST_LIMIT=200  # Recent traces stored for /v1/diagnostics
+
+# Performance
+LOW_MEMORY_MODE=true
+SLOW_VM_MODE=true
+WAIT_LOG_INTERVAL_SECONDS=10
+DEBUG_SCREENSHOTS=false
 
 # Discord Notifications (optional)
 DISCORD_WEBHOOK=https://discord.com/api/webhooks/...
@@ -240,15 +240,13 @@ Returns:
 
 ## Self-Healing Features
 
-- **Fallback Selectors** - Uses structural selectors (`role`, `contenteditable`) that survive UI text changes
-- **Request-Level Retry** - Failed requests automatically retry on different workers
-- **Periodic Refresh** - Browser tabs refresh every 10 requests to clear cache
-- **Idle Wake Refresh** - Refreshes long-idle tabs before handling a new request
-- **Overlay Dismissal** - Clears stuck modals/menus before each request
-- **Idle Keepalive (optional)** - Detects/recover stale `Stop response` states while idle
-- **Timeline Diagnostics** - Request lifecycle timeline included in diagnostics/error context
-- **Error Tracking** - All errors logged with selector, action, and timestamp
-- **Discord Alerts** - Optional notifications with 5-minute cooldown to prevent spam
+- **Stable-First Selectors** - Uses strict selectors first with bounded fallbacks
+- **Request-Level Retry** - Failed requests retry on different workers
+- **Periodic Refresh** - Hard refresh every 10 requests to clear stale page state
+- **Overlay Dismissal** - Clears stuck overlays before each request
+- **Wait-State Telemetry** - Periodic wait logs include stop/send/response/visibility state
+- **Diagnostics Endpoint** - Exposes worker state, last errors, and recent request traces
+- **Discord Alerts** - Cooldown-based error notifications with compact diagnostics payload
 
 ---
 

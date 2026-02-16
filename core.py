@@ -6,8 +6,9 @@ import random
 import time
 import uuid
 from datetime import datetime
-from typing import List, Dict, Optional, Tuple
+from typing import Any, List, Dict, Optional, Tuple
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page, Route
+from notifier import notify_error
 
 # --- Timestamped Logging (use stderr - always unbuffered) ---
 def log(msg: str, tag: str = "Core"):
@@ -654,25 +655,220 @@ class GeminiWebAutomation(BaseAutomation):
             cls._clipboard_lock = asyncio.Lock()
         return cls._clipboard_lock
     
-    # Selectors discovered during research
+    # Stable selectors first; bounded fallbacks second
     SELECTORS = {
-        "input": 'div[role="textbox"][aria-label="Enter a prompt for Gemini"]',
-        "send_btn": '[aria-label="Send message"]',
-        "model_btn": '.input-area-switch',
-        "new_chat": '[data-test-id="new-chat-button"]',
-        "temp_chat": '[aria-label="Temporary chat"]',
-        "temp_chat_active": '[aria-label="Temporary chat"].temp-chat-on',
-        "sidebar_toggle": '[aria-label="Main menu"]',
-        "copy_btn": '[aria-label="Copy"]',
-        "menu_panel": '.mat-mdc-menu-panel',
-        "menu_item": '.mat-mdc-menu-item'
+        "input": [
+            'div[role="textbox"][aria-label="Enter a prompt for Gemini"]',
+            'div[role="textbox"][aria-label="Enter a prompt here"]',
+            'div[role="textbox"][contenteditable="true"]',
+        ],
+        "send_btn": [
+            'button[aria-label="Send message"]',
+            'button[aria-label*="Send" i]',
+        ],
+        "model_btn": [
+            'button[aria-label="Open mode picker"]',
+            '.input-area-switch',
+        ],
+        "new_chat": [
+            'a[aria-label="New chat"]',
+            '[data-test-id="new-chat-button"]',
+            'a[href="/app"]',
+        ],
+        "temp_chat": [
+            'button[aria-label="Temporary chat"]',
+            '[aria-label="Temporary chat"]',
+        ],
+        "temp_chat_active": [
+            'button[aria-label*="Temporary" i][aria-pressed="true"]',
+            '[aria-label="Temporary chat"].temp-chat-on',
+        ],
+        "sidebar_toggle": [
+            'button[aria-label="Main menu"]',
+            '[aria-label="Main menu"]',
+        ],
+        "copy_btn": [
+            'button[aria-label="Copy"]',
+            '[aria-label="Copy"]',
+        ],
+        "menu_panel": [
+            '.mat-mdc-menu-panel',
+        ],
+        "menu_item": [
+            '.mat-mdc-menu-item',
+            '[role="menuitem"]',
+        ],
     }
+
+    _last_errors: Dict[int, Dict[str, Any]] = {}
     
     def __init__(self, worker_id: int = 0):
         super().__init__()
         self.worker_id = worker_id  # For logging
         self._request_count = 0
         self._request_id = None  # Set per-request for log tracing
+        self._wait_log_interval_seconds = max(2, int(os.getenv("WAIT_LOG_INTERVAL_SECONDS", "10")))
+
+    def _selector_candidates(self, key: str) -> List[str]:
+        raw = self.SELECTORS.get(key, [])
+        if isinstance(raw, str):
+            return [raw]
+        if isinstance(raw, list):
+            return [item for item in raw if isinstance(item, str) and item.strip()]
+        return []
+
+    async def _resolve_selector(self, key: str, require_visible: bool = False, timeout_ms: int = 900) -> str:
+        """Resolve a selector key to the first existing/visible candidate."""
+        candidates = self._selector_candidates(key)
+        if not candidates:
+            return ""
+
+        for selector in candidates:
+            locator = self.page.locator(selector).first
+            try:
+                if require_visible:
+                    await locator.wait_for(state="visible", timeout=timeout_ms)
+                else:
+                    if await locator.count() == 0:
+                        continue
+                return selector
+            except:
+                continue
+
+        return candidates[0]
+
+    async def _resolve_locator(self, key: str, require_visible: bool = False, timeout_ms: int = 900):
+        selector = await self._resolve_selector(key, require_visible=require_visible, timeout_ms=timeout_ms)
+        if not selector:
+            return None
+        return self.page.locator(selector).first
+
+    def _matches_model(self, item_text: str, model_name: str) -> bool:
+        """Token-safe model matching to avoid accidental partial collisions."""
+        if not item_text or not model_name:
+            return False
+
+        import re
+
+        tokens = re.findall(r"[a-z0-9]+", item_text.lower())
+        target = model_name.strip().lower()
+        if target in tokens:
+            return True
+
+        aliases = {
+            "fast": ["fast", "flash"],
+            "thinking": ["thinking", "reasoning"],
+            "pro": ["pro", "advanced"],
+        }
+        for alias in aliases.get(target, [target]):
+            if alias in tokens:
+                return True
+        return False
+
+    async def _capture_state_snapshot(self) -> Dict[str, Any]:
+        snapshot: Dict[str, Any] = {
+            "request_id": self._request_id,
+            "url": "",
+            "stop_visible": False,
+            "send_visible": False,
+            "copy_count": 0,
+            "response_count": 0,
+            "last_response_len": 0,
+            "last_response_tail": "",
+            "active_button": "",
+            "visibility": "unknown",
+        }
+
+        if not self.page:
+            return snapshot
+
+        try:
+            snapshot["url"] = self.page.url
+        except:
+            pass
+
+        try:
+            data = await self.page.evaluate(
+                """
+                () => {
+                    const isVisible = (el) => {
+                        if (!el) return false;
+                        const style = window.getComputedStyle(el);
+                        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+                        return !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                    };
+
+                    const buttons = Array.from(document.querySelectorAll('button')).filter(isVisible);
+                    const stopBtn = buttons.find((b) => {
+                        const label = (b.getAttribute('aria-label') || '').toLowerCase();
+                        const text = (b.innerText || '').toLowerCase();
+                        return label.includes('stop') || text.includes('stop');
+                    });
+                    const sendBtn = buttons.find((b) => {
+                        const label = (b.getAttribute('aria-label') || '').toLowerCase();
+                        const text = (b.innerText || '').toLowerCase();
+                        return label.includes('send') || text.includes('send');
+                    });
+
+                    let responses = document.querySelectorAll('[data-content-type="response"]');
+                    if (!responses.length) responses = document.querySelectorAll('model-response, assistant-message-content');
+                    const last = responses.length ? responses[responses.length - 1] : null;
+                    const lastText = last ? (last.innerText || '') : '';
+
+                    return {
+                        stop_visible: !!stopBtn,
+                        send_visible: !!sendBtn,
+                        active_button: (stopBtn?.getAttribute('aria-label') || stopBtn?.innerText || sendBtn?.getAttribute('aria-label') || sendBtn?.innerText || '').trim().slice(0, 80),
+                        copy_count: document.querySelectorAll('button[aria-label="Copy"]').length,
+                        response_count: responses.length,
+                        last_response_len: lastText.length,
+                        last_response_tail: lastText.slice(-120),
+                        visibility: document.visibilityState || 'unknown',
+                    };
+                }
+                """
+            )
+            if isinstance(data, dict):
+                snapshot.update(data)
+        except:
+            pass
+
+        return snapshot
+
+    def _track_error(self, error: str, selector_key: str, action: str, diagnostics: Optional[Dict[str, Any]] = None):
+        payload = {
+            "error": error,
+            "selector_key": selector_key,
+            "action": action,
+            "timestamp": datetime.now().isoformat(),
+            "worker_id": self.worker_id,
+            "request_id": self._request_id,
+            "diagnostics": diagnostics or {},
+        }
+        GeminiWebAutomation._last_errors[self.worker_id] = payload
+        log(f"Error tracked: {error} (selector={selector_key}, action={action})", f"Worker {self.worker_id}")
+
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(
+                notify_error(
+                    error,
+                    selector_key,
+                    action,
+                    self.worker_id,
+                    diagnostics=payload["diagnostics"],
+                )
+            )
+        except:
+            pass
+
+    @classmethod
+    def get_all_errors(cls) -> Dict[int, Dict[str, Any]]:
+        return dict(cls._last_errors)
+
+    @classmethod
+    def clear_errors(cls):
+        cls._last_errors.clear()
 
     async def _screenshot_on_failure(self, action_name: str):
         """
@@ -816,7 +1012,11 @@ class GeminiWebAutomation(BaseAutomation):
         self.context = context
         try:
             # Wait for input to be ready (login check)
-            await self.page.wait_for_selector(self.SELECTORS["input"], timeout=30000)
+            input_selector = await self._resolve_selector("input", require_visible=True, timeout_ms=12000)
+            if not input_selector:
+                raise Exception("Input selector not found")
+
+            await self.page.wait_for_selector(input_selector, timeout=30000)
             await self._human_delay(500, 1000)
             print("[GeminiWeb] ✅ Logged in and ready")
             
@@ -828,21 +1028,27 @@ class GeminiWebAutomation(BaseAutomation):
             return True
         except Exception as e:
             print(f"[GeminiWeb] ❌ Init failed: {e}")
+            self._track_error(str(e), "input", "init")
             return False
 
     async def _enable_temp_chat(self):
         """Enable temporary chat mode."""
         try:
-            temp_btn = self.page.locator(self.SELECTORS["temp_chat"])
+            temp_btn = await self._resolve_locator("temp_chat")
+            if temp_btn is None:
+                return
             
             # Check if temp chat is already enabled
-            temp_active = self.page.locator(self.SELECTORS["temp_chat_active"])
-            if await temp_active.count() > 0:
+            temp_active_selector = await self._resolve_selector("temp_chat_active")
+            temp_active = self.page.locator(temp_active_selector) if temp_active_selector else None
+            if temp_active and await temp_active.count() > 0:
                 return
             
             # Expand sidebar if button not visible
             if not await temp_btn.is_visible():
-                sidebar_btn = self.page.locator(self.SELECTORS["sidebar_toggle"])
+                sidebar_btn = await self._resolve_locator("sidebar_toggle")
+                if sidebar_btn is None:
+                    return
                 if await sidebar_btn.is_visible():
                     await sidebar_btn.click()
                     await self._human_delay(300, 500)
@@ -851,13 +1057,15 @@ class GeminiWebAutomation(BaseAutomation):
             
             # Click temp chat button
             if await temp_btn.is_visible():
-                temp_active = self.page.locator(self.SELECTORS["temp_chat_active"])
-                if await temp_active.count() == 0:
+                temp_active_selector = await self._resolve_selector("temp_chat_active")
+                temp_active = self.page.locator(temp_active_selector) if temp_active_selector else None
+                if (not temp_active) or (await temp_active.count() == 0):
                     await temp_btn.click()
                     await self._human_delay(200, 400)
                     
         except Exception as e:
             log(f"⚠️ Temp chat error: {e}", f"Worker {self.worker_id}")
+            self._track_error(str(e), "temp_chat", "enable_temp_chat")
 
     async def send_message(self, prompt: str, model: str = None, thinking_level: str = None, use_search: bool = False, images: List[str] = None) -> Dict:
         if not self._initialized: 
@@ -868,6 +1076,12 @@ class GeminiWebAutomation(BaseAutomation):
             self._request_count += 1
             self._request_id = uuid.uuid4().hex[:8]  # Short ID for log tracing
             log(f"[{self._request_id}] Request: model={model}, prompt={len(prompt)} chars", f"Worker {self.worker_id}")
+
+            copy_selector = await self._resolve_selector("copy_btn")
+            if not copy_selector:
+                err = "Copy selector not found"
+                self._track_error(err, "copy_btn", "send_message")
+                return {"success": False, "error": err}
             
             # 0. Dismiss any stuck overlays/modals (Angular Material CDK overlays block clicks)
             try:
@@ -891,27 +1105,30 @@ class GeminiWebAutomation(BaseAutomation):
             
             # 1. New Chat (starts fresh) - VERIFIED
             async def get_copy_count():
-                return await self.page.locator(self.SELECTORS["copy_btn"]).count()
-            
-            worker_id_for_closure = self.worker_id  # Capture for nested functions
+                return await self.page.locator(copy_selector).count()
             
             async def verify_chat_cleared(before_count):
                 # Give extra time for chat to clear
                 await self._human_delay(500, 800)
-                after_count = await self.page.locator(self.SELECTORS["copy_btn"]).count()
+                after_count = await self.page.locator(copy_selector).count()
                 # Success if count dropped (ideally to 0, but at least fewer than before)
                 return after_count == 0 or after_count < before_count
             
-            new_chat_success = await self._verified_click(
-                self.SELECTORS["new_chat"],
-                "New Chat",
-                verify_before=get_copy_count,
-                verify_after=verify_chat_cleared,
-                timeout=5000
-            )
+            new_chat_success = False
+            for selector in self._selector_candidates("new_chat"):
+                new_chat_success = await self._verified_click(
+                    selector,
+                    "New Chat",
+                    verify_before=get_copy_count,
+                    verify_after=verify_chat_cleared,
+                    timeout=5000
+                )
+                if new_chat_success:
+                    break
             
             if not new_chat_success:
                 log("⚠️ New Chat click failed, proceeding anyway", f"Worker {self.worker_id}")
+                self._track_error("New chat click failed", "new_chat", "send_message")
 
             
             # 1.5 Enable Temporary Chat
@@ -923,7 +1140,12 @@ class GeminiWebAutomation(BaseAutomation):
                 await self._select_model(model)
 
             # 3. Enter Prompt
-            input_area = self.page.locator(self.SELECTORS["input"])
+            input_selector = await self._resolve_selector("input", require_visible=True, timeout_ms=2000)
+            if not input_selector:
+                err = "Input selector not found"
+                self._track_error(err, "input", "send_message")
+                return {"success": False, "error": err}
+            input_area = self.page.locator(input_selector)
             await input_area.click()
             await self._human_delay()
             
@@ -937,7 +1159,7 @@ class GeminiWebAutomation(BaseAutomation):
             await self._human_delay(300, 600)
 
             # Capture button count BEFORE sending (to ensure we wait for a NEW one)
-            pre_send_count = await self.page.locator(self.SELECTORS["copy_btn"]).count()
+            pre_send_count = await self.page.locator(copy_selector).count()
 
             # 4. Click Send - VERIFIED
             worker_id = self.worker_id  # Capture for closure
@@ -977,16 +1199,22 @@ class GeminiWebAutomation(BaseAutomation):
                     log(f"⚠️ Send verification error: {e}", f"Worker {worker_id}")
                     return False  # Don't assume success on error
             
-            send_success = await self._verified_click(
-                self.SELECTORS["send_btn"],
-                "Send",
-                verify_before=get_input_text,
-                verify_after=verify_send_worked,
-                timeout=5000
-            )
+            send_success = False
+            for selector in self._selector_candidates("send_btn"):
+                send_success = await self._verified_click(
+                    selector,
+                    "Send",
+                    verify_before=get_input_text,
+                    verify_after=verify_send_worked,
+                    timeout=5000,
+                )
+                if send_success:
+                    break
             
             if not send_success:
                 log(f"❌ Send button click failed", f"Worker {self.worker_id}")
+                snapshot = await self._capture_state_snapshot()
+                self._track_error("Send button click failed", "send_btn", "send_message", snapshot)
                 return {"success": False, "error": "Send button click failed"}
             
             # 5. Wait for Response (Copy button to appear)
@@ -995,10 +1223,11 @@ class GeminiWebAutomation(BaseAutomation):
             
             # Polling for copy button (Wait until we have MORE buttons than before)
             start_time = time.time()
-            max_wait = 180 # Extended for thinking models
+            max_wait = int(os.getenv("BROWSER_TIMEOUT", "480"))
             copy_btn = None
+            last_wait_log = start_time
             while (time.time() - start_time) < max_wait:
-                btns = self.page.locator(self.SELECTORS["copy_btn"])
+                btns = self.page.locator(copy_selector)
                 current_count = await btns.count()
                 
                 # We need to find a new button (more than we started with)
@@ -1007,23 +1236,42 @@ class GeminiWebAutomation(BaseAutomation):
                     copy_btn = btns.nth(current_count - 1)
                     if await copy_btn.is_visible():
                         break
+
+                now = time.time()
+                if (now - last_wait_log) >= self._wait_log_interval_seconds:
+                    snap = await self._capture_state_snapshot()
+                    elapsed = int(now - start_time)
+                    log(
+                        f"[{self._request_id}] Wait state: elapsed={elapsed}s stop={snap.get('stop_visible')} "
+                        f"send={snap.get('send_visible')} resp={snap.get('response_count')} "
+                        f"len={snap.get('last_response_len')} copy={snap.get('copy_count')} vis={snap.get('visibility')}",
+                        f"Worker {self.worker_id}"
+                    )
+                    last_wait_log = now
                         
                 await asyncio.sleep(1)  # Reduced from 2s
             
             if not copy_btn:
                 log(f"❌ Timeout after {max_wait}s waiting for response", f"Worker {self.worker_id}")
+                snapshot = await self._capture_state_snapshot()
+                self._track_error(
+                    f"Timeout after {max_wait}s waiting for response",
+                    "copy_btn",
+                    "wait_for_response",
+                    snapshot,
+                )
                 return {"success": False, "error": f"Timeout after {max_wait}s waiting for response"}
 
             # Auto-scroll to ensure copy button is visible
             await self.page.evaluate('''
-                () => {
-                    const copyButtons = document.querySelectorAll('button[aria-label="Copy"]');
+                (selector) => {
+                    const copyButtons = document.querySelectorAll(selector);
                     if (copyButtons.length > 0) {
                         const lastBtn = copyButtons[copyButtons.length - 1];
                         lastBtn.scrollIntoView({ behavior: 'smooth', block: 'center' });
                     }
                 }
-            ''')
+            ''', copy_selector)
             await self._human_delay(150, 300)
 
             # 6. Extraction via Copy Button (with lock to prevent clipboard race condition)
@@ -1036,6 +1284,8 @@ class GeminiWebAutomation(BaseAutomation):
             
             if not markdown:
                 log(f"⚠️ Clipboard empty, using fallback", f"Worker {self.worker_id}")
+                snapshot = await self._capture_state_snapshot()
+                self._track_error("Clipboard empty", "copy_btn", "extract_response", snapshot)
                 return await self._fallback_extract()
 
             log(f"✅ Response: {len(markdown)} chars", f"Worker {self.worker_id}")
@@ -1044,6 +1294,11 @@ class GeminiWebAutomation(BaseAutomation):
         except Exception as e:
             self._generation_in_progress = False
             log(f"❌ Error: {e}", f"Worker {self.worker_id}")
+            try:
+                snapshot = await self._capture_state_snapshot()
+            except:
+                snapshot = {}
+            self._track_error(str(e), "unknown", "send_message", snapshot)
             
             # Force refresh to reset page state for next request
             try:
@@ -1054,6 +1309,9 @@ class GeminiWebAutomation(BaseAutomation):
             
             # Retry extraction once via DOM fallback
             return await self._fallback_extract()
+        finally:
+            self._generation_in_progress = False
+            self._request_id = None
 
     async def _fallback_extract(self) -> Dict:
         """Fallback extraction via DOM if copy button fails."""
@@ -1076,21 +1334,31 @@ class GeminiWebAutomation(BaseAutomation):
     async def _select_model(self, model_name: str):
         """Select model from dropdown (Fast, Thinking, Pro)."""
         try:
-            # Click the pill
-            btn = self.page.locator(self.SELECTORS["model_btn"])
+            # Click model picker
+            model_selector = await self._resolve_selector("model_btn", require_visible=True, timeout_ms=1500)
+            if not model_selector:
+                self._track_error("Model picker not found", "model_btn", "select_model")
+                return
+
+            btn = self.page.locator(model_selector)
             current = await btn.inner_text()
-            if model_name.lower() in current.lower():
+            if self._matches_model(current, model_name):
                 return
             
             await btn.click()
             await self._human_delay(400, 600)
             
             # Select from menu
-            items = self.page.locator(self.SELECTORS["menu_item"])
+            menu_item_selector = await self._resolve_selector("menu_item")
+            if not menu_item_selector:
+                self._track_error("Model menu item selector missing", "menu_item", "select_model")
+                return
+
+            items = self.page.locator(menu_item_selector)
             for i in range(await items.count()):
                 item = items.nth(i)
                 text = await item.inner_text()
-                if model_name.lower() in text.lower():
+                if self._matches_model(text, model_name):
                     await item.click()
                     print(f"[Worker {self.worker_id}] ✅ Selected model: {model_name}")
                     await self._human_delay(300, 600)
@@ -1100,6 +1368,7 @@ class GeminiWebAutomation(BaseAutomation):
             await self._human_delay(100, 300)
         except Exception as e:
             print(f"[Worker {self.worker_id}] ⚠️ Model selection failed: {e}")
+            self._track_error(str(e), "model_btn", "select_model")
 
     async def _paste_image(self, image_path: str):
         """Paste an image via clipboard into Gemini Web."""
@@ -1122,7 +1391,11 @@ class GeminiWebAutomation(BaseAutomation):
             mime_type = mime_map.get(ext, 'image/png')
             
             # Focus input first
-            input_area = self.page.locator(self.SELECTORS["input"])
+            input_selector = await self._resolve_selector("input", require_visible=True, timeout_ms=2000)
+            if not input_selector:
+                raise Exception("Input selector not found for image paste")
+
+            input_area = self.page.locator(input_selector)
             await input_area.click()
             await asyncio.sleep(0.1)
             
@@ -1161,6 +1434,7 @@ class WorkerPool:
     def __init__(self, worker_count: int = 1, provider: str = "auto"):
         self.worker_count = max(1, worker_count)  # At least 1 worker
         self.provider = provider.lower()
+        self.browser_channel = os.getenv("BROWSER_CHANNEL", "").strip()
         
         # Array of Gemini Web workers (1 worker = 1 tab)
         self.workers: List[GeminiWebAutomation] = []
@@ -1173,6 +1447,7 @@ class WorkerPool:
         
         self._browser_semaphore = asyncio.Semaphore(worker_count)  # Allow N concurrent requests
         self._last_activity = time.time()
+        self._active_requests = 0
     
     async def _get_available_worker(self, exclude: set = None) -> Tuple[int, GeminiWebAutomation]:
         """Get first available worker (round-robin). Waits if all are busy."""
@@ -1235,6 +1510,11 @@ class WorkerPool:
             
             # Use .browser_session for persistence
             user_data_dir = os.path.join(os.path.dirname(__file__), ".browser_session")
+
+            launch_kwargs: Dict[str, Any] = {}
+            if self.browser_channel:
+                launch_kwargs["channel"] = self.browser_channel
+                log(f"Using browser channel: {self.browser_channel}", "WorkerPool")
             
             self.shared_context = await self.playwright.chromium.launch_persistent_context(
                 user_data_dir,
@@ -1242,6 +1522,7 @@ class WorkerPool:
                 args=browser_args,
                 viewport={"width": 1920, "height": 1080},
                 permissions=["clipboard-read", "clipboard-write"],
+                **launch_kwargs,
             )
             
             # Inject cookies if provided
@@ -1330,7 +1611,11 @@ class WorkerPool:
         
         for attempt in range(MAX_RETRIES):
             # Acquire semaphore (limits concurrent requests to N workers)
+            sem_wait_start = time.time()
             async with self._browser_semaphore:
+                sem_wait_ms = int((time.time() - sem_wait_start) * 1000)
+                if sem_wait_ms > 250:
+                    log(f"Worker assignment wait: {sem_wait_ms}ms", "WorkerPool")
                 
                 # Get available worker, excluding already-tried workers
                 worker_index, worker = await self._get_available_worker(exclude=tried_workers)
@@ -1338,6 +1623,8 @@ class WorkerPool:
                 if worker is None:
                     log(f"⚠️ No available workers left to try", "WorkerPool")
                     break
+
+                self._active_requests += 1
                 
                 tried_workers.add(worker_index)
                 
@@ -1363,12 +1650,36 @@ class WorkerPool:
                     last_error = str(e)
                     log(f"Worker {worker_index+1} exception: {e}, retrying...", "WorkerPool")
                 finally:
+                    self._active_requests = max(0, self._active_requests - 1)
                     await self._release_worker(worker_index)
                     self._last_activity = time.time()
         
         # All retries exhausted
         log(f"❌ All {MAX_RETRIES} attempts failed. Last error: {last_error}", "WorkerPool")
         return {"success": False, "error": f"All workers failed. Last error: {last_error}"}
+
+    def get_diagnostics(self) -> Dict[str, Any]:
+        errors = GeminiWebAutomation.get_all_errors()
+        workers = []
+        for idx, worker in enumerate(self.workers):
+            workers.append({
+                "worker_id": idx + 1,
+                "initialized": bool(worker and worker._initialized),
+                "busy": bool(self._worker_busy[idx]) if idx < len(self._worker_busy) else False,
+                "generation_in_progress": bool(worker and worker._generation_in_progress),
+                "last_error": errors.get(idx + 1),
+            })
+
+        return {
+            "initialized": self._initialized,
+            "provider": self.provider,
+            "worker_count": self.worker_count,
+            "active_requests": self._active_requests,
+            "browser_channel": self.browser_channel or "default",
+            "workers": workers,
+            "errors": errors,
+            "last_activity_unix": int(self._last_activity),
+        }
 
 
     async def close(self):
