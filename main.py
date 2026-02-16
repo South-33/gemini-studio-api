@@ -18,7 +18,7 @@ import json
 import time
 import uuid
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional, Dict, Union
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -71,6 +71,8 @@ async def lifespan(app: FastAPI):
     success = await init_browser_thread()
     if success:
         log(f"✅ Multi-Worker Pool Ready ({WORKER_COUNT} workers)")
+    else:
+        raise RuntimeError("Worker pool failed to initialize")
     
     yield
     if worker_pool:
@@ -186,7 +188,7 @@ async def openai_chat(request: Request):
         "ip": source["ip"],
         "model": body.get("model", ""),
         "status": "started",
-        "started_at": datetime.utcnow().isoformat(),
+        "started_at": datetime.now(timezone.utc).isoformat(),
     }
     recent_requests.append(trace)
 
@@ -259,13 +261,13 @@ async def openai_chat(request: Request):
         log(f"Browser thread returned", "API")
     except TimeoutError:
         trace["status"] = "timeout"
-        trace["finished_at"] = datetime.utcnow().isoformat()
+        trace["finished_at"] = datetime.now(timezone.utc).isoformat()
         log(f"❌ BROWSER TIMEOUT after {api_timeout}s - request stuck in browser thread", "API")
         raise HTTPException(status_code=504, detail=f"Browser operation timed out after {api_timeout}s")
     except Exception as e:
         trace["status"] = "error"
         trace["error"] = str(e)
-        trace["finished_at"] = datetime.utcnow().isoformat()
+        trace["finished_at"] = datetime.now(timezone.utc).isoformat()
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         for img_path in image_paths:
@@ -275,13 +277,13 @@ async def openai_chat(request: Request):
     if not result["success"]:
         trace["status"] = "failed"
         trace["error"] = result.get("error")
-        trace["finished_at"] = datetime.utcnow().isoformat()
+        trace["finished_at"] = datetime.now(timezone.utc).isoformat()
         raise HTTPException(status_code=500, detail=result.get("error"))
 
     content = result["response"] or ""
     trace["status"] = "ok"
     trace["response_chars"] = len(content)
-    trace["finished_at"] = datetime.utcnow().isoformat()
+    trace["finished_at"] = datetime.now(timezone.utc).isoformat()
     log(f"Got response ({len(content)} chars)", "API")
     
     return {

@@ -1482,17 +1482,23 @@ class WorkerPool:
             if 0 <= index < len(self._worker_busy):
                 self._worker_busy[index] = False
 
-    async def _close_all_context_pages(self):
-        """Best-effort close of all existing pages in shared context."""
+    def _get_reusable_context_pages(self) -> List[Page]:
+        """Collect existing live pages that can be reused as worker windows."""
         if not self.shared_context:
-            return
+            return []
 
-        pages = list(self.shared_context.pages)
-        for page in pages:
+        reusable: List[Page] = []
+        for page in self.shared_context.pages:
             try:
-                await page.close()
+                if page.is_closed():
+                    continue
+                url = (page.url or "").lower()
+                if url.startswith("devtools://"):
+                    continue
+                reusable.append(page)
             except:
-                pass
+                continue
+        return reusable
 
     def _window_bounds_for_index(self, index: int) -> Dict[str, int]:
         """Compute deterministic tiled bounds for headed split windows."""
@@ -1663,8 +1669,11 @@ class WorkerPool:
             if LOW_MEMORY_MODE:
                 await self.shared_context.route("**/*", self._block_resources)
 
+            reusable_pages: List[Page] = []
             if use_split_windows:
-                await self._close_all_context_pages()
+                reusable_pages = self._get_reusable_context_pages()
+                if reusable_pages:
+                    log(f"Reusing {len(reusable_pages)} existing window page(s)", "WorkerPool")
 
             # Create N Gemini Web workers (1 worker = 1 tab)
             print(f"[WorkerPool] Creating {self.worker_count} Gemini Web worker(s)...")
@@ -1675,7 +1684,11 @@ class WorkerPool:
 
                 page: Optional[Page] = None
                 if use_split_windows:
-                    page = await self._open_split_window_page(i)
+                    if reusable_pages:
+                        page = reusable_pages.pop(0)
+                        await self._position_page_window(page, i)
+                    else:
+                        page = await self._open_split_window_page(i)
 
                 if page is None:
                     page = await self.shared_context.new_page()
