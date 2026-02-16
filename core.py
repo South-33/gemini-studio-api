@@ -1437,10 +1437,15 @@ class WorkerPool:
         self.provider = provider.lower()
         self.browser_channel = os.getenv("BROWSER_CHANNEL", "").strip()
         self.headed_split_windows = os.getenv("HEADED_SPLIT_WINDOWS", "true").lower() == "true"
+        self.headed_window_layout = os.getenv("HEADED_WINDOW_LAYOUT", "overlap").strip().lower()
         self.headed_screen_width = max(800, int(os.getenv("HEADED_SCREEN_WIDTH", "1920")))
         self.headed_screen_height = max(600, int(os.getenv("HEADED_SCREEN_HEIGHT", "1080")))
         self.headed_screen_left = int(os.getenv("HEADED_SCREEN_LEFT", "0"))
         self.headed_screen_top = int(os.getenv("HEADED_SCREEN_TOP", "0"))
+        self.headed_window_width = max(800, int(os.getenv("HEADED_WINDOW_WIDTH", "1366")))
+        self.headed_window_height = max(600, int(os.getenv("HEADED_WINDOW_HEIGHT", "768")))
+        self.headed_window_offset_x = int(os.getenv("HEADED_WINDOW_OFFSET_X", "70"))
+        self.headed_window_offset_y = int(os.getenv("HEADED_WINDOW_OFFSET_Y", "45"))
         
         # Array of Gemini Web workers (1 worker = 1 tab)
         self.workers: List[GeminiWebAutomation] = []
@@ -1501,20 +1506,36 @@ class WorkerPool:
         return reusable
 
     def _window_bounds_for_index(self, index: int) -> Dict[str, int]:
-        """Compute deterministic tiled bounds for headed split windows."""
-        # Two columns by default; more workers spill to additional rows.
-        cols = min(2, max(1, self.worker_count))
-        rows = max(1, math.ceil(self.worker_count / cols))
+        """Compute deterministic window bounds for headed split windows."""
+        layout = self.headed_window_layout
 
-        width = max(640, self.headed_screen_width // cols)
-        height = max(480, self.headed_screen_height // rows)
+        if layout == "tile":
+            # Two columns by default; more workers spill to additional rows.
+            cols = min(2, max(1, self.worker_count))
+            rows = max(1, math.ceil(self.worker_count / cols))
 
-        col = index % cols
-        row = index // cols
+            width = max(640, self.headed_screen_width // cols)
+            height = max(480, self.headed_screen_height // rows)
+
+            col = index % cols
+            row = index // cols
+
+            return {
+                "left": self.headed_screen_left + (col * width),
+                "top": self.headed_screen_top + (row * height),
+                "width": width,
+                "height": height,
+            }
+
+        # Default: overlap full-size windows so each worker keeps desktop layout.
+        width = self.headed_window_width
+        height = self.headed_window_height
+        left = self.headed_screen_left + (index * self.headed_window_offset_x)
+        top = self.headed_screen_top + (index * self.headed_window_offset_y)
 
         return {
-            "left": self.headed_screen_left + (col * width),
-            "top": self.headed_screen_top + (row * height),
+            "left": left,
+            "top": top,
             "width": width,
             "height": height,
         }
@@ -1587,7 +1608,7 @@ class WorkerPool:
             use_split_windows = (not is_headless) and self.headed_split_windows and self.worker_count >= 2
             if use_split_windows:
                 log(
-                    f"Headed split windows enabled ({self.worker_count} workers, {self.headed_screen_width}x{self.headed_screen_height})",
+                    f"Headed split windows enabled ({self.worker_count} workers, layout={self.headed_window_layout})",
                     "WorkerPool",
                 )
             
@@ -1811,6 +1832,11 @@ class WorkerPool:
             "active_requests": self._active_requests,
             "browser_channel": self.browser_channel or "default",
             "headed_split_windows": self.headed_split_windows,
+            "headed_window_layout": self.headed_window_layout,
+            "headed_window_size": {
+                "width": self.headed_window_width,
+                "height": self.headed_window_height,
+            },
             "workers": workers,
             "errors": errors,
             "last_activity_unix": int(self._last_activity),

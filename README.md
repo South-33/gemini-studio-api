@@ -8,7 +8,7 @@ A lightweight API that automates Gemini Web to provide OpenAI-compatible endpoin
 - **Session Persistence** - Login once via Chrome, stays authenticated forever
 - **ngrok Tunnel** - Expose your local API to the internet with a static domain
 - **Resilient Selectors** - Stable-first fallback selectors for Gemini UI drift
-- **Headed Split Windows** - Optional auto-tiling for visible worker windows
+- **Headed Split Windows** - Optional per-worker windows with overlap/tile placement
 - **Discord Alerts** - Error notifications with cooldown and diagnostics payload
 - **Diagnostics Endpoint** - Worker status, error context, and recent request traces
 - **Request Source Tracing** - Track project/client/request-id across logs and diagnostics
@@ -94,8 +94,13 @@ RECENT_REQUEST_LIMIT=200  # Recent traces stored for /v1/diagnostics
 
 # Headed split-window mode (defaults to true when HEADLESS=false and WORKER_COUNT>=2)
 HEADED_SPLIT_WINDOWS=true   # set false to keep worker tabs in one window
-HEADED_SCREEN_WIDTH=1920
-HEADED_SCREEN_HEIGHT=1080
+HEADED_WINDOW_LAYOUT=overlap  # overlap (default) or tile
+HEADED_WINDOW_WIDTH=1366
+HEADED_WINDOW_HEIGHT=768
+HEADED_WINDOW_OFFSET_X=70
+HEADED_WINDOW_OFFSET_Y=45
+HEADED_SCREEN_WIDTH=1920      # used by tile layout
+HEADED_SCREEN_HEIGHT=1080     # used by tile layout
 HEADED_SCREEN_LEFT=0
 HEADED_SCREEN_TOP=0
 
@@ -253,7 +258,7 @@ Returns:
 - **Periodic Refresh** - Hard refresh every 10 requests to clear stale page state
 - **Overlay Dismissal** - Clears stuck overlays before each request
 - **Wait-State Telemetry** - Periodic wait logs include stop/send/response/visibility state
-- **Headed Window Tiling** - Optional CDP-based split windows for visible multi-worker runs
+- **Headed Window Placement** - Optional CDP-based overlap/tile windows for multi-worker runs
 - **Diagnostics Endpoint** - Exposes worker state, last errors, and recent request traces
 - **Discord Alerts** - Cooldown-based error notifications with compact diagnostics payload
 
