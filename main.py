@@ -16,10 +16,8 @@ import base64
 import tempfile
 import json
 import time
-import uuid
 from datetime import datetime
 from typing import List, Optional, Dict, Union
-from collections import deque
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict
@@ -36,7 +34,7 @@ def log(msg: str, tag: str = "Server"):
 # Load .env file
 load_dotenv()
 
-from core import WorkerPool, GeminiWebAutomation
+from core import WorkerPool
 
 # Configuration
 WORKER_COUNT = int(os.getenv("WORKER_COUNT", "1"))
@@ -46,7 +44,6 @@ PROVIDER = os.getenv("PROVIDER", "auto").lower()  # "auto", "aistudio", or "gemi
 worker_pool: Optional[WorkerPool] = None
 browser_loop: Optional[asyncio.AbstractEventLoop] = None
 browser_thread: Optional[threading.Thread] = None
-RECENT_REQUESTS = deque(maxlen=int(os.getenv("RECENT_REQUEST_LIMIT", "200")))
 
 def run_browser_loop(loop):
     asyncio.set_event_loop(loop)
@@ -123,41 +120,6 @@ def parse_model_and_thinking(model_name: str) -> tuple:
     
     return model_name, "High"
 
-def get_request_source(request: Request, body: Dict) -> Dict[str, str]:
-    """Extract request source metadata for traceability."""
-    headers = request.headers
-    metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
-
-    request_id = (
-        headers.get("x-request-id")
-        or headers.get("x-correlation-id")
-        or body.get("request_id")
-        or uuid.uuid4().hex[:8]
-    )
-
-    source = {
-        "request_id": request_id,
-        "project": (
-            headers.get("x-project-name")
-            or headers.get("x-project-id")
-            or metadata.get("project")
-            or body.get("project")
-            or "unknown"
-        ),
-        "client": (
-            headers.get("x-client-name")
-            or headers.get("x-app-name")
-            or metadata.get("client")
-            or body.get("client")
-            or "unknown"
-        ),
-        "ip": request.client.host if request.client else "unknown",
-        "origin": headers.get("origin") or "",
-        "referer": headers.get("referer") or "",
-        "user_agent": headers.get("user-agent") or "",
-    }
-    return source
-
 # --- Endpoints ---
 
 @app.get("/v1/models")
@@ -175,23 +137,6 @@ async def list_models():
 async def openai_chat(request: Request):
     """OpenAI-compatible chat completions endpoint."""
     body = await request.json()
-    source = get_request_source(request, body)
-
-    log(
-        f"[{source['request_id']}] Source: project={source['project']} client={source['client']} ip={source['ip']}",
-        "API"
-    )
-
-    RECENT_REQUESTS.append({
-        "request_id": source["request_id"],
-        "timestamp": datetime.now().isoformat(),
-        "project": source["project"],
-        "client": source["client"],
-        "ip": source["ip"],
-        "model": body.get("model", ""),
-        "origin": source["origin"],
-        "referer": source["referer"],
-    })
     
     if not worker_pool:
         raise HTTPException(status_code=503, detail="Worker pool not initialized")
@@ -255,29 +200,18 @@ async def openai_chat(request: Request):
     
     # CRITICAL: Use timeout to prevent infinite blocking
     # The lambda with timeout prevents run_in_executor from blocking forever
-    BROWSER_TIMEOUT = int(os.getenv("BROWSER_TIMEOUT", "480"))
-    API_TIMEOUT_HEADROOM = int(os.getenv("API_TIMEOUT_HEADROOM", "30"))
-    api_wait_timeout = BROWSER_TIMEOUT + max(0, API_TIMEOUT_HEADROOM)
+    BROWSER_TIMEOUT = 300  # 5 minutes max for generation
     
     try:
-        log(
-            f"Waiting for browser thread (worker_timeout={BROWSER_TIMEOUT}s, api_timeout={api_wait_timeout}s)...",
-            "API"
-        )
+        log(f"Waiting for browser thread (timeout={BROWSER_TIMEOUT}s)...", "API")
         result = await asyncio.get_event_loop().run_in_executor(
             None, 
-            lambda: future.result(timeout=api_wait_timeout)
+            lambda: future.result(timeout=BROWSER_TIMEOUT)
         )
         log(f"Browser thread returned", "API")
     except TimeoutError:
-        log(
-            f"❌ BROWSER TIMEOUT after {api_wait_timeout}s - request stuck in browser thread",
-            "API"
-        )
-        raise HTTPException(
-            status_code=504,
-            detail=f"Browser operation timed out after {api_wait_timeout}s"
-        )
+        log(f"❌ BROWSER TIMEOUT after {BROWSER_TIMEOUT}s - request stuck in browser thread", "API")
+        raise HTTPException(status_code=504, detail=f"Browser operation timed out after {BROWSER_TIMEOUT}s")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
@@ -305,62 +239,12 @@ async def openai_chat(request: Request):
             "prompt_tokens": len(prompt),
             "completion_tokens": len(content),
             "total_tokens": len(prompt) + len(content)
-        },
-        "request_id": source["request_id"]
+        }
     }
 
 @app.get("/health")
 async def health():
     return {"status": "ok", "workers": WORKER_COUNT}
-
-@app.get("/v1/diagnostics")
-async def diagnostics():
-    """
-    Diagnostics endpoint for debugging selector failures and worker health.
-    Returns structured error information that can be parsed by monitoring tools.
-    """
-    errors = GeminiWebAutomation.get_all_errors()
-    
-    # Get worker status
-    worker_status = []
-    if worker_pool and worker_pool.workers:
-        for i, worker in enumerate(worker_pool.workers):
-            worker_status.append({
-                "worker_id": i + 1,
-                "initialized": worker._initialized,
-                "busy": worker_pool._worker_busy[i] if i < len(worker_pool._worker_busy) else False,
-                "request_count": worker._request_count,
-                "current_request_id": worker._request_id,
-                "timeline_tail": worker._timeline_tail(10) if hasattr(worker, "_timeline_tail") else [],
-                "last_error": errors.get(i + 1)
-            })
-    
-    return {
-        "status": "ok" if worker_pool and worker_pool._initialized else "initializing",
-        "worker_count": WORKER_COUNT,
-        "workers": worker_status,
-        "errors": errors,
-        "recent_requests": list(RECENT_REQUESTS),
-        "keepalive": {
-            "enabled": getattr(worker_pool, "keepalive_enabled", False) if worker_pool else False,
-            "interval_seconds": getattr(worker_pool, "keepalive_interval", 0) if worker_pool else 0,
-            "idle_recover_seconds": getattr(worker_pool, "keepalive_idle_recover_seconds", 0) if worker_pool else 0,
-            "runs": getattr(worker_pool, "_keepalive_runs", 0) if worker_pool else 0,
-            "recoveries": getattr(worker_pool, "_keepalive_recoveries", 0) if worker_pool else 0,
-            "reloads": getattr(worker_pool, "_keepalive_reloads", 0) if worker_pool else 0,
-        },
-        "selectors": {
-            key: vals[0] if isinstance(vals, list) and vals else vals 
-            for key, vals in GeminiWebAutomation.SELECTORS.items()
-        },
-        "timestamp": datetime.now().isoformat()
-    }
-
-@app.post("/v1/diagnostics/clear-errors")
-async def clear_errors():
-    """Clear all tracked errors."""
-    GeminiWebAutomation.clear_errors()
-    return {"status": "ok", "message": "Errors cleared"}
 
 if __name__ == "__main__":
     import uvicorn
