@@ -1218,6 +1218,104 @@ class GeminiWebAutomation(BaseAutomation):
                 self._track_error("Send button click failed", "send_btn", "send_message", snapshot)
                 return {"success": False, "error": "Send button click failed"}
             
+            # 4.5 Verify generation actually started (stop button appears) - with retry
+            # Capture pre-send state to detect instant completions
+            pre_send_snap = await self._capture_state_snapshot()
+            max_send_retries = 3
+            generation_started = False
+            
+            for send_attempt in range(max_send_retries):
+                await self._human_delay(1500, 2500)  # Wait for generation to start
+                
+                # Check current state
+                snap = await self._capture_state_snapshot()
+                stop_now = snap.get("stop_visible", False)
+                send_now = snap.get("send_visible", True)
+                resp_now = snap.get("response_count", 0)
+                resp_before = pre_send_snap.get("response_count", 0)
+                
+                # Case 1: Generation actively running (stop visible)
+                if stop_now:
+                    log(f"✅ Generation started (attempt {send_attempt + 1})", f"Worker {self.worker_id}")
+                    generation_started = True
+                    break
+                
+                # Case 2: Generation finished instantly (response appeared, back to send)
+                # This happens when Gemini responds very fast
+                if not stop_now and send_now and resp_now > resp_before:
+                    log(f"✅ Generation completed instantly (attempt {send_attempt + 1})", f"Worker {self.worker_id}")
+                    generation_started = True
+                    break
+                
+                # Case 3: Send didn't work, retry
+                if send_attempt < max_send_retries - 1:
+                    log(f"⚠️ Generation didn't start, retrying send (attempt {send_attempt + 2}/{max_send_retries})", f"Worker {self.worker_id}")
+                    # Retry clicking send
+                    for selector in self._selector_candidates("send_btn"):
+                        try:
+                            send_btn = self.page.locator(selector).first
+                            if await send_btn.is_visible():
+                                await send_btn.click()
+                                break
+                        except:
+                            continue
+                else:
+                    # All retries exhausted - try hard refresh fallback
+                    log(f"⚠️ Soft retries failed, attempting hard refresh recovery", f"Worker {self.worker_id}")
+                    break
+            
+            # Fallback: hard refresh and retry once more if generation never started
+            if not generation_started:
+                try:
+                    log(f"🔄 Hard refresh recovery", f"Worker {self.worker_id}")
+                    await self.page.reload(wait_until="domcontentloaded", timeout=30000)
+                    await self._human_delay(1000, 1500)
+                    
+                    # Re-init worker state
+                    if not await self.init_with_page(self.page, self.context):
+                        log(f"❌ Re-init failed after hard refresh", f"Worker {self.worker_id}")
+                        snapshot = await self._capture_state_snapshot()
+                        self._track_error("Re-init failed after hard refresh", "init", "send_message", snapshot)
+                        return {"success": False, "error": "Worker re-init failed after hard refresh"}
+                    
+                    # Re-send the prompt
+                    log(f"🔄 Retrying send after recovery", f"Worker {self.worker_id}")
+                    input_selector = await self._resolve_selector("input", require_visible=True, timeout_ms=2000)
+                    if input_selector:
+                        input_area = self.page.locator(input_selector)
+                        await input_area.click()
+                        await self._human_delay()
+                        await input_area.fill(prompt)
+                        await self._human_delay(300, 600)
+                        
+                        # Click send again
+                        for selector in self._selector_candidates("send_btn"):
+                            try:
+                                send_btn = self.page.locator(selector).first
+                                if await send_btn.is_visible():
+                                    await send_btn.click()
+                                    break
+                            except:
+                                continue
+                    
+                    # Wait and check if it worked
+                    await self._human_delay(2000, 3000)
+                    snap = await self._capture_state_snapshot()
+                    if snap.get("stop_visible", False) or snap.get("response_count", 0) > resp_before:
+                        log(f"✅ Generation started after hard refresh recovery", f"Worker {self.worker_id}")
+                        generation_started = True
+                    else:
+                        log(f"❌ Generation failed after hard refresh", f"Worker {self.worker_id}")
+                        snapshot = await self._capture_state_snapshot()
+                        self._track_error("Generation failed after hard refresh", "send_btn", "verify_generation_started", snapshot)
+                        return {"success": False, "error": "Generation failed to start after hard refresh recovery"}
+                        
+                except Exception as e:
+                    log(f"❌ Hard refresh recovery failed: {e}", f"Worker {self.worker_id}")
+                    snapshot = await self._capture_state_snapshot()
+                    self._track_error("Hard refresh recovery failed", "send_btn", "verify_generation_started", snapshot)
+                    return {"success": False, "error": f"Generation failed after all recovery attempts: {e}"}
+            
             # 5. Wait for Response (Copy button to appear)
             log(f"Waiting for response...", f"Worker {self.worker_id}")
             await self._human_delay(300, 600)  # Reduced initial wait
