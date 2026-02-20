@@ -1334,39 +1334,67 @@ class GeminiWebAutomation(BaseAutomation):
                 self._track_error("Send button click failed", "send_btn", "send_message", snapshot)
                 return {"success": False, "error": "Send button click failed"}
             
-            # 4.5 Verify generation actually started (stop button appears) - with retry
-            # Capture pre-send state to detect instant completions
+            # 4.5 Verify generation started using a short observation loop
+            # This avoids false negatives for very fast responses.
             pre_send_snap = await self._capture_state_snapshot()
-            max_send_retries = MAX_SEND_RETRIES
+            pre_send_resp_count = int(pre_send_snap.get("response_count") or 0)
+            prompt_len = len((prompt or "").strip())
+            start_observe_seconds = 6.0
+            start_poll_seconds = 0.2
             generation_started = False
-            
-            for send_attempt in range(max_send_retries):
-                await self._human_delay(1500, 2500)  # Wait for generation to start
-                
-                # Check current state
-                snap = await self._capture_state_snapshot()
-                stop_now = snap.get("stop_visible", False)
-                send_now = snap.get("send_visible", True)
-                resp_now = snap.get("response_count", 0)
-                resp_before = pre_send_snap.get("response_count", 0)
-                
-                # Case 1: Generation actively running (stop visible)
-                if stop_now:
-                    log(f"✅ Generation started (attempt {send_attempt + 1})", f"Worker {self.worker_id}")
+
+            for send_attempt in range(MAX_SEND_RETRIES):
+                start_signal = ""
+                last_snap = None
+                observe_deadline = time.time() + start_observe_seconds
+
+                while time.time() < observe_deadline:
+                    snap = await self._capture_state_snapshot()
+                    last_snap = snap
+                    stop_now = bool(snap.get("stop_visible"))
+                    send_now = bool(snap.get("send_visible"))
+                    resp_now = int(snap.get("response_count") or 0)
+                    copy_now = int(snap.get("copy_count") or 0)
+
+                    input_now = await get_input_text()
+                    input_now_len = len((input_now or "").strip())
+                    input_cleared = prompt_len == 0 or input_now_len < max(1, prompt_len // 2)
+
+                    if stop_now:
+                        start_signal = "stop_visible"
+                    elif not send_now:
+                        start_signal = "send_hidden"
+                    elif copy_now > pre_send_count:
+                        start_signal = "copy_increased"
+                    elif resp_now > pre_send_resp_count:
+                        start_signal = "response_increased"
+                    elif input_cleared:
+                        start_signal = "input_cleared"
+
+                    if start_signal:
+                        break
+
+                    await asyncio.sleep(start_poll_seconds)
+
+                if start_signal:
+                    log(f"✅ Generation started (attempt {send_attempt + 1}, signal={start_signal})", f"Worker {self.worker_id}")
                     generation_started = True
                     break
-                
-                # Case 2: Generation finished instantly (response appeared, back to send)
-                # This happens when Gemini responds very fast
-                if not stop_now and send_now and resp_now > resp_before:
-                    log(f"✅ Generation completed instantly (attempt {send_attempt + 1})", f"Worker {self.worker_id}")
-                    generation_started = True
-                    break
-                
-                # Case 3: Send didn't work, retry
-                if send_attempt < max_send_retries - 1:
-                    log(f"⚠️ Generation didn't start, retrying send (attempt {send_attempt + 2}/{max_send_retries})", f"Worker {self.worker_id}")
-                    # Retry clicking send
+
+                # No start signals detected: confirm unsent before retrying.
+                if last_snap is None:
+                    last_snap = await self._capture_state_snapshot()
+                send_still_visible = bool(last_snap.get("send_visible"))
+                input_after = await get_input_text()
+                input_after_len = len((input_after or "").strip())
+                input_still_present = prompt_len > 0 and input_after_len >= max(1, prompt_len // 2)
+                confirmed_unsent = send_still_visible and input_still_present
+
+                if confirmed_unsent and send_attempt < MAX_SEND_RETRIES - 1:
+                    log(
+                        f"⚠️ Confirmed unsent; retrying send (attempt {send_attempt + 2}/{MAX_SEND_RETRIES})",
+                        f"Worker {self.worker_id}"
+                    )
                     for selector in self._selector_candidates("send_btn"):
                         try:
                             send_btn = self.page.locator(selector).first
@@ -1375,10 +1403,17 @@ class GeminiWebAutomation(BaseAutomation):
                                 break
                         except:
                             continue
-                else:
-                    # All retries exhausted - try hard refresh fallback
-                    log(f"⚠️ Soft retries failed, attempting hard refresh recovery", f"Worker {self.worker_id}")
+                    continue
+
+                if not confirmed_unsent:
+                    # Ambiguous state: continue to normal wait path instead of over-retrying.
+                    log("⚠️ Ambiguous start state; proceeding to response wait", f"Worker {self.worker_id}")
+                    generation_started = True
                     break
+
+                # Confirmed unsent and out of retries.
+                log(f"⚠️ Soft retries failed, attempting hard refresh recovery", f"Worker {self.worker_id}")
+                break
             
             # Fallback: hard refresh and retry once more if generation never started
             if not generation_started:
@@ -1413,7 +1448,7 @@ class GeminiWebAutomation(BaseAutomation):
                     # Wait and check if it worked
                     await self._human_delay(2000, 3000)
                     snap = await self._capture_state_snapshot()
-                    if snap.get("stop_visible", False) or snap.get("response_count", 0) > resp_before:
+                    if snap.get("stop_visible", False) or snap.get("response_count", 0) > pre_send_resp_count:
                         log(f"✅ Generation started after hard refresh recovery", f"Worker {self.worker_id}")
                         generation_started = True
                     else:
