@@ -250,16 +250,24 @@ async def openai_chat(request: Request):
     )
     future = asyncio.run_coroutine_threadsafe(coro, browser_loop)
     
-    api_timeout = BROWSER_TIMEOUT + API_TIMEOUT_HEADROOM
+    retry_budget = min(3, max(1, WORKER_COUNT))
+    api_timeout = (BROWSER_TIMEOUT * retry_budget) + API_TIMEOUT_HEADROOM
     
     try:
-        log(f"Waiting for browser thread (worker_timeout={BROWSER_TIMEOUT}s, api_timeout={api_timeout}s)...", "API")
+        log(
+            f"Waiting for browser thread (worker_timeout={BROWSER_TIMEOUT}s, retries={retry_budget}, api_timeout={api_timeout}s)...",
+            "API"
+        )
         result = await asyncio.get_event_loop().run_in_executor(
             None, 
             lambda: future.result(timeout=api_timeout)
         )
         log(f"Browser thread returned", "API")
     except TimeoutError:
+        try:
+            future.cancel()
+        except:
+            pass
         trace["status"] = "timeout"
         trace["finished_at"] = datetime.now(timezone.utc).isoformat()
         log(f"❌ BROWSER TIMEOUT after {api_timeout}s - request stuck in browser thread", "API")

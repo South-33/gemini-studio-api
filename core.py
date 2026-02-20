@@ -709,6 +709,8 @@ class GeminiWebAutomation(BaseAutomation):
         self._request_count = 0
         self._request_id = None  # Set per-request for log tracing
         self._wait_log_interval_seconds = max(2, int(os.getenv("WAIT_LOG_INTERVAL_SECONDS", "10")))
+        self._stall_empty_seconds = max(20, int(os.getenv("STALL_EMPTY_SECONDS", "45")))
+        self._stall_no_progress_seconds = max(30, int(os.getenv("STALL_NO_PROGRESS_SECONDS", "90")))
 
     def _selector_candidates(self, key: str) -> List[str]:
         raw = self.SELECTORS.get(key, [])
@@ -835,6 +837,104 @@ class GeminiWebAutomation(BaseAutomation):
             pass
 
         return snapshot
+
+    async def _click_stop_if_visible(self) -> bool:
+        """Best-effort stop click using in-page DOM lookup."""
+        try:
+            clicked = await self.page.evaluate(
+                """
+                () => {
+                    const isVisible = (el) => {
+                        if (!el) return false;
+                        const style = window.getComputedStyle(el);
+                        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+                        return !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                    };
+
+                    const buttons = Array.from(document.querySelectorAll('button')).filter(isVisible);
+                    const stopBtn = buttons.find((b) => {
+                        const label = (b.getAttribute('aria-label') || '').toLowerCase();
+                        const text = (b.innerText || '').toLowerCase();
+                        return label.includes('stop') || text.includes('stop');
+                    });
+
+                    if (!stopBtn) return false;
+
+                    try {
+                        stopBtn.click();
+                        return true;
+                    } catch (_) {}
+
+                    try {
+                        stopBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                        return true;
+                    } catch (_) {}
+
+                    return false;
+                }
+                """
+            )
+            return bool(clicked)
+        except:
+            return False
+
+    async def _extract_latest_via_copy(self, copy_selector: str, pre_send_count: int) -> Optional[str]:
+        """Try extracting response markdown via latest copy button."""
+        try:
+            buttons = self.page.locator(copy_selector)
+            current_count = await buttons.count()
+            if current_count <= pre_send_count:
+                return None
+
+            copy_btn = buttons.nth(current_count - 1)
+            if not await copy_btn.is_visible():
+                return None
+
+            async with GeminiWebAutomation._get_clipboard_lock():
+                await copy_btn.click()
+                await self._human_delay(100, 200)
+                markdown = await self.page.evaluate("navigator.clipboard.readText()")
+
+            if markdown and markdown.strip():
+                return markdown.strip()
+            return None
+        except:
+            return None
+
+    async def _attempt_finalize_stalled_response(self, copy_selector: str, pre_send_count: int) -> Optional[str]:
+        """Try to finalize an in-flight stalled generation before giving up."""
+        try:
+            stop_clicked = await self._click_stop_if_visible()
+            if stop_clicked:
+                log("Attempted stop click on stalled generation", f"Worker {self.worker_id}")
+            await self._human_delay(1200, 1800)
+
+            markdown = await self._extract_latest_via_copy(copy_selector, pre_send_count)
+            if markdown:
+                return markdown
+
+            fallback = await self._fallback_extract()
+            if fallback.get("success"):
+                text = (fallback.get("response") or "").strip()
+                if text:
+                    return text
+            return None
+        except:
+            return None
+
+    async def _hard_refresh_and_reinit(self, reason: str) -> bool:
+        """Hard refresh page and re-run worker init path."""
+        try:
+            log(f"Hard refresh recovery ({reason})", f"Worker {self.worker_id}")
+            await self.page.reload(wait_until="domcontentloaded", timeout=30000)
+            await self._human_delay(1000, 1500)
+            self._request_count = 0
+
+            ok = await self.init_with_page(self.page, self.context)
+            return bool(ok)
+        except Exception as e:
+            log(f"Hard refresh recovery failed: {e}", f"Worker {self.worker_id}")
+            return False
 
     def _track_error(self, error: str, selector_key: str, action: str, diagnostics: Optional[Dict[str, Any]] = None):
         payload = {
@@ -1083,6 +1183,21 @@ class GeminiWebAutomation(BaseAutomation):
                 err = "Copy selector not found"
                 self._track_error(err, "copy_btn", "send_message")
                 return {"success": False, "error": err}
+
+            # Preflight: if previous run left tab in Stop state, recover before sending
+            preflight = await self._capture_state_snapshot()
+            if preflight.get("stop_visible", False):
+                log("Preflight detected stale stop state, refreshing", f"Worker {self.worker_id}")
+                recovered = await self._hard_refresh_and_reinit("preflight_stop_visible")
+                if not recovered:
+                    self._track_error("Preflight recovery failed", "send_btn", "preflight_recovery", preflight)
+                    return {"success": False, "error": "Preflight recovery failed"}
+
+                copy_selector = await self._resolve_selector("copy_btn")
+                if not copy_selector:
+                    err = "Copy selector not found after recovery"
+                    self._track_error(err, "copy_btn", "send_message")
+                    return {"success": False, "error": err}
             
             # 0. Dismiss any stuck overlays/modals (Angular Material CDK overlays block clicks)
             try:
@@ -1267,12 +1382,8 @@ class GeminiWebAutomation(BaseAutomation):
             # Fallback: hard refresh and retry once more if generation never started
             if not generation_started:
                 try:
-                    log(f"🔄 Hard refresh recovery", f"Worker {self.worker_id}")
-                    await self.page.reload(wait_until="domcontentloaded", timeout=30000)
-                    await self._human_delay(1000, 1500)
-                    
-                    # Re-init worker state
-                    if not await self.init_with_page(self.page, self.context):
+                    recovered = await self._hard_refresh_and_reinit("send_not_started")
+                    if not recovered:
                         log(f"❌ Re-init failed after hard refresh", f"Worker {self.worker_id}")
                         snapshot = await self._capture_state_snapshot()
                         self._track_error("Re-init failed after hard refresh", "init", "send_message", snapshot)
@@ -1325,6 +1436,8 @@ class GeminiWebAutomation(BaseAutomation):
             max_wait = int(os.getenv("BROWSER_TIMEOUT", "480"))
             copy_btn = None
             last_wait_log = start_time
+            last_response_len = -1
+            last_progress_at = start_time
             while (time.time() - start_time) < max_wait:
                 btns = self.page.locator(copy_selector)
                 current_count = await btns.count()
@@ -1340,12 +1453,43 @@ class GeminiWebAutomation(BaseAutomation):
                 if (now - last_wait_log) >= self._wait_log_interval_seconds:
                     snap = await self._capture_state_snapshot()
                     elapsed = int(now - start_time)
+                    resp_count = int(snap.get("response_count") or 0)
+                    resp_len = int(snap.get("last_response_len") or 0)
+
+                    if resp_len > last_response_len:
+                        last_response_len = resp_len
+                        last_progress_at = now
+
                     log(
                         f"[{self._request_id}] Wait state: elapsed={elapsed}s stop={snap.get('stop_visible')} "
-                        f"send={snap.get('send_visible')} resp={snap.get('response_count')} "
-                        f"len={snap.get('last_response_len')} copy={snap.get('copy_count')} vis={snap.get('visibility')}",
+                        f"send={snap.get('send_visible')} resp={resp_count} "
+                        f"len={resp_len} copy={snap.get('copy_count')} vis={snap.get('visibility')}",
                         f"Worker {self.worker_id}"
                     )
+
+                    # Progress watchdog: recover poisoned/stalled generation before full timeout
+                    stop_visible = bool(snap.get("stop_visible"))
+                    no_progress_age = int(now - last_progress_at)
+                    stall_reason = ""
+
+                    if stop_visible and resp_count == 0 and elapsed >= self._stall_empty_seconds:
+                        stall_reason = f"Stalled generation: no output for {self._stall_empty_seconds}s"
+                    elif stop_visible and resp_count > 0 and no_progress_age >= self._stall_no_progress_seconds:
+                        stall_reason = f"Stalled generation: no progress for {self._stall_no_progress_seconds}s (len={resp_len})"
+
+                    if stall_reason:
+                        log(f"⚠️ {stall_reason}", f"Worker {self.worker_id}")
+
+                        recovered_text = await self._attempt_finalize_stalled_response(copy_selector, pre_send_count)
+                        if recovered_text:
+                            log("✅ Recovered stalled generation via finalize path", f"Worker {self.worker_id}")
+                            return {"success": True, "response": recovered_text}
+
+                        snapshot = await self._capture_state_snapshot()
+                        self._track_error(stall_reason, "copy_btn", "wait_for_response_stalled", snapshot)
+                        await self._hard_refresh_and_reinit("stalled_generation")
+                        return {"success": False, "error": stall_reason}
+
                     last_wait_log = now
                         
                 await asyncio.sleep(1)  # Reduced from 2s
@@ -1359,6 +1503,7 @@ class GeminiWebAutomation(BaseAutomation):
                     "wait_for_response",
                     snapshot,
                 )
+                await self._hard_refresh_and_reinit("copy_timeout")
                 return {"success": False, "error": f"Timeout after {max_wait}s waiting for response"}
 
             # Auto-scroll to ensure copy button is visible

@@ -89,8 +89,10 @@ HEADLESS=true             # false to run headed
 BROWSER_CHANNEL=chromium  # optional: new Chromium headless mode
 WORKER_COUNT=2            # Number of worker tabs
 BROWSER_TIMEOUT=480       # Worker timeout seconds
-API_TIMEOUT_HEADROOM=30   # API timeout buffer above worker timeout
+API_TIMEOUT_HEADROOM=30   # API timeout buffer; total API timeout includes retry budget
 RECENT_REQUEST_LIMIT=200  # Recent traces stored for /v1/diagnostics
+STALL_EMPTY_SECONDS=45    # Recover if stop-visible generation emits no output this long
+STALL_NO_PROGRESS_SECONDS=90 # Recover if output length stops growing this long
 
 # Headed split-window mode (defaults to true when HEADLESS=false and WORKER_COUNT>=2)
 HEADED_SPLIT_WINDOWS=true   # set false to keep worker tabs in one window
@@ -258,6 +260,7 @@ Returns:
 - **Periodic Refresh** - Hard refresh every 10 requests to clear stale page state
 - **Overlay Dismissal** - Clears stuck overlays before each request
 - **Wait-State Telemetry** - Periodic wait logs include stop/send/response/visibility state
+- **Stall Watchdog Recovery** - Detects no-output/no-progress generations and recovers before full timeout
 - **Headed Window Placement** - Optional CDP-based overlap/tile windows for multi-worker runs
 - **Diagnostics Endpoint** - Exposes worker state, last errors, and recent request traces
 - **Discord Alerts** - Cooldown-based error notifications with compact diagnostics payload
