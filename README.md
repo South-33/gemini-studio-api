@@ -91,8 +91,6 @@ WORKER_COUNT=2            # Number of worker tabs
 BROWSER_TIMEOUT=480       # Worker timeout seconds
 API_TIMEOUT_HEADROOM=30   # API timeout buffer; total API timeout includes retry budget
 RECENT_REQUEST_LIMIT=200  # Recent traces stored for /v1/diagnostics
-STALL_EMPTY_SECONDS=45    # Recover if stop-visible generation emits no output this long
-STALL_NO_PROGRESS_SECONDS=90 # Recover if output length stops growing this long
 
 # Headed split-window mode (defaults to true when HEADLESS=false and WORKER_COUNT>=2)
 HEADED_SPLIT_WINDOWS=true   # set false to keep worker tabs in one window
@@ -109,7 +107,6 @@ HEADED_SCREEN_TOP=0
 # Performance
 LOW_MEMORY_MODE=true
 SLOW_VM_MODE=true
-WAIT_LOG_INTERVAL_SECONDS=10
 DEBUG_SCREENSHOTS=false
 
 # Discord Notifications (optional)

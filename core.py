@@ -27,6 +27,13 @@ SLOW_VM_MODE = os.getenv("SLOW_VM_MODE", "true").lower() == "true"
 DEBUG_SCREENSHOTS = os.getenv("DEBUG_SCREENSHOTS", "false").lower() == "true"
 DEBUG_SCREENSHOT_DIR = os.path.join(os.path.dirname(__file__), "debug_screenshots")
 
+# Reliability constants (intentionally hardcoded)
+WAIT_LOG_INTERVAL_SECONDS = 10
+STALL_EMPTY_SECONDS = 45
+STALL_NO_PROGRESS_SECONDS = 90
+MAX_SEND_RETRIES = 3
+IDLE_REFRESH_AFTER_SECONDS = 600
+
 class BaseAutomation:
     """Base class for browser-based AI automation."""
     def __init__(self):
@@ -708,9 +715,9 @@ class GeminiWebAutomation(BaseAutomation):
         self.worker_id = worker_id  # For logging
         self._request_count = 0
         self._request_id = None  # Set per-request for log tracing
-        self._wait_log_interval_seconds = max(2, int(os.getenv("WAIT_LOG_INTERVAL_SECONDS", "10")))
-        self._stall_empty_seconds = max(20, int(os.getenv("STALL_EMPTY_SECONDS", "45")))
-        self._stall_no_progress_seconds = max(30, int(os.getenv("STALL_NO_PROGRESS_SECONDS", "90")))
+        self._wait_log_interval_seconds = WAIT_LOG_INTERVAL_SECONDS
+        self._stall_empty_seconds = STALL_EMPTY_SECONDS
+        self._stall_no_progress_seconds = STALL_NO_PROGRESS_SECONDS
 
     def _selector_candidates(self, key: str) -> List[str]:
         raw = self.SELECTORS.get(key, [])
@@ -912,12 +919,6 @@ class GeminiWebAutomation(BaseAutomation):
             markdown = await self._extract_latest_via_copy(copy_selector, pre_send_count)
             if markdown:
                 return markdown
-
-            fallback = await self._fallback_extract()
-            if fallback.get("success"):
-                text = (fallback.get("response") or "").strip()
-                if text:
-                    return text
             return None
         except:
             return None
@@ -1336,7 +1337,7 @@ class GeminiWebAutomation(BaseAutomation):
             # 4.5 Verify generation actually started (stop button appears) - with retry
             # Capture pre-send state to detect instant completions
             pre_send_snap = await self._capture_state_snapshot()
-            max_send_retries = 3
+            max_send_retries = MAX_SEND_RETRIES
             generation_started = False
             
             for send_attempt in range(max_send_retries):
@@ -1527,10 +1528,11 @@ class GeminiWebAutomation(BaseAutomation):
             self._generation_in_progress = False
             
             if not markdown:
-                log(f"⚠️ Clipboard empty, using fallback", f"Worker {self.worker_id}")
+                log(f"⚠️ Clipboard empty after copy", f"Worker {self.worker_id}")
                 snapshot = await self._capture_state_snapshot()
                 self._track_error("Clipboard empty", "copy_btn", "extract_response", snapshot)
-                return await self._fallback_extract()
+                await self._hard_refresh_and_reinit("clipboard_empty")
+                return {"success": False, "error": "Clipboard extraction failed"}
 
             log(f"✅ Response: {len(markdown)} chars", f"Worker {self.worker_id}")
             return {"success": True, "response": markdown.strip()}
@@ -1551,29 +1553,10 @@ class GeminiWebAutomation(BaseAutomation):
             except:
                 pass
             
-            # Retry extraction once via DOM fallback
-            return await self._fallback_extract()
+            return {"success": False, "error": str(e)}
         finally:
             self._generation_in_progress = False
             self._request_id = None
-
-    async def _fallback_extract(self) -> Dict:
-        """Fallback extraction via DOM if copy button fails."""
-        try:
-            await self._human_delay(400, 800) # Give DOM a moment to settle
-            text = await self.page.evaluate('''
-                () => {
-                    const responses = document.querySelectorAll('[data-content-type="response"]');
-                    if (responses.length === 0) return null;
-                    const last = responses[responses.length - 1];
-                    return last.innerText;
-                }
-            ''')
-            if text and len(text) > 20:
-                return {"success": True, "response": text.strip()}
-        except:
-            pass
-        return {"success": False, "error": "Extraction failed"}
 
     async def _select_model(self, model_name: str):
         """Select model from dropdown (Fast, Thinking, Pro)."""
@@ -1702,6 +1685,9 @@ class WorkerPool:
         self._browser_semaphore = asyncio.Semaphore(worker_count)  # Allow N concurrent requests
         self._last_activity = time.time()
         self._active_requests = 0
+        self._has_processed_request = False
+        self._idle_refresh_lock = asyncio.Lock()
+        self._last_idle_refresh_at = 0.0
     
     async def _get_available_worker(self, exclude: set = None) -> Tuple[int, GeminiWebAutomation]:
         """Get first available worker (round-robin). Waits if all are busy."""
@@ -1729,6 +1715,57 @@ class WorkerPool:
         async with self._worker_lock:
             if 0 <= index < len(self._worker_busy):
                 self._worker_busy[index] = False
+
+    async def _set_all_workers_busy(self, busy: bool):
+        async with self._worker_lock:
+            for i in range(len(self._worker_busy)):
+                self._worker_busy[i] = busy
+
+    def _are_workers_idle(self) -> bool:
+        if self._active_requests != 0:
+            return False
+        return not any(self._worker_busy)
+
+    async def _maybe_refresh_workers_after_idle(self):
+        """Refresh all workers once after long idle, right before handling new work."""
+        if not self._has_processed_request:
+            return
+
+        now = time.time()
+        if (now - self._last_activity) < IDLE_REFRESH_AFTER_SECONDS:
+            return
+        if not self._are_workers_idle():
+            return
+        if self._idle_refresh_lock.locked():
+            return
+
+        async with self._idle_refresh_lock:
+            # Re-check after lock acquisition to avoid races.
+            now = time.time()
+            if (now - self._last_activity) < IDLE_REFRESH_AFTER_SECONDS:
+                return
+            if not self._are_workers_idle():
+                return
+
+            idle_for = int(now - self._last_activity)
+            log(f"Idle maintenance: refreshing all workers after {idle_for}s idle", "WorkerPool")
+
+            await self._set_all_workers_busy(True)
+            try:
+                for i, worker in enumerate(self.workers):
+                    if not worker or not worker._initialized:
+                        continue
+                    try:
+                        ok = await worker._hard_refresh_and_reinit("idle_maintenance")
+                        if not ok:
+                            log(f"Worker {i+1} idle refresh failed", "WorkerPool")
+                    except Exception as e:
+                        log(f"Worker {i+1} idle refresh exception: {e}", "WorkerPool")
+            finally:
+                await self._set_all_workers_busy(False)
+
+            self._last_idle_refresh_at = time.time()
+            self._last_activity = self._last_idle_refresh_at
 
     def _get_reusable_context_pages(self) -> List[Page]:
         """Collect existing live pages that can be reused as worker windows."""
@@ -1994,13 +2031,16 @@ class WorkerPool:
         Send message with round-robin worker dispatch.
         Supports N concurrent requests (1 per worker).
         """
-        # Update activity timestamp
-        self._last_activity = time.time()
-        
         # No workers available
         if not self.workers:
             log("❌ No workers available", "WorkerPool")
             return {"success": False, "error": "No workers available"}
+
+        # Idle maintenance: refresh workers once after long idle periods.
+        await self._maybe_refresh_workers_after_idle()
+
+        # Request accepted, update activity timestamp.
+        self._last_activity = time.time()
         
         # Retry configuration
         MAX_RETRIES = min(3, len(self.workers))  # Try up to 3 different workers
@@ -2050,6 +2090,7 @@ class WorkerPool:
                 finally:
                     self._active_requests = max(0, self._active_requests - 1)
                     await self._release_worker(worker_index)
+                    self._has_processed_request = True
                     self._last_activity = time.time()
         
         # All retries exhausted
