@@ -33,6 +33,8 @@ STALL_EMPTY_SECONDS = 45
 STALL_NO_PROGRESS_SECONDS = 90
 MAX_SEND_RETRIES = 3
 IDLE_REFRESH_AFTER_SECONDS = 600
+SCROLL_NUDGE_AFTER_NO_PROGRESS_SECONDS = 8
+SCROLL_NUDGE_MIN_INTERVAL_SECONDS = 4
 
 class BaseAutomation:
     """Base class for browser-based AI automation."""
@@ -937,6 +939,42 @@ class GeminiWebAutomation(BaseAutomation):
             log(f"Hard refresh recovery failed: {e}", f"Worker {self.worker_id}")
             return False
 
+    async def _nudge_scroll_to_bottom(self):
+        """Best-effort scroll nudge to keep streaming region active/visible."""
+        try:
+            await self.page.evaluate(
+                """
+                () => {
+                    const selectors = [
+                        'main',
+                        '[role="main"]',
+                        'mat-sidenav-content',
+                        '.conversation-container',
+                        '.chat-history',
+                        'body',
+                        'html',
+                    ];
+
+                    for (const selector of selectors) {
+                        const nodes = document.querySelectorAll(selector);
+                        nodes.forEach((el) => {
+                            try { el.scrollTop = el.scrollHeight; } catch (_) {}
+                        });
+                    }
+
+                    try { window.scrollTo(0, document.body.scrollHeight); } catch (_) {}
+
+                    const responses = document.querySelectorAll('[data-content-type="response"], model-response, assistant-message-content');
+                    if (responses.length > 0) {
+                        const last = responses[responses.length - 1];
+                        try { last.scrollIntoView({ block: 'end', inline: 'nearest' }); } catch (_) {}
+                    }
+                }
+                """
+            )
+        except:
+            pass
+
     def _track_error(self, error: str, selector_key: str, action: str, diagnostics: Optional[Dict[str, Any]] = None):
         payload = {
             "error": error,
@@ -1474,6 +1512,7 @@ class GeminiWebAutomation(BaseAutomation):
             last_wait_log = start_time
             last_response_len = -1
             last_progress_at = start_time
+            last_scroll_nudge_at = 0.0
             while (time.time() - start_time) < max_wait:
                 btns = self.page.locator(copy_selector)
                 current_count = await btns.count()
@@ -1507,6 +1546,19 @@ class GeminiWebAutomation(BaseAutomation):
                     stop_visible = bool(snap.get("stop_visible"))
                     no_progress_age = int(now - last_progress_at)
                     stall_reason = ""
+
+                    # If generation appears active but no progress, nudge scroll to bottom.
+                    if (
+                        stop_visible
+                        and no_progress_age >= SCROLL_NUDGE_AFTER_NO_PROGRESS_SECONDS
+                        and (now - last_scroll_nudge_at) >= SCROLL_NUDGE_MIN_INTERVAL_SECONDS
+                    ):
+                        await self._nudge_scroll_to_bottom()
+                        last_scroll_nudge_at = now
+                        log(
+                            f"Scroll nudge at no-progress age {no_progress_age}s",
+                            f"Worker {self.worker_id}"
+                        )
 
                     if stop_visible and resp_count == 0 and elapsed >= self._stall_empty_seconds:
                         stall_reason = f"Stalled generation: no output for {self._stall_empty_seconds}s"
