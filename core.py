@@ -35,6 +35,7 @@ MAX_SEND_RETRIES = 3
 IDLE_REFRESH_AFTER_SECONDS = 600
 SCROLL_NUDGE_AFTER_NO_PROGRESS_SECONDS = 8
 SCROLL_NUDGE_MIN_INTERVAL_SECONDS = 4
+UNSENT_STUCK_SECONDS = 20
 
 class BaseAutomation:
     """Base class for browser-based AI automation."""
@@ -1544,8 +1545,25 @@ class GeminiWebAutomation(BaseAutomation):
 
                     # Progress watchdog: recover poisoned/stalled generation before full timeout
                     stop_visible = bool(snap.get("stop_visible"))
+                    send_visible = bool(snap.get("send_visible"))
                     no_progress_age = int(now - last_progress_at)
                     stall_reason = ""
+
+                    # Guardrail: request likely never sent, avoid waiting full timeout.
+                    if (
+                        (not stop_visible)
+                        and send_visible
+                        and resp_count == 0
+                        and elapsed >= UNSENT_STUCK_SECONDS
+                    ):
+                        input_now = await get_input_text()
+                        input_now_len = len((input_now or "").strip())
+                        prompt_still_present = prompt_len > 0 and input_now_len >= max(1, prompt_len // 2)
+
+                        if prompt_still_present:
+                            stall_reason = (
+                                f"Unsent stuck: send visible and no output for {UNSENT_STUCK_SECONDS}s"
+                            )
 
                     # If generation appears active but no progress, nudge scroll to bottom.
                     if (
@@ -1560,9 +1578,9 @@ class GeminiWebAutomation(BaseAutomation):
                             f"Worker {self.worker_id}"
                         )
 
-                    if stop_visible and resp_count == 0 and elapsed >= self._stall_empty_seconds:
+                    if (not stall_reason) and stop_visible and resp_count == 0 and elapsed >= self._stall_empty_seconds:
                         stall_reason = f"Stalled generation: no output for {self._stall_empty_seconds}s"
-                    elif stop_visible and resp_count > 0 and no_progress_age >= self._stall_no_progress_seconds:
+                    elif (not stall_reason) and stop_visible and resp_count > 0 and no_progress_age >= self._stall_no_progress_seconds:
                         stall_reason = f"Stalled generation: no progress for {self._stall_no_progress_seconds}s (len={resp_len})"
 
                     if stall_reason:
