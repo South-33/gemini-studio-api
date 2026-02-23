@@ -31,6 +31,8 @@ DEBUG_SCREENSHOT_DIR = os.path.join(os.path.dirname(__file__), "debug_screenshot
 WAIT_LOG_INTERVAL_SECONDS = 10
 STALL_EMPTY_SECONDS = 45
 STALL_NO_PROGRESS_SECONDS = 90
+STALL_NO_PROGRESS_SECONDS_SMALL = 180
+STALL_SMALL_LEN_THRESHOLD = 200
 MAX_SEND_RETRIES = 3
 IDLE_REFRESH_AFTER_SECONDS = 600
 SCROLL_NUDGE_AFTER_NO_PROGRESS_SECONDS = 8
@@ -1580,8 +1582,13 @@ class GeminiWebAutomation(BaseAutomation):
 
                     if (not stall_reason) and stop_visible and resp_count == 0 and elapsed >= self._stall_empty_seconds:
                         stall_reason = f"Stalled generation: no output for {self._stall_empty_seconds}s"
-                    elif (not stall_reason) and stop_visible and resp_count > 0 and no_progress_age >= self._stall_no_progress_seconds:
-                        stall_reason = f"Stalled generation: no progress for {self._stall_no_progress_seconds}s (len={resp_len})"
+                    elif (not stall_reason) and stop_visible and resp_count > 0:
+                        no_progress_threshold = self._stall_no_progress_seconds
+                        if resp_len < STALL_SMALL_LEN_THRESHOLD:
+                            no_progress_threshold = STALL_NO_PROGRESS_SECONDS_SMALL
+
+                        if no_progress_age >= no_progress_threshold:
+                            stall_reason = f"Stalled generation: no progress for {no_progress_threshold}s (len={resp_len})"
 
                     if stall_reason:
                         log(f"⚠️ {stall_reason}", f"Worker {self.worker_id}")
