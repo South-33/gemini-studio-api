@@ -991,20 +991,6 @@ class GeminiWebAutomation(BaseAutomation):
         GeminiWebAutomation._last_errors[self.worker_id] = payload
         log(f"Error tracked: {error} (selector={selector_key}, action={action})", f"Worker {self.worker_id}")
 
-        try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(
-                notify_error(
-                    error,
-                    selector_key,
-                    action,
-                    self.worker_id,
-                    diagnostics=payload["diagnostics"],
-                )
-            )
-        except:
-            pass
-
     @classmethod
     def get_all_errors(cls) -> Dict[int, Dict[str, Any]]:
         return dict(cls._last_errors)
@@ -2138,6 +2124,38 @@ class WorkerPool:
         else:
             await route.continue_()
 
+    async def _notify_final_failure(self, last_error: str, worker_index: Optional[int]):
+        """Send one Discord alert only after all retries fail."""
+        try:
+            selector_key = "worker_pool"
+            action = "final_failure"
+            diagnostics: Dict[str, Any] = {
+                "worker_count": self.worker_count,
+                "active_requests": self._active_requests,
+                "last_error": last_error,
+            }
+
+            worker_id = 0
+            if worker_index is not None:
+                worker_id = worker_index + 1
+                payload = GeminiWebAutomation.get_all_errors().get(worker_id)
+                if payload:
+                    selector_key = payload.get("selector_key") or selector_key
+                    action = payload.get("action") or action
+                    diagnostics["tracked_error"] = payload.get("error")
+                    if payload.get("diagnostics"):
+                        diagnostics["worker_context"] = payload.get("diagnostics")
+
+            await notify_error(
+                error=f"All retries failed: {last_error}",
+                selector_key=selector_key,
+                action=action,
+                worker_id=worker_id,
+                diagnostics=diagnostics,
+            )
+        except Exception as e:
+            log(f"Final failure notification failed: {e}", "WorkerPool")
+
     async def send_message(self, prompt: str, model: str = None, thinking_level: str = None, use_search: bool = False, images: List[str] = None) -> Dict:
         """
         Send message with round-robin worker dispatch.
@@ -2158,6 +2176,7 @@ class WorkerPool:
         MAX_RETRIES = min(3, len(self.workers))  # Try up to 3 different workers
         tried_workers = set()
         last_error = None
+        last_failure_worker_index: Optional[int] = None
         
         for attempt in range(MAX_RETRIES):
             # Acquire semaphore (limits concurrent requests to N workers)
@@ -2194,10 +2213,12 @@ class WorkerPool:
                         return result
                     else:
                         last_error = result.get('error', 'unknown')
+                        last_failure_worker_index = worker_index
                         log(f"Worker {worker_index+1} failed: {last_error}, retrying...", "WorkerPool")
                         
                 except Exception as e:
                     last_error = str(e)
+                    last_failure_worker_index = worker_index
                     log(f"Worker {worker_index+1} exception: {e}, retrying...", "WorkerPool")
                 finally:
                     self._active_requests = max(0, self._active_requests - 1)
@@ -2207,6 +2228,7 @@ class WorkerPool:
         
         # All retries exhausted
         log(f"❌ All {MAX_RETRIES} attempts failed. Last error: {last_error}", "WorkerPool")
+        await self._notify_final_failure(last_error or "unknown", last_failure_worker_index)
         return {"success": False, "error": f"All workers failed. Last error: {last_error}"}
 
     def get_diagnostics(self) -> Dict[str, Any]:
