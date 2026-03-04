@@ -41,7 +41,18 @@ SCROLL_NUDGE_AFTER_NO_PROGRESS_SECONDS = 8
 SCROLL_NUDGE_MIN_INTERVAL_SECONDS = 4
 UNSENT_STUCK_SECONDS = 20
 STALL_RECREATE_THRESHOLD = 2
-HEADED_PAGE_ZOOM = 0.50
+
+
+def _read_headed_page_zoom() -> float:
+    raw = os.getenv("HEADED_PAGE_ZOOM", "1.0").strip()
+    try:
+        value = float(raw)
+    except Exception:
+        value = 1.0
+    return max(0.5, min(1.0, value))
+
+
+HEADED_PAGE_ZOOM = _read_headed_page_zoom()
 
 class BaseAutomation:
     """Base class for browser-based AI automation."""
@@ -747,11 +758,30 @@ class GeminiWebAutomation(BaseAutomation):
         self._network_logging_attached = False
         self._recent_network_events = deque(maxlen=40)
         self._zoom_applied = False
+        self._browser_zoom_reset = False
+
+    async def _reset_browser_zoom(self, force: bool = False):
+        try:
+            if os.getenv("HEADLESS", "false").lower() == "true":
+                return
+            if self._browser_zoom_reset and not force:
+                return
+
+            await self.page.bring_to_front()
+            await self.page.keyboard.press("Control+0")
+            await self._human_delay(50, 90)
+            self._browser_zoom_reset = True
+            log("Reset browser zoom to 100%", f"Worker {self.worker_id}")
+        except Exception:
+            pass
 
     async def _apply_headed_zoom(self, force: bool = False):
         """Keep headed sessions zoomed out to reduce long-output clipping/stalls."""
         try:
             if os.getenv("HEADLESS", "false").lower() == "true":
+                return
+
+            if HEADED_PAGE_ZOOM >= 0.999:
                 return
 
             zoom_css = f"{int(HEADED_PAGE_ZOOM * 100)}%"
@@ -1297,6 +1327,7 @@ class GeminiWebAutomation(BaseAutomation):
             # Default to Temporary Chat if possible for clean sessions
             await self._enable_temp_chat()
             await self._human_delay(200, 500)
+            await self._reset_browser_zoom(force=True)
             await self._apply_headed_zoom(force=True)
             self._attach_network_logging()
             
@@ -1391,6 +1422,7 @@ class GeminiWebAutomation(BaseAutomation):
             # In headed mode, explicitly foreground the active worker page before send.
             try:
                 await self.page.bring_to_front()
+                await self._reset_browser_zoom()
                 await self._apply_headed_zoom()
                 await self._human_delay(60, 120)
             except:
@@ -1951,8 +1983,8 @@ class WorkerPool:
         self.headed_screen_height = max(600, int(os.getenv("HEADED_SCREEN_HEIGHT", "1080")))
         self.headed_screen_left = int(os.getenv("HEADED_SCREEN_LEFT", "0"))
         self.headed_screen_top = int(os.getenv("HEADED_SCREEN_TOP", "0"))
-        self.headed_window_width = max(800, int(os.getenv("HEADED_WINDOW_WIDTH", "1366")))
-        self.headed_window_height = max(600, int(os.getenv("HEADED_WINDOW_HEIGHT", "768")))
+        self.headed_window_width = max(900, int(os.getenv("HEADED_WINDOW_WIDTH", "1440")))
+        self.headed_window_height = max(700, int(os.getenv("HEADED_WINDOW_HEIGHT", "900")))
         self.headed_window_offset_x = int(os.getenv("HEADED_WINDOW_OFFSET_X", "70"))
         self.headed_window_offset_y = int(os.getenv("HEADED_WINDOW_OFFSET_Y", "45"))
         
