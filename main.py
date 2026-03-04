@@ -17,6 +17,7 @@ import tempfile
 import json
 import time
 import uuid
+import math
 from collections import deque
 from datetime import datetime, timezone
 from typing import List, Optional, Dict, Union
@@ -44,6 +45,7 @@ PROVIDER = os.getenv("PROVIDER", "auto").lower()  # "auto", "aistudio", or "gemi
 BROWSER_TIMEOUT = int(os.getenv("BROWSER_TIMEOUT", "480"))
 API_TIMEOUT_HEADROOM = int(os.getenv("API_TIMEOUT_HEADROOM", "30"))
 RECENT_REQUEST_LIMIT = int(os.getenv("RECENT_REQUEST_LIMIT", "200"))
+IMAGE_TOKEN_ESTIMATE = 300
 
 # Global State
 worker_pool: Optional[WorkerPool] = None
@@ -158,6 +160,18 @@ def extract_request_source(request: Request, body: Dict) -> Dict[str, str]:
         "ip": request.client.host if request.client else "unknown",
     }
 
+
+def estimate_text_tokens(text: str) -> int:
+    """Rough token estimate for diagnostics/logging only."""
+    if not text:
+        return 0
+
+    chars = len(text)
+    words = len(text.split())
+    by_chars = max(1, math.ceil(chars / 4))
+    by_words = max(1, math.ceil(words * 1.3))
+    return max(by_chars, by_words)
+
 # --- Endpoints ---
 
 @app.get("/v1/models")
@@ -240,13 +254,24 @@ async def openai_chat(request: Request):
                 prompt += content + "\n"
     
     # Send to worker
+    prompt_chars = len(prompt)
+    prompt_tokens_est = estimate_text_tokens(prompt) + (len(image_paths) * IMAGE_TOKEN_ESTIMATE)
+    trace["prompt_chars"] = prompt_chars
+    trace["prompt_tokens_est"] = prompt_tokens_est
+    trace["image_count"] = len(image_paths)
+
+    log(
+        f"Prompt stats: chars={prompt_chars} tokens_est={prompt_tokens_est} images={len(image_paths)}",
+        "API",
+    )
     log(f"Dispatching to browser thread...", "API")
     coro = worker_pool.send_message(
         prompt, 
         model=base_model, 
         thinking_level=thinking_level, 
         use_search=use_search, 
-        images=image_paths
+        images=image_paths,
+        request_id=trace_id,
     )
     future = asyncio.run_coroutine_threadsafe(coro, browser_loop)
     
@@ -289,10 +314,15 @@ async def openai_chat(request: Request):
         raise HTTPException(status_code=500, detail=result.get("error"))
 
     content = result["response"] or ""
+    completion_tokens_est = estimate_text_tokens(content)
     trace["status"] = "ok"
     trace["response_chars"] = len(content)
+    trace["response_tokens_est"] = completion_tokens_est
     trace["finished_at"] = datetime.now(timezone.utc).isoformat()
-    log(f"Got response ({len(content)} chars)", "API")
+    log(
+        f"Got response chars={len(content)} tokens_est={completion_tokens_est}",
+        "API",
+    )
     
     return {
         "id": f"chatcmpl-{int(time.time())}",
@@ -306,9 +336,12 @@ async def openai_chat(request: Request):
             "finish_reason": "stop"
         }],
         "usage": {
-            "prompt_tokens": len(prompt),
-            "completion_tokens": len(content),
-            "total_tokens": len(prompt) + len(content)
+            "prompt_tokens": prompt_tokens_est,
+            "completion_tokens": completion_tokens_est,
+            "total_tokens": prompt_tokens_est + completion_tokens_est,
+            "prompt_chars": prompt_chars,
+            "completion_chars": len(content),
+            "token_estimate": True,
         }
     }
 

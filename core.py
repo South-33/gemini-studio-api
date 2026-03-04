@@ -6,6 +6,7 @@ import sys
 import random
 import time
 import uuid
+from collections import deque
 from datetime import datetime
 from typing import Any, List, Dict, Optional, Tuple
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page, Route
@@ -38,6 +39,7 @@ IDLE_REFRESH_AFTER_SECONDS = 600
 SCROLL_NUDGE_AFTER_NO_PROGRESS_SECONDS = 8
 SCROLL_NUDGE_MIN_INTERVAL_SECONDS = 4
 UNSENT_STUCK_SECONDS = 20
+STALL_RECREATE_THRESHOLD = 2
 
 class BaseAutomation:
     """Base class for browser-based AI automation."""
@@ -660,6 +662,15 @@ class GeminiWebAutomation(BaseAutomation):
     # Shared lock for clipboard operations (clipboard is shared across all tabs)
     # Note: Using class-level lock - all workers share this across tabs
     _clipboard_lock: asyncio.Lock = None  # Lazy init to ensure correct event loop
+    NETWORK_URL_KEYWORDS = (
+        "generatecontent",
+        "streamgeneratecontent",
+        "batchexecute",
+        "assistant",
+        "conversation",
+        "bard",
+        "prompt",
+    )
     
     @classmethod
     def _get_clipboard_lock(cls) -> asyncio.Lock:
@@ -723,6 +734,69 @@ class GeminiWebAutomation(BaseAutomation):
         self._wait_log_interval_seconds = WAIT_LOG_INTERVAL_SECONDS
         self._stall_empty_seconds = STALL_EMPTY_SECONDS
         self._stall_no_progress_seconds = STALL_NO_PROGRESS_SECONDS
+        self._network_logging_attached = False
+        self._recent_network_events = deque(maxlen=40)
+
+    @classmethod
+    def _is_relevant_network_url(cls, url: str) -> bool:
+        text = (url or "").lower()
+        if not text:
+            return False
+        return any(k in text for k in cls.NETWORK_URL_KEYWORDS)
+
+    def _record_network_event(self, kind: str, url: str, status: Optional[int] = None, error: str = ""):
+        self._recent_network_events.append(
+            {
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "request_id": self._request_id,
+                "kind": kind,
+                "status": int(status) if status is not None else None,
+                "error": (error or "")[:180],
+                "url": (url or "")[:240],
+            }
+        )
+
+    def _attach_network_logging(self):
+        if not self.page or self._network_logging_attached:
+            return
+
+        def on_response(response):
+            try:
+                url = response.url or ""
+                if not self._is_relevant_network_url(url):
+                    return
+                status = int(response.status)
+                self._record_network_event("response", url, status=status)
+                if status >= 400:
+                    log(
+                        f"[{self._request_id}] Net response status={status} url={url[:140]}",
+                        f"Worker {self.worker_id}",
+                    )
+            except:
+                pass
+
+        def on_request_failed(request):
+            try:
+                url = request.url or ""
+                if not self._is_relevant_network_url(url):
+                    return
+                failure = request.failure
+                error_text = ""
+                if failure and isinstance(failure, dict):
+                    error_text = failure.get("errorText") or ""
+                elif isinstance(failure, str):
+                    error_text = failure
+                self._record_network_event("request_failed", url, error=error_text)
+                log(
+                    f"[{self._request_id}] Net request failed: {error_text or 'unknown'} url={url[:140]}",
+                    f"Worker {self.worker_id}",
+                )
+            except:
+                pass
+
+        self.page.on("response", on_response)
+        self.page.on("requestfailed", on_request_failed)
+        self._network_logging_attached = True
 
     def _selector_candidates(self, key: str) -> List[str]:
         raw = self.SELECTORS.get(key, [])
@@ -780,6 +854,18 @@ class GeminiWebAutomation(BaseAutomation):
                 return True
         return False
 
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        """Rough token estimate for logging only."""
+        if not text:
+            return 0
+
+        chars = len(text)
+        words = len(text.split())
+        by_chars = max(1, math.ceil(chars / 4))
+        by_words = max(1, math.ceil(words * 1.3))
+        return max(by_chars, by_words)
+
     async def _capture_state_snapshot(self) -> Dict[str, Any]:
         snapshot: Dict[str, Any] = {
             "request_id": self._request_id,
@@ -792,6 +878,7 @@ class GeminiWebAutomation(BaseAutomation):
             "last_response_tail": "",
             "active_button": "",
             "visibility": "unknown",
+            "network_events": [],
         }
 
         if not self.page:
@@ -845,6 +932,11 @@ class GeminiWebAutomation(BaseAutomation):
             )
             if isinstance(data, dict):
                 snapshot.update(data)
+        except:
+            pass
+
+        try:
+            snapshot["network_events"] = list(self._recent_network_events)[-8:]
         except:
             pass
 
@@ -1152,6 +1244,7 @@ class GeminiWebAutomation(BaseAutomation):
             # Default to Temporary Chat if possible for clean sessions
             await self._enable_temp_chat()
             await self._human_delay(200, 500)
+            self._attach_network_logging()
             
             self._initialized = True
             return True
@@ -1196,15 +1289,29 @@ class GeminiWebAutomation(BaseAutomation):
             log(f"⚠️ Temp chat error: {e}", f"Worker {self.worker_id}")
             self._track_error(str(e), "temp_chat", "enable_temp_chat")
 
-    async def send_message(self, prompt: str, model: str = None, thinking_level: str = None, use_search: bool = False, images: List[str] = None) -> Dict:
+    async def send_message(
+        self,
+        prompt: str,
+        model: str = None,
+        thinking_level: str = None,
+        use_search: bool = False,
+        images: List[str] = None,
+        request_id: str = None,
+    ) -> Dict:
         if not self._initialized: 
             return {"success": False, "error": "Not initialized"}
 
         try:
             self._generation_in_progress = True
             self._request_count += 1
-            self._request_id = uuid.uuid4().hex[:8]  # Short ID for log tracing
-            log(f"[{self._request_id}] Request: model={model}, prompt={len(prompt)} chars", f"Worker {self.worker_id}")
+            self._request_id = (request_id or "").strip() or uuid.uuid4().hex[:8]
+            self._recent_network_events.clear()
+            prompt_chars = len(prompt or "")
+            prompt_tokens_est = self._estimate_tokens(prompt or "")
+            log(
+                f"[{self._request_id}] Request: model={model}, prompt_chars={prompt_chars}, prompt_tokens_est={prompt_tokens_est}",
+                f"Worker {self.worker_id}",
+            )
 
             copy_selector = await self._resolve_selector("copy_btn")
             if not copy_selector:
@@ -1226,6 +1333,13 @@ class GeminiWebAutomation(BaseAutomation):
                     err = "Copy selector not found after recovery"
                     self._track_error(err, "copy_btn", "send_message")
                     return {"success": False, "error": err}
+
+            # In headed mode, explicitly foreground the active worker page before send.
+            try:
+                await self.page.bring_to_front()
+                await self._human_delay(60, 120)
+            except:
+                pass
             
             # 0. Dismiss any stuck overlays/modals (Angular Material CDK overlays block clicks)
             try:
@@ -1578,6 +1692,17 @@ class GeminiWebAutomation(BaseAutomation):
 
                     if stall_reason:
                         log(f"⚠️ {stall_reason}", f"Worker {self.worker_id}")
+                        net_events = snap.get("network_events") or []
+                        if net_events:
+                            tail = []
+                            for evt in net_events[-4:]:
+                                kind = evt.get("kind", "?")
+                                status = evt.get("status")
+                                err = evt.get("error")
+                                code = status if status is not None else (err or "ok")
+                                url = (evt.get("url") or "")
+                                tail.append(f"{kind}:{code}:{url[-48:]}")
+                            log(f"[{self._request_id}] Network tail: {' | '.join(tail)}", f"Worker {self.worker_id}")
 
                         recovered_text = await self._attempt_finalize_stalled_response(copy_selector, pre_send_count)
                         if recovered_text:
@@ -1632,7 +1757,12 @@ class GeminiWebAutomation(BaseAutomation):
                 await self._hard_refresh_and_reinit("clipboard_empty")
                 return {"success": False, "error": "Clipboard extraction failed"}
 
-            log(f"✅ Response: {len(markdown)} chars", f"Worker {self.worker_id}")
+            out_chars = len(markdown)
+            out_tokens_est = self._estimate_tokens(markdown)
+            log(
+                f"✅ Response: chars={out_chars}, tokens_est={out_tokens_est}",
+                f"Worker {self.worker_id}",
+            )
             return {"success": True, "response": markdown.strip()}
 
         except Exception as e:
@@ -1775,6 +1905,8 @@ class WorkerPool:
         self.workers: List[GeminiWebAutomation] = []
         self._worker_busy: List[bool] = []  # Track which workers are busy
         self._worker_lock = asyncio.Lock()  # Lock for worker assignment
+        self._next_worker_index = 0
+        self._worker_stall_failures: Dict[int, int] = {}
         
         self.shared_context = None
         self.playwright = None
@@ -1788,7 +1920,7 @@ class WorkerPool:
         self._last_idle_refresh_at = 0.0
     
     async def _get_available_worker(self, exclude: set = None) -> Tuple[int, GeminiWebAutomation]:
-        """Get first available worker (round-robin). Waits if all are busy."""
+        """Get available worker via fair round-robin. Waits if all are busy."""
         if exclude is None:
             exclude = set()
             
@@ -1797,11 +1929,14 @@ class WorkerPool:
         
         while time.time() - start_time < max_wait:
             async with self._worker_lock:
-                for i, busy in enumerate(self._worker_busy):
+                count = len(self._worker_busy)
+                for offset in range(count):
+                    i = (self._next_worker_index + offset) % count
                     if i in exclude:
                         continue
-                    if not busy and self.workers[i]._initialized:
+                    if (not self._worker_busy[i]) and self.workers[i]._initialized:
                         self._worker_busy[i] = True
+                        self._next_worker_index = (i + 1) % count
                         return i, self.workers[i]
             await asyncio.sleep(0.5)
         
@@ -1818,6 +1953,100 @@ class WorkerPool:
         async with self._worker_lock:
             for i in range(len(self._worker_busy)):
                 self._worker_busy[i] = busy
+
+    @staticmethod
+    def _is_stall_class_error(error: str) -> bool:
+        text = (error or "").strip().lower()
+        if not text:
+            return False
+
+        keywords = (
+            "stalled generation",
+            "unsent stuck",
+            "failed to start",
+            "copy timeout",
+            "waiting for response",
+            "clipboard extraction failed",
+        )
+        return any(k in text for k in keywords)
+
+    def _record_worker_failure(self, worker_index: int, error: str) -> bool:
+        """Track consecutive stall-like failures and request worker recreation when threshold is hit."""
+        if worker_index is None or worker_index < 0:
+            return False
+
+        if self._is_stall_class_error(error):
+            current = self._worker_stall_failures.get(worker_index, 0) + 1
+            self._worker_stall_failures[worker_index] = current
+            log(
+                f"Worker {worker_index + 1} stall-class failure count={current}/{STALL_RECREATE_THRESHOLD}",
+                "WorkerPool",
+            )
+            return current >= STALL_RECREATE_THRESHOLD
+
+        self._worker_stall_failures[worker_index] = 0
+        return False
+
+    def _record_worker_success(self, worker_index: int):
+        if worker_index is None or worker_index < 0:
+            return
+        self._worker_stall_failures[worker_index] = 0
+
+    async def _recreate_worker(self, index: int, reason: str) -> bool:
+        """Replace a poisoned worker with a fresh page/window and re-init it."""
+        if index < 0 or index >= len(self.workers):
+            return False
+        if not self.shared_context:
+            return False
+
+        split_windows_active = (
+            os.getenv("HEADLESS", "false").lower() != "true"
+            and self.headed_split_windows
+            and self.worker_count >= 2
+        )
+
+        log(f"Recreating worker {index + 1} ({reason})", "WorkerPool")
+
+        new_page: Optional[Page] = None
+        try:
+            if split_windows_active:
+                new_page = await self._open_split_window_page(index)
+            if new_page is None:
+                new_page = await self.shared_context.new_page()
+                if split_windows_active:
+                    await self._position_page_window(new_page, index)
+
+            await new_page.goto(GeminiWebAutomation.URL, timeout=60000, wait_until="domcontentloaded")
+
+            new_worker = GeminiWebAutomation(worker_id=index + 1)
+            ok = await new_worker.init_with_page(new_page, self.shared_context)
+            if not ok:
+                try:
+                    await new_page.close()
+                except:
+                    pass
+                log(f"Worker {index + 1} recreate init failed", "WorkerPool")
+                return False
+
+            old_worker = self.workers[index]
+            self.workers[index] = new_worker
+            self._worker_stall_failures[index] = 0
+
+            try:
+                await old_worker.close()
+            except:
+                pass
+
+            log(f"Worker {index + 1} recreated successfully", "WorkerPool")
+            return True
+        except Exception as e:
+            log(f"Worker {index + 1} recreate failed: {e}", "WorkerPool")
+            if new_page:
+                try:
+                    await new_page.close()
+                except:
+                    pass
+            return False
 
     def _are_workers_idle(self) -> bool:
         if self._active_requests != 0:
@@ -1999,7 +2228,44 @@ class WorkerPool:
                 "--disable-background-timer-throttling",
                 "--disable-backgrounding-occluded-windows",
                 "--disable-renderer-backgrounding",
+                "--disable-background-media-suspend",
+                "--disable-back-forward-cache",
             ]
+
+            # Add feature-level anti-throttling controls (Windows + desktop perf).
+            disable_features = [
+                # ui/base/ui_base_features.cc: enabled by default on Windows.
+                "CalculateNativeWinOcclusion",
+                # components/performance_manager/public/features.h
+                "BatterySaverModeAvailable",
+                # content/public/common/content_features.cc
+                "BatterySaverModeAlignWakeUps",
+            ]
+            enable_features = [
+                # components/performance_manager/public/features.h
+                "DisableTabDiscarding",
+            ]
+
+            def _merge_feature_switch(arg_prefix: str, feature_names: List[str]):
+                existing: List[str] = []
+                for arg in list(browser_args):
+                    if arg.startswith(arg_prefix):
+                        browser_args.remove(arg)
+                        existing.extend([f.strip() for f in arg[len(arg_prefix):].split(",") if f.strip()])
+
+                merged = sorted(set(existing + feature_names))
+                if merged:
+                    browser_args.append(f"{arg_prefix}{','.join(merged)}")
+
+            _merge_feature_switch("--disable-features=", disable_features)
+            _merge_feature_switch("--enable-features=", enable_features)
+
+            log("Applied anti-throttle Chromium switches for backgrounding/occlusion", "WorkerPool")
+            anti_throttle_args = [
+                arg for arg in browser_args
+                if ("background" in arg) or ("occlusion" in arg.lower()) or ("features=" in arg)
+            ]
+            log(f"Anti-throttle args: {' | '.join(anti_throttle_args)}", "WorkerPool")
             if is_headless:
                 browser_args.extend([
                     "--disable-gpu",
@@ -2156,7 +2422,15 @@ class WorkerPool:
         except Exception as e:
             log(f"Final failure notification failed: {e}", "WorkerPool")
 
-    async def send_message(self, prompt: str, model: str = None, thinking_level: str = None, use_search: bool = False, images: List[str] = None) -> Dict:
+    async def send_message(
+        self,
+        prompt: str,
+        model: str = None,
+        thinking_level: str = None,
+        use_search: bool = False,
+        images: List[str] = None,
+        request_id: str = None,
+    ) -> Dict:
         """
         Send message with round-robin worker dispatch.
         Supports N concurrent requests (1 per worker).
@@ -2196,9 +2470,18 @@ class WorkerPool:
                 self._active_requests += 1
                 
                 tried_workers.add(worker_index)
+                should_recreate_worker = False
+                recreate_reason = ""
                 
                 try:
-                    result = await worker.send_message(prompt, model, thinking_level, use_search, images)
+                    result = await worker.send_message(
+                        prompt,
+                        model,
+                        thinking_level,
+                        use_search,
+                        images,
+                        request_id=request_id,
+                    )
                     
                     # Validate response
                     if result.get("success"):
@@ -2207,20 +2490,34 @@ class WorkerPool:
                         if not response.strip():
                             log(f"Worker {worker_index+1}: Empty response, retrying...", "WorkerPool")
                             last_error = "Empty response"
+                            should_recreate_worker = self._record_worker_failure(worker_index, last_error)
+                            recreate_reason = last_error
                             # Don't call _release_worker here - finally block handles it
                             continue
-                        
+                        self._record_worker_success(worker_index)
                         return result
                     else:
                         last_error = result.get('error', 'unknown')
                         last_failure_worker_index = worker_index
-                        log(f"Worker {worker_index+1} failed: {last_error}, retrying...", "WorkerPool")
+                        should_recreate_worker = self._record_worker_failure(worker_index, last_error)
+                        recreate_reason = last_error
+                        log(
+                            f"Worker {worker_index+1} failed: {last_error}, retrying... (recreate={should_recreate_worker})",
+                            "WorkerPool",
+                        )
                         
                 except Exception as e:
                     last_error = str(e)
                     last_failure_worker_index = worker_index
-                    log(f"Worker {worker_index+1} exception: {e}, retrying...", "WorkerPool")
+                    should_recreate_worker = self._record_worker_failure(worker_index, last_error)
+                    recreate_reason = last_error
+                    log(
+                        f"Worker {worker_index+1} exception: {e}, retrying... (recreate={should_recreate_worker})",
+                        "WorkerPool",
+                    )
                 finally:
+                    if should_recreate_worker:
+                        await self._recreate_worker(worker_index, recreate_reason)
                     self._active_requests = max(0, self._active_requests - 1)
                     await self._release_worker(worker_index)
                     self._has_processed_request = True
@@ -2249,12 +2546,15 @@ class WorkerPool:
             "worker_count": self.worker_count,
             "active_requests": self._active_requests,
             "browser_channel": self.browser_channel or "default",
+            "next_worker_index": self._next_worker_index + 1,
             "headed_split_windows": self.headed_split_windows,
             "headed_window_layout": self.headed_window_layout,
             "headed_window_size": {
                 "width": self.headed_window_width,
                 "height": self.headed_window_height,
             },
+            "stall_recreate_threshold": STALL_RECREATE_THRESHOLD,
+            "worker_stall_failures": {str(k + 1): v for k, v in self._worker_stall_failures.items()},
             "workers": workers,
             "errors": errors,
             "last_activity_unix": int(self._last_activity),
