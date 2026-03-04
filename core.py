@@ -9,6 +9,7 @@ import uuid
 from collections import deque
 from datetime import datetime
 from typing import Any, List, Dict, Optional, Tuple
+from urllib.parse import urlparse
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page, Route
 from notifier import notify_error
 
@@ -40,6 +41,7 @@ SCROLL_NUDGE_AFTER_NO_PROGRESS_SECONDS = 8
 SCROLL_NUDGE_MIN_INTERVAL_SECONDS = 4
 UNSENT_STUCK_SECONDS = 20
 STALL_RECREATE_THRESHOLD = 2
+HEADED_PAGE_ZOOM = 0.50
 
 class BaseAutomation:
     """Base class for browser-based AI automation."""
@@ -663,13 +665,21 @@ class GeminiWebAutomation(BaseAutomation):
     # Note: Using class-level lock - all workers share this across tabs
     _clipboard_lock: asyncio.Lock = None  # Lazy init to ensure correct event loop
     NETWORK_URL_KEYWORDS = (
+        "bard.google.com",
+        "gemini.google.com",
+        "/_/bardchatui/",
         "generatecontent",
         "streamgeneratecontent",
         "batchexecute",
         "assistant",
         "conversation",
         "bard",
-        "prompt",
+    )
+    NETWORK_IGNORED_HOSTS = (
+        "google-analytics.com",
+        "googletagmanager.com",
+        "doubleclick.net",
+        "googleadservices.com",
     )
     
     @classmethod
@@ -736,13 +746,52 @@ class GeminiWebAutomation(BaseAutomation):
         self._stall_no_progress_seconds = STALL_NO_PROGRESS_SECONDS
         self._network_logging_attached = False
         self._recent_network_events = deque(maxlen=40)
+        self._zoom_applied = False
+
+    async def _apply_headed_zoom(self, force: bool = False):
+        """Keep headed sessions zoomed out to reduce long-output clipping/stalls."""
+        try:
+            if os.getenv("HEADLESS", "false").lower() == "true":
+                return
+
+            zoom_css = f"{int(HEADED_PAGE_ZOOM * 100)}%"
+            if not force:
+                current_zoom = await self.page.evaluate(
+                    "() => (document.documentElement && document.documentElement.style && document.documentElement.style.zoom) || ''"
+                )
+                if str(current_zoom).strip() == zoom_css:
+                    return
+
+            await self.page.evaluate(
+                """
+                (zoomCss) => {
+                    try { document.documentElement.style.zoom = zoomCss; } catch (_) {}
+                    try { if (document.body) document.body.style.zoom = zoomCss; } catch (_) {}
+                }
+                """,
+                zoom_css,
+            )
+            self._zoom_applied = True
+            log(f"Applied page zoom: {zoom_css}", f"Worker {self.worker_id}")
+        except Exception as e:
+            if force:
+                log(f"Zoom apply warning: {e}", f"Worker {self.worker_id}")
 
     @classmethod
     def _is_relevant_network_url(cls, url: str) -> bool:
-        text = (url or "").lower()
+        text = (url or "").strip().lower()
         if not text:
             return False
-        return any(k in text for k in cls.NETWORK_URL_KEYWORDS)
+
+        parsed = urlparse(text)
+        host = (parsed.netloc or "").lower()
+        path_query = f"{parsed.path or ''}?{parsed.query or ''}".lower()
+
+        if any(ignore in host for ignore in cls.NETWORK_IGNORED_HOSTS):
+            return False
+
+        searchable = f"{host}{path_query}"
+        return any(k in searchable for k in cls.NETWORK_URL_KEYWORDS)
 
     def _record_network_event(self, kind: str, url: str, status: Optional[int] = None, error: str = ""):
         self._recent_network_events.append(
@@ -762,6 +811,8 @@ class GeminiWebAutomation(BaseAutomation):
 
         def on_response(response):
             try:
+                if not self._generation_in_progress:
+                    return
                 url = response.url or ""
                 if not self._is_relevant_network_url(url):
                     return
@@ -777,6 +828,8 @@ class GeminiWebAutomation(BaseAutomation):
 
         def on_request_failed(request):
             try:
+                if not self._generation_in_progress:
+                    return
                 url = request.url or ""
                 if not self._is_relevant_network_url(url):
                     return
@@ -1244,6 +1297,7 @@ class GeminiWebAutomation(BaseAutomation):
             # Default to Temporary Chat if possible for clean sessions
             await self._enable_temp_chat()
             await self._human_delay(200, 500)
+            await self._apply_headed_zoom(force=True)
             self._attach_network_logging()
             
             self._initialized = True
@@ -1337,6 +1391,7 @@ class GeminiWebAutomation(BaseAutomation):
             # In headed mode, explicitly foreground the active worker page before send.
             try:
                 await self.page.bring_to_front()
+                await self._apply_headed_zoom()
                 await self._human_delay(60, 120)
             except:
                 pass
