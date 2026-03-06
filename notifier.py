@@ -194,7 +194,12 @@ class DiscordNotifier:
                 
         except Exception as e:
             # Don't crash the app if notification fails
-            print(f"[Notifier] Failed to send Discord notification: {e}")
+            message = str(e)
+            lowered = message.lower()
+            if "getaddrinfo failed" in lowered or "name or service not known" in lowered:
+                print(f"[Notifier] Failed to send Discord notification (local DNS/network issue): {e}")
+            else:
+                print(f"[Notifier] Failed to send Discord notification: {e}")
             return False
     
     async def send_recovery(self, message: str = "All workers recovered") -> bool:
@@ -219,7 +224,11 @@ class DiscordNotifier:
             session = await self._get_session()
             async with session.post(self.webhook_url, json=payload) as response:
                 return response.status in (200, 204)
-        except Exception:
+        except Exception as e:
+            message = str(e)
+            lowered = message.lower()
+            if "getaddrinfo failed" in lowered or "name or service not known" in lowered:
+                print(f"[Notifier] Failed to send recovery notification (local DNS/network issue): {e}")
             return False
     
     async def close(self):

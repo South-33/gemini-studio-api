@@ -4,6 +4,7 @@ import math
 import os
 import sys
 import random
+import socket
 import time
 import uuid
 from collections import deque
@@ -41,6 +42,7 @@ SCROLL_NUDGE_AFTER_NO_PROGRESS_SECONDS = 8
 SCROLL_NUDGE_MIN_INTERVAL_SECONDS = 4
 UNSENT_STUCK_SECONDS = 20
 STALL_RECREATE_THRESHOLD = 2
+NETWORK_OUTAGE_PROBE_TIMEOUT_SECONDS = 2.0
 
 
 def _read_headed_page_zoom() -> float:
@@ -675,22 +677,38 @@ class GeminiWebAutomation(BaseAutomation):
     # Shared lock for clipboard operations (clipboard is shared across all tabs)
     # Note: Using class-level lock - all workers share this across tabs
     _clipboard_lock: asyncio.Lock = None  # Lazy init to ensure correct event loop
-    NETWORK_URL_KEYWORDS = (
-        "bard.google.com",
+    NETWORK_URL_HOSTS = (
         "gemini.google.com",
-        "/_/bardchatui/",
+        "bard.google.com",
+    )
+    NETWORK_URL_PATH_KEYWORDS = (
+        "/app",
+        "/_/bardchatui/data/",
+        "streamgenerate",
         "generatecontent",
-        "streamgeneratecontent",
         "batchexecute",
-        "assistant",
-        "conversation",
-        "bard",
     )
     NETWORK_IGNORED_HOSTS = (
         "google-analytics.com",
         "googletagmanager.com",
         "doubleclick.net",
         "googleadservices.com",
+        "www.google.com",
+        "www.google.com.kh",
+    )
+    NETWORK_IGNORED_PATH_KEYWORDS = (
+        "jserror",
+        "cspreport",
+        "/pagead/",
+        "/measurement/",
+        "1p-conversion",
+    )
+    NETWORK_OUTAGE_ERROR_HINTS = (
+        "err_name_not_resolved",
+        "err_internet_disconnected",
+        "err_network_changed",
+        "err_address_unreachable",
+        "getaddrinfo failed",
     )
     
     @classmethod
@@ -757,6 +775,8 @@ class GeminiWebAutomation(BaseAutomation):
         self._stall_no_progress_seconds = STALL_NO_PROGRESS_SECONDS
         self._network_logging_attached = False
         self._recent_network_events = deque(maxlen=40)
+        self._network_failure_counts: Dict[str, int] = {}
+        self._last_network_outage: Optional[Dict[str, Any]] = None
         self._zoom_applied = False
         self._browser_zoom_reset = False
 
@@ -820,8 +840,94 @@ class GeminiWebAutomation(BaseAutomation):
         if any(ignore in host for ignore in cls.NETWORK_IGNORED_HOSTS):
             return False
 
-        searchable = f"{host}{path_query}"
-        return any(k in searchable for k in cls.NETWORK_URL_KEYWORDS)
+        if any(ignore in path_query for ignore in cls.NETWORK_IGNORED_PATH_KEYWORDS):
+            return False
+
+        if not any(host == allowed or host.endswith(f".{allowed}") for allowed in cls.NETWORK_URL_HOSTS):
+            return False
+
+        return any(k in path_query for k in cls.NETWORK_URL_PATH_KEYWORDS)
+
+    @classmethod
+    def _is_network_outage_error_text(cls, error_text: str) -> bool:
+        text = (error_text or "").strip().lower()
+        if not text:
+            return False
+        return any(hint in text for hint in cls.NETWORK_OUTAGE_ERROR_HINTS)
+
+    @classmethod
+    def _format_host_for_log(cls, url: str) -> str:
+        try:
+            return (urlparse(url or "").netloc or "unknown-host").lower()
+        except Exception:
+            return "unknown-host"
+
+    def _mark_network_outage(self, source: str, url: str, error_text: str):
+        host = self._format_host_for_log(url)
+        key = f"{source}:{host}:{(error_text or '').strip().lower()}"
+        count = self._network_failure_counts.get(key, 0) + 1
+        self._network_failure_counts[key] = count
+        self._last_network_outage = {
+            "source": source,
+            "url": url,
+            "host": host,
+            "error": (error_text or "").strip(),
+            "count": count,
+            "request_id": self._request_id,
+            "timestamp": time.time(),
+        }
+
+        if count <= 2 or count in (5, 10):
+            log(
+                f"[{self._request_id}] Network outage detected via {source}: host={host} error={error_text or 'unknown'} count={count}",
+                f"Worker {self.worker_id}",
+            )
+
+    async def _probe_host_resolution(self, host: str) -> str:
+        host = (host or "").strip().lower()
+        if not host or host == "unknown-host":
+            return "unknown"
+
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(socket.getaddrinfo, host, 443, type=socket.SOCK_STREAM),
+                timeout=NETWORK_OUTAGE_PROBE_TIMEOUT_SECONDS,
+            )
+            return "resolved"
+        except asyncio.TimeoutError:
+            return "timeout"
+        except Exception as e:
+            return f"failed:{type(e).__name__}"
+
+    async def _build_network_outage_error(self) -> Tuple[str, Dict[str, Any]]:
+        issue = self._last_network_outage or {}
+        host = (issue.get("host") or "gemini.google.com").strip().lower()
+        probe = await self._probe_host_resolution(host)
+        error_text = (issue.get("error") or "network resolution failed").strip()
+        source = issue.get("source") or "network"
+        count = int(issue.get("count") or 0)
+        message = f"Network outage: {host} unreachable ({error_text})"
+        diagnostics = {
+            "network_outage": {
+                "host": host,
+                "source": source,
+                "error": error_text,
+                "count": count,
+                "dns_probe": probe,
+                "url": issue.get("url") or "",
+            }
+        }
+        return message, diagnostics
+
+    def _get_active_network_outage(self) -> Optional[Dict[str, Any]]:
+        issue = self._last_network_outage
+        if not issue:
+            return None
+        if issue.get("request_id") not in (None, self._request_id):
+            return None
+        if (time.time() - float(issue.get("timestamp") or 0)) > 90:
+            return None
+        return issue
 
     def _record_network_event(self, kind: str, url: str, status: Optional[int] = None, error: str = ""):
         self._recent_network_events.append(
@@ -870,10 +976,19 @@ class GeminiWebAutomation(BaseAutomation):
                 elif isinstance(failure, str):
                     error_text = failure
                 self._record_network_event("request_failed", url, error=error_text)
-                log(
-                    f"[{self._request_id}] Net request failed: {error_text or 'unknown'} url={url[:140]}",
-                    f"Worker {self.worker_id}",
-                )
+
+                if self._is_network_outage_error_text(error_text):
+                    self._mark_network_outage("request_failed", url, error_text)
+                    return
+
+                key = f"request_failed:{self._format_host_for_log(url)}:{(error_text or 'unknown').strip().lower()}"
+                count = self._network_failure_counts.get(key, 0) + 1
+                self._network_failure_counts[key] = count
+                if count <= 2 or count in (5, 10):
+                    log(
+                        f"[{self._request_id}] Net request failed: {error_text or 'unknown'} url={url[:140]} count={count}",
+                        f"Worker {self.worker_id}",
+                    )
             except:
                 pass
 
@@ -962,6 +1077,7 @@ class GeminiWebAutomation(BaseAutomation):
             "active_button": "",
             "visibility": "unknown",
             "network_events": [],
+            "network_outage": None,
         }
 
         if not self.page:
@@ -1020,6 +1136,18 @@ class GeminiWebAutomation(BaseAutomation):
 
         try:
             snapshot["network_events"] = list(self._recent_network_events)[-8:]
+        except:
+            pass
+
+        try:
+            issue = self._get_active_network_outage()
+            if issue:
+                snapshot["network_outage"] = {
+                    "host": issue.get("host"),
+                    "source": issue.get("source"),
+                    "error": issue.get("error"),
+                    "count": issue.get("count"),
+                }
         except:
             pass
 
@@ -1114,6 +1242,13 @@ class GeminiWebAutomation(BaseAutomation):
             ok = await self.init_with_page(self.page, self.context)
             return bool(ok)
         except Exception as e:
+            if self._is_network_outage_error_text(str(e)):
+                current_url = ""
+                try:
+                    current_url = self.page.url or ""
+                except Exception:
+                    current_url = ""
+                self._mark_network_outage("page_reload", current_url or self.URL, str(e))
             log(f"Hard refresh recovery failed: {e}", f"Worker {self.worker_id}")
             return False
 
@@ -1391,6 +1526,8 @@ class GeminiWebAutomation(BaseAutomation):
             self._request_count += 1
             self._request_id = (request_id or "").strip() or uuid.uuid4().hex[:8]
             self._recent_network_events.clear()
+            self._network_failure_counts.clear()
+            self._last_network_outage = None
             prompt_chars = len(prompt or "")
             prompt_tokens_est = self._estimate_tokens(prompt or "")
             log(
@@ -1559,6 +1696,12 @@ class GeminiWebAutomation(BaseAutomation):
             if not send_success:
                 log(f"❌ Send button click failed", f"Worker {self.worker_id}")
                 snapshot = await self._capture_state_snapshot()
+                outage = self._get_active_network_outage()
+                if outage:
+                    outage_error, outage_diag = await self._build_network_outage_error()
+                    snapshot.update(outage_diag)
+                    self._track_error(outage_error, "send_btn", "send_message", snapshot)
+                    return {"success": False, "error": outage_error}
                 self._track_error("Send button click failed", "send_btn", "send_message", snapshot)
                 return {"success": False, "error": "Send button click failed"}
             
@@ -1579,6 +1722,12 @@ class GeminiWebAutomation(BaseAutomation):
                 while time.time() < observe_deadline:
                     snap = await self._capture_state_snapshot()
                     last_snap = snap
+                    outage = self._get_active_network_outage()
+                    if outage:
+                        outage_error, outage_diag = await self._build_network_outage_error()
+                        snap.update(outage_diag)
+                        self._track_error(outage_error, "send_btn", "verify_generation_started", snap)
+                        return {"success": False, "error": outage_error}
                     stop_now = bool(snap.get("stop_visible"))
                     send_now = bool(snap.get("send_visible"))
                     resp_now = int(snap.get("response_count") or 0)
@@ -1650,6 +1799,12 @@ class GeminiWebAutomation(BaseAutomation):
                     if not recovered:
                         log(f"❌ Re-init failed after hard refresh", f"Worker {self.worker_id}")
                         snapshot = await self._capture_state_snapshot()
+                        outage = self._get_active_network_outage()
+                        if outage:
+                            outage_error, outage_diag = await self._build_network_outage_error()
+                            snapshot.update(outage_diag)
+                            self._track_error(outage_error, "init", "send_message", snapshot)
+                            return {"success": False, "error": outage_error}
                         self._track_error("Re-init failed after hard refresh", "init", "send_message", snapshot)
                         return {"success": False, "error": "Worker re-init failed after hard refresh"}
                     
@@ -1688,6 +1843,12 @@ class GeminiWebAutomation(BaseAutomation):
                 except Exception as e:
                     log(f"❌ Hard refresh recovery failed: {e}", f"Worker {self.worker_id}")
                     snapshot = await self._capture_state_snapshot()
+                    outage = self._get_active_network_outage()
+                    if outage:
+                        outage_error, outage_diag = await self._build_network_outage_error()
+                        snapshot.update(outage_diag)
+                        self._track_error(outage_error, "send_btn", "verify_generation_started", snapshot)
+                        return {"success": False, "error": outage_error}
                     self._track_error("Hard refresh recovery failed", "send_btn", "verify_generation_started", snapshot)
                     return {"success": False, "error": f"Generation failed after all recovery attempts: {e}"}
             
@@ -1704,6 +1865,15 @@ class GeminiWebAutomation(BaseAutomation):
             last_progress_at = start_time
             last_scroll_nudge_at = 0.0
             while (time.time() - start_time) < max_wait:
+                outage = self._get_active_network_outage()
+                if outage:
+                    snapshot = await self._capture_state_snapshot()
+                    outage_error, outage_diag = await self._build_network_outage_error()
+                    snapshot.update(outage_diag)
+                    log(f"⚠️ {outage_error}", f"Worker {self.worker_id}")
+                    self._track_error(outage_error, "copy_btn", "wait_for_response_network_outage", snapshot)
+                    return {"success": False, "error": outage_error}
+
                 btns = self.page.locator(copy_selector)
                 current_count = await btns.count()
                 
@@ -1859,6 +2029,19 @@ class GeminiWebAutomation(BaseAutomation):
                 snapshot = await self._capture_state_snapshot()
             except:
                 snapshot = {}
+            if self._is_network_outage_error_text(str(e)):
+                current_url = ""
+                try:
+                    current_url = self.page.url or ""
+                except Exception:
+                    current_url = ""
+                self._mark_network_outage("send_exception", current_url or self.URL, str(e))
+            outage = self._get_active_network_outage()
+            if outage:
+                outage_error, outage_diag = await self._build_network_outage_error()
+                snapshot.update(outage_diag)
+                self._track_error(outage_error, "unknown", "send_message", snapshot)
+                return {"success": False, "error": outage_error}
             self._track_error(str(e), "unknown", "send_message", snapshot)
             
             # Force refresh to reset page state for next request
@@ -2056,6 +2239,13 @@ class WorkerPool:
             "clipboard extraction failed",
         )
         return any(k in text for k in keywords)
+
+    @staticmethod
+    def _is_network_outage_error(error: str) -> bool:
+        text = (error or "").strip().lower()
+        if not text:
+            return False
+        return text.startswith("network outage:")
 
     def _record_worker_failure(self, worker_index: int, error: str) -> bool:
         """Track consecutive stall-like failures and request worker recreation when threshold is hit."""
@@ -2592,6 +2782,9 @@ class WorkerPool:
                             f"Worker {worker_index+1} failed: {last_error}, retrying... (recreate={should_recreate_worker})",
                             "WorkerPool",
                         )
+                        if self._is_network_outage_error(last_error):
+                            log("Network outage detected; skipping cross-worker retry", "WorkerPool")
+                            break
                         
                 except Exception as e:
                     last_error = str(e)
@@ -2602,6 +2795,9 @@ class WorkerPool:
                         f"Worker {worker_index+1} exception: {e}, retrying... (recreate={should_recreate_worker})",
                         "WorkerPool",
                     )
+                    if self._is_network_outage_error(last_error):
+                        log("Network outage detected; skipping cross-worker retry", "WorkerPool")
+                        break
                 finally:
                     if should_recreate_worker:
                         await self._recreate_worker(worker_index, recreate_reason)
