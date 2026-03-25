@@ -36,6 +36,8 @@ STALL_EMPTY_SECONDS = 45
 STALL_NO_PROGRESS_SECONDS = 90
 STALL_NO_PROGRESS_SECONDS_SMALL = 180
 STALL_SMALL_LEN_THRESHOLD = 200
+FINALIZE_STABLE_RESPONSE_SECONDS = 45
+FINALIZE_STABLE_RESPONSE_LEN = 800
 MAX_SEND_RETRIES = 3
 IDLE_REFRESH_AFTER_SECONDS = 600
 SCROLL_NUDGE_AFTER_NO_PROGRESS_SECONDS = 8
@@ -1073,6 +1075,7 @@ class GeminiWebAutomation(BaseAutomation):
             "copy_count": 0,
             "response_count": 0,
             "last_response_len": 0,
+            "last_response_signature": "",
             "last_response_tail": "",
             "active_button": "",
             "visibility": "unknown",
@@ -1123,6 +1126,7 @@ class GeminiWebAutomation(BaseAutomation):
                         copy_count: document.querySelectorAll('button[aria-label="Copy"]').length,
                         response_count: responses.length,
                         last_response_len: lastText.length,
+                        last_response_signature: `${lastText.slice(0, 80)}|${lastText.slice(-80)}`.slice(0, 200),
                         last_response_tail: lastText.slice(-120),
                         visibility: document.visibilityState || 'unknown',
                     };
@@ -1709,6 +1713,8 @@ class GeminiWebAutomation(BaseAutomation):
             # This avoids false negatives for very fast responses.
             pre_send_snap = await self._capture_state_snapshot()
             pre_send_resp_count = int(pre_send_snap.get("response_count") or 0)
+            pre_send_resp_len = int(pre_send_snap.get("last_response_len") or 0)
+            pre_send_resp_sig = str(pre_send_snap.get("last_response_signature") or "")
             prompt_len = len((prompt or "").strip())
             start_observe_seconds = 6.0
             start_poll_seconds = 0.2
@@ -1864,6 +1870,8 @@ class GeminiWebAutomation(BaseAutomation):
             last_response_len = -1
             last_progress_at = start_time
             last_scroll_nudge_at = 0.0
+            finalize_attempted = False
+            seen_new_response = False
             while (time.time() - start_time) < max_wait:
                 outage = self._get_active_network_outage()
                 if outage:
@@ -1888,17 +1896,37 @@ class GeminiWebAutomation(BaseAutomation):
                 if (now - last_wait_log) >= self._wait_log_interval_seconds:
                     snap = await self._capture_state_snapshot()
                     elapsed = int(now - start_time)
-                    resp_count = int(snap.get("response_count") or 0)
-                    resp_len = int(snap.get("last_response_len") or 0)
+                    resp_count_total = int(snap.get("response_count") or 0)
+                    resp_len_total = int(snap.get("last_response_len") or 0)
+                    resp_sig = str(snap.get("last_response_signature") or "")
+
+                    response_changed = False
+                    if resp_count_total > pre_send_resp_count:
+                        response_changed = True
+                    elif resp_sig and resp_sig != pre_send_resp_sig:
+                        response_changed = True
+                    elif resp_len_total > pre_send_resp_len:
+                        response_changed = True
+
+                    if response_changed:
+                        seen_new_response = True
+
+                    if seen_new_response:
+                        resp_count = max(1, resp_count_total - pre_send_resp_count) if resp_count_total > pre_send_resp_count else 1
+                        resp_len = resp_len_total if resp_sig != pre_send_resp_sig else max(0, resp_len_total - pre_send_resp_len)
+                    else:
+                        resp_count = 0
+                        resp_len = 0
 
                     if resp_len > last_response_len:
                         last_response_len = resp_len
                         last_progress_at = now
+                        finalize_attempted = False
 
                     log(
                         f"[{self._request_id}] Wait state: elapsed={elapsed}s stop={snap.get('stop_visible')} "
                         f"send={snap.get('send_visible')} resp={resp_count} "
-                        f"len={resp_len} copy={snap.get('copy_count')} vis={snap.get('visibility')}",
+                        f"len={resp_len} copy={snap.get('copy_count')} vis={snap.get('visibility')} seen_new={seen_new_response}",
                         f"Worker {self.worker_id}"
                     )
 
@@ -1936,6 +1964,23 @@ class GeminiWebAutomation(BaseAutomation):
                             f"Scroll nudge at no-progress age {no_progress_age}s",
                             f"Worker {self.worker_id}"
                         )
+
+                    if (
+                        (not finalize_attempted)
+                        and stop_visible
+                        and seen_new_response
+                        and resp_len >= FINALIZE_STABLE_RESPONSE_LEN
+                        and no_progress_age >= FINALIZE_STABLE_RESPONSE_SECONDS
+                    ):
+                        finalize_attempted = True
+                        log(
+                            f"Attempting finalize after stable response len={resp_len} no_progress={no_progress_age}s",
+                            f"Worker {self.worker_id}"
+                        )
+                        finalized_text = await self._attempt_finalize_stalled_response(copy_selector, pre_send_count)
+                        if finalized_text:
+                            log("✅ Finalized stable response during post-processing", f"Worker {self.worker_id}")
+                            return {"success": True, "response": finalized_text}
 
                     if (not stall_reason) and stop_visible and resp_count == 0 and elapsed >= self._stall_empty_seconds:
                         stall_reason = f"Stalled generation: no output for {self._stall_empty_seconds}s"
