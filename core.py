@@ -37,10 +37,11 @@ STALL_EMPTY_SECONDS_WITH_ACTIVITY = 90
 STALL_NO_PROGRESS_SECONDS = 90
 STALL_NO_PROGRESS_SECONDS_SMALL = 180
 STALL_NO_PROGRESS_SECONDS_SMALL_WITH_ACTIVITY = 300
+STALL_NO_PROGRESS_SECONDS_WITH_ACTIVITY = 180
 STALL_SMALL_LEN_THRESHOLD = 200
 FINALIZE_STABLE_RESPONSE_SECONDS = 45
 FINALIZE_STABLE_RESPONSE_LEN = 800
-RECENT_NETWORK_ACTIVITY_SECONDS = 15
+RECENT_NETWORK_ACTIVITY_SECONDS = 45
 MAX_SEND_RETRIES = 3
 IDLE_REFRESH_AFTER_SECONDS = 600
 SCROLL_NUDGE_AFTER_NO_PROGRESS_SECONDS = 8
@@ -1256,13 +1257,21 @@ class GeminiWebAutomation(BaseAutomation):
         except:
             return None
 
-    async def _attempt_finalize_stalled_response(self, copy_selector: str, pre_send_count: int) -> Optional[str]:
+    async def _attempt_finalize_stalled_response(
+        self,
+        copy_selector: str,
+        pre_send_count: int,
+        click_stop: bool = True,
+    ) -> Optional[str]:
         """Try to finalize an in-flight stalled generation before giving up."""
         try:
-            stop_clicked = await self._click_stop_if_visible()
-            if stop_clicked:
-                log("Attempted stop click on stalled generation", f"Worker {self.worker_id}")
-            await self._human_delay(1200, 1800)
+            if click_stop:
+                stop_clicked = await self._click_stop_if_visible()
+                if stop_clicked:
+                    log("Attempted stop click on stalled generation", f"Worker {self.worker_id}")
+                await self._human_delay(1200, 1800)
+            else:
+                await self._human_delay(300, 600)
 
             markdown = await self._extract_latest_via_copy(copy_selector, pre_send_count)
             if markdown:
@@ -2018,7 +2027,11 @@ class GeminiWebAutomation(BaseAutomation):
                             f"Attempting finalize after stable response len={resp_len} no_progress={no_progress_age}s",
                             f"Worker {self.worker_id}"
                         )
-                        finalized_text = await self._attempt_finalize_stalled_response(copy_selector, pre_send_count)
+                        finalized_text = await self._attempt_finalize_stalled_response(
+                            copy_selector,
+                            pre_send_count,
+                            click_stop=False,
+                        )
                         if finalized_text:
                             log("✅ Finalized stable response during post-processing", f"Worker {self.worker_id}")
                             return {"success": True, "response": finalized_text}
@@ -2031,6 +2044,11 @@ class GeminiWebAutomation(BaseAutomation):
                         stall_reason = f"Stalled generation: no output for {empty_threshold}s"
                     elif (not stall_reason) and stop_visible and resp_count > 0:
                         no_progress_threshold = self._stall_no_progress_seconds
+                        if backend_activity_live:
+                            no_progress_threshold = max(
+                                no_progress_threshold,
+                                STALL_NO_PROGRESS_SECONDS_WITH_ACTIVITY,
+                            )
                         if resp_len < STALL_SMALL_LEN_THRESHOLD:
                             no_progress_threshold = STALL_NO_PROGRESS_SECONDS_SMALL
                             if backend_activity_live:
@@ -2061,8 +2079,15 @@ class GeminiWebAutomation(BaseAutomation):
                             log("✅ Recovered stalled generation via finalize path", f"Worker {self.worker_id}")
                             return {"success": True, "response": recovered_text}
 
-                        snapshot = await self._capture_state_snapshot()
-                        self._track_error(stall_reason, "copy_btn", "wait_for_response_stalled", snapshot)
+                        error_snapshot = dict(snap)
+                        try:
+                            refreshed_snapshot = await self._capture_state_snapshot()
+                            for key, value in refreshed_snapshot.items():
+                                if key in ("network_events", "network_outage"):
+                                    error_snapshot[key] = value
+                        except:
+                            pass
+                        self._track_error(stall_reason, "copy_btn", "wait_for_response_stalled", error_snapshot)
                         await self._hard_refresh_and_reinit("stalled_generation")
                         return {"success": False, "error": stall_reason}
 
