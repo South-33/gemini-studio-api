@@ -2844,7 +2844,9 @@ class WorkerPool:
         self._last_activity = time.time()
         
         # Retry configuration
-        MAX_RETRIES = min(3, len(self.workers))  # Try up to 3 different workers
+        # With 2 workers, allow a third total attempt so a refreshed/recreated worker
+        # can be reused if the alternate worker is still occupied.
+        MAX_RETRIES = 2 if len(self.workers) == 1 else 3
         tried_workers = set()
         last_error = None
         last_failure_worker_index: Optional[int] = None
@@ -2869,6 +2871,8 @@ class WorkerPool:
                 tried_workers.add(worker_index)
                 should_recreate_worker = False
                 recreate_reason = ""
+                allow_same_worker_retry = False
+                attempt_error = ""
                 
                 try:
                     result = await worker.send_message(
@@ -2887,17 +2891,21 @@ class WorkerPool:
                         if not response.strip():
                             log(f"Worker {worker_index+1}: Empty response, retrying...", "WorkerPool")
                             last_error = "Empty response"
+                            attempt_error = last_error
                             should_recreate_worker = self._record_worker_failure(worker_index, last_error)
                             recreate_reason = last_error
+                            allow_same_worker_retry = True
                             # Don't call _release_worker here - finally block handles it
                             continue
                         self._record_worker_success(worker_index)
                         return result
                     else:
                         last_error = result.get('error', 'unknown')
+                        attempt_error = last_error
                         last_failure_worker_index = worker_index
                         should_recreate_worker = self._record_worker_failure(worker_index, last_error)
                         recreate_reason = last_error
+                        allow_same_worker_retry = not self._is_network_outage_error(last_error)
                         log(
                             f"Worker {worker_index+1} failed: {last_error}, retrying... (recreate={should_recreate_worker})",
                             "WorkerPool",
@@ -2908,9 +2916,11 @@ class WorkerPool:
                         
                 except Exception as e:
                     last_error = str(e)
+                    attempt_error = last_error
                     last_failure_worker_index = worker_index
                     should_recreate_worker = self._record_worker_failure(worker_index, last_error)
                     recreate_reason = last_error
+                    allow_same_worker_retry = not self._is_network_outage_error(last_error)
                     log(
                         f"Worker {worker_index+1} exception: {e}, retrying... (recreate={should_recreate_worker})",
                         "WorkerPool",
@@ -2919,12 +2929,26 @@ class WorkerPool:
                         log("Network outage detected; skipping cross-worker retry", "WorkerPool")
                         break
                 finally:
+                    recreated_ok = False
                     if should_recreate_worker:
-                        await self._recreate_worker(worker_index, recreate_reason)
+                        recreated_ok = await self._recreate_worker(worker_index, recreate_reason)
                     self._active_requests = max(0, self._active_requests - 1)
                     await self._release_worker(worker_index)
                     self._has_processed_request = True
                     self._last_activity = time.time()
+
+                    if attempt_error and allow_same_worker_retry:
+                        tried_workers.discard(worker_index)
+                        if recreated_ok:
+                            log(
+                                f"Worker {worker_index+1} retry reopened after recreation",
+                                "WorkerPool",
+                            )
+                        else:
+                            log(
+                                f"Worker {worker_index+1} retry reopened after recoverable failure",
+                                "WorkerPool",
+                            )
         
         # All retries exhausted
         log(f"❌ All {MAX_RETRIES} attempts failed. Last error: {last_error}", "WorkerPool")
