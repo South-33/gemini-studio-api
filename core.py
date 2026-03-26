@@ -33,11 +33,14 @@ DEBUG_SCREENSHOT_DIR = os.path.join(os.path.dirname(__file__), "debug_screenshot
 # Reliability constants (intentionally hardcoded)
 WAIT_LOG_INTERVAL_SECONDS = 10
 STALL_EMPTY_SECONDS = 45
+STALL_EMPTY_SECONDS_WITH_ACTIVITY = 90
 STALL_NO_PROGRESS_SECONDS = 90
 STALL_NO_PROGRESS_SECONDS_SMALL = 180
+STALL_NO_PROGRESS_SECONDS_SMALL_WITH_ACTIVITY = 300
 STALL_SMALL_LEN_THRESHOLD = 200
 FINALIZE_STABLE_RESPONSE_SECONDS = 45
 FINALIZE_STABLE_RESPONSE_LEN = 800
+RECENT_NETWORK_ACTIVITY_SECONDS = 15
 MAX_SEND_RETRIES = 3
 IDLE_REFRESH_AFTER_SECONDS = 600
 SCROLL_NUDGE_AFTER_NO_PROGRESS_SECONDS = 8
@@ -934,6 +937,7 @@ class GeminiWebAutomation(BaseAutomation):
     def _record_network_event(self, kind: str, url: str, status: Optional[int] = None, error: str = ""):
         self._recent_network_events.append(
             {
+                "t": time.time(),
                 "ts": datetime.now().isoformat(timespec="seconds"),
                 "request_id": self._request_id,
                 "kind": kind,
@@ -942,6 +946,38 @@ class GeminiWebAutomation(BaseAutomation):
                 "url": (url or "")[:240],
             }
         )
+
+    @staticmethod
+    def _is_generation_network_url(url: str) -> bool:
+        text = (url or "").lower()
+        if not text:
+            return False
+        generation_markers = (
+            "streamgenerate",
+            "generatecontent",
+            "batchexecute",
+            "/_/bardchatui/data/",
+        )
+        return any(marker in text for marker in generation_markers)
+
+    def _get_recent_generation_activity_age(self) -> Optional[float]:
+        now = time.time()
+        for evt in reversed(self._recent_network_events):
+            if evt.get("request_id") != self._request_id:
+                continue
+            if evt.get("kind") != "response":
+                continue
+            status = int(evt.get("status") or 0)
+            if status < 200 or status >= 400:
+                continue
+            url = str(evt.get("url") or "")
+            if not self._is_generation_network_url(url):
+                continue
+            event_time = float(evt.get("t") or 0)
+            if event_time <= 0:
+                continue
+            return max(0.0, now - event_time)
+        return None
 
     def _attach_network_logging(self):
         if not self.page or self._network_logging_attached:
@@ -1899,6 +1935,10 @@ class GeminiWebAutomation(BaseAutomation):
                     resp_count_total = int(snap.get("response_count") or 0)
                     resp_len_total = int(snap.get("last_response_len") or 0)
                     resp_sig = str(snap.get("last_response_signature") or "")
+                    recent_activity_age = self._get_recent_generation_activity_age()
+                    backend_activity_live = (
+                        recent_activity_age is not None and recent_activity_age <= RECENT_NETWORK_ACTIVITY_SECONDS
+                    )
 
                     response_changed = False
                     if resp_count_total > pre_send_resp_count:
@@ -1926,7 +1966,8 @@ class GeminiWebAutomation(BaseAutomation):
                     log(
                         f"[{self._request_id}] Wait state: elapsed={elapsed}s stop={snap.get('stop_visible')} "
                         f"send={snap.get('send_visible')} resp={resp_count} "
-                        f"len={resp_len} copy={snap.get('copy_count')} vis={snap.get('visibility')} seen_new={seen_new_response}",
+                        f"len={resp_len} copy={snap.get('copy_count')} vis={snap.get('visibility')} "
+                        f"seen_new={seen_new_response} net_age={int(recent_activity_age) if recent_activity_age is not None else '-'}",
                         f"Worker {self.worker_id}"
                     )
 
@@ -1982,12 +2023,21 @@ class GeminiWebAutomation(BaseAutomation):
                             log("✅ Finalized stable response during post-processing", f"Worker {self.worker_id}")
                             return {"success": True, "response": finalized_text}
 
-                    if (not stall_reason) and stop_visible and resp_count == 0 and elapsed >= self._stall_empty_seconds:
-                        stall_reason = f"Stalled generation: no output for {self._stall_empty_seconds}s"
+                    empty_threshold = self._stall_empty_seconds
+                    if backend_activity_live:
+                        empty_threshold = max(empty_threshold, STALL_EMPTY_SECONDS_WITH_ACTIVITY)
+
+                    if (not stall_reason) and stop_visible and resp_count == 0 and elapsed >= empty_threshold:
+                        stall_reason = f"Stalled generation: no output for {empty_threshold}s"
                     elif (not stall_reason) and stop_visible and resp_count > 0:
                         no_progress_threshold = self._stall_no_progress_seconds
                         if resp_len < STALL_SMALL_LEN_THRESHOLD:
                             no_progress_threshold = STALL_NO_PROGRESS_SECONDS_SMALL
+                            if backend_activity_live:
+                                no_progress_threshold = max(
+                                    no_progress_threshold,
+                                    STALL_NO_PROGRESS_SECONDS_SMALL_WITH_ACTIVITY,
+                                )
 
                         if no_progress_age >= no_progress_threshold:
                             stall_reason = f"Stalled generation: no progress for {no_progress_threshold}s (len={resp_len})"
