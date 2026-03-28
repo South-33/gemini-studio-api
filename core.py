@@ -1536,7 +1536,7 @@ class GeminiWebAutomation(BaseAutomation):
                                 await self._human_delay(500 * (attempt + 1), 1000 * (attempt + 1))
                                 continue
                             else:
-                                log(f"❌ {description}: verification failed", f"Worker {self.worker_id}")
+                                log(f"⚠️ {description}: state change not confirmed", f"Worker {self.worker_id}")
                                 await self._screenshot_on_failure(f"{description}_verify_failed")
                                 return False
                     except Exception as e:
@@ -1747,8 +1747,8 @@ class GeminiWebAutomation(BaseAutomation):
                     break
             
             if not new_chat_success:
-                log("⚠️ New Chat click failed, proceeding anyway", f"Worker {self.worker_id}")
-                self._track_error("New chat click failed", "new_chat", "send_message")
+                log("⚠️ New Chat reset not confirmed, proceeding anyway", f"Worker {self.worker_id}")
+                self._track_error("New chat reset not confirmed", "new_chat", "send_message")
 
             
             # 1.5 Enable Temporary Chat
