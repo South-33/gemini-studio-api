@@ -39,6 +39,8 @@ STALL_NO_PROGRESS_SECONDS_SMALL = 180
 STALL_NO_PROGRESS_SECONDS_SMALL_WITH_ACTIVITY = 300
 STALL_NO_PROGRESS_SECONDS_WITH_ACTIVITY = 180
 STALL_SMALL_LEN_THRESHOLD = 200
+STALL_THINKING_NO_PROGRESS_SECONDS = 30
+STALL_THINKING_NO_PROGRESS_SECONDS_WITH_ACTIVITY = 45
 FINALIZE_STABLE_RESPONSE_SECONDS = 45
 FINALIZE_STABLE_RESPONSE_LEN = 800
 RECENT_NETWORK_ACTIVITY_SECONDS = 45
@@ -1114,6 +1116,15 @@ class GeminiWebAutomation(BaseAutomation):
             "last_response_len": 0,
             "last_response_signature": "",
             "last_response_tail": "",
+            "response_body_len": 0,
+            "response_visible": False,
+            "response_copy_count": 0,
+            "input_copy_count": 0,
+            "thinking_visible": False,
+            "thinking_active": False,
+            "thinking_label": "",
+            "thinking_len": 0,
+            "phase": "idle_or_unknown",
             "active_button": "",
             "visibility": "unknown",
             "network_events": [],
@@ -1155,16 +1166,66 @@ class GeminiWebAutomation(BaseAutomation):
                     if (!responses.length) responses = document.querySelectorAll('model-response, assistant-message-content');
                     const last = responses.length ? responses[responses.length - 1] : null;
                     const lastText = last ? (last.innerText || '') : '';
+                    const responseCopyButtons = last
+                        ? Array.from(last.querySelectorAll('button[aria-label="Copy"]')).filter(isVisible)
+                        : [];
+                    const inputCopyButtons = Array.from(document.querySelectorAll('button[aria-label="Copy prompt"]')).filter(isVisible);
+                    const thinkingBtn = last
+                        ? Array.from(last.querySelectorAll('button.thoughts-header-button')).find(isVisible) || null
+                        : Array.from(document.querySelectorAll('button.thoughts-header-button')).find(isVisible) || null;
+                    const thinkingLabel = (thinkingBtn?.innerText || thinkingBtn?.textContent || '').trim().slice(0, 120);
+                    const thinkingDoneLabels = new Set(['Show thinking', 'Hide thinking']);
+                    const thinkingActive = !!thinkingBtn && !thinkingDoneLabels.has(thinkingLabel);
+
+                    let thoughtContainer = null;
+                    if (thinkingBtn) {
+                        thoughtContainer =
+                            (last && (last.querySelector('.thought-container') || last.querySelector('[class*="thought-container"]'))) ||
+                            thinkingBtn.closest('[class*="thought-container"]');
+
+                        if (!thoughtContainer) {
+                            const sibling = thinkingBtn.parentElement?.nextElementSibling || null;
+                            if (sibling) {
+                                const siblingClass = String(sibling.className || '').toLowerCase();
+                                if (siblingClass.includes('thought') || siblingClass.includes('reason')) {
+                                    thoughtContainer = sibling;
+                                }
+                            }
+                        }
+                    }
+
+                    const thinkingText = thoughtContainer ? (thoughtContainer.innerText || thoughtContainer.textContent || '') : '';
+                    const thinkingLen = thinkingText.trim().length;
+                    const responseBodyLen = Math.max(0, lastText.trim().length - thinkingLen);
+                    const responseVisible = responseBodyLen > 0;
+
+                    let phase = 'idle_or_unknown';
+                    if (responseCopyButtons.length > 0) {
+                        phase = 'response_copyable_postprocessing';
+                    } else if (stopBtn) {
+                        phase = thinkingActive && responseBodyLen < 120 ? 'thinking_only' : 'response_streaming';
+                    } else if (responseVisible) {
+                        phase = 'response_complete_postprocessing';
+                    }
 
                     return {
                         stop_visible: !!stopBtn,
                         send_visible: !!sendBtn,
                         active_button: (stopBtn?.getAttribute('aria-label') || stopBtn?.innerText || sendBtn?.getAttribute('aria-label') || sendBtn?.innerText || '').trim().slice(0, 80),
                         copy_count: document.querySelectorAll('button[aria-label="Copy"]').length,
+                        response_copy_count: responseCopyButtons.length,
+                        input_copy_count: inputCopyButtons.length,
                         response_count: responses.length,
                         last_response_len: lastText.length,
                         last_response_signature: `${lastText.slice(0, 80)}|${lastText.slice(-80)}`.slice(0, 200),
                         last_response_tail: lastText.slice(-120),
+                        response_body_len: responseBodyLen,
+                        response_visible: responseVisible,
+                        thinking_visible: !!thinkingBtn,
+                        thinking_active: thinkingActive,
+                        thinking_label: thinkingLabel,
+                        thinking_len: thinkingLen,
+                        phase,
                         visibility: document.visibilityState || 'unknown',
                     };
                 }
@@ -1912,8 +1973,12 @@ class GeminiWebAutomation(BaseAutomation):
             max_wait = int(os.getenv("BROWSER_TIMEOUT", "480"))
             copy_btn = None
             last_wait_log = start_time
-            last_response_len = -1
-            last_progress_at = start_time
+            last_thinking_len = -1
+            last_response_body_len = -1
+            last_thinking_progress_at = start_time
+            last_response_progress_at = start_time
+            last_phase = "idle_or_unknown"
+            last_phase_change_at = start_time
             last_scroll_nudge_at = 0.0
             finalize_attempted = False
             seen_new_response = False
@@ -1944,6 +2009,11 @@ class GeminiWebAutomation(BaseAutomation):
                     resp_count_total = int(snap.get("response_count") or 0)
                     resp_len_total = int(snap.get("last_response_len") or 0)
                     resp_sig = str(snap.get("last_response_signature") or "")
+                    response_body_len = int(snap.get("response_body_len") or 0)
+                    thinking_len = int(snap.get("thinking_len") or 0)
+                    response_copy_count = int(snap.get("response_copy_count") or 0)
+                    input_copy_count = int(snap.get("input_copy_count") or 0)
+                    phase = str(snap.get("phase") or "idle_or_unknown")
                     recent_activity_age = self._get_recent_generation_activity_age()
                     backend_activity_live = (
                         recent_activity_age is not None and recent_activity_age <= RECENT_NETWORK_ACTIVITY_SECONDS
@@ -1967,23 +2037,38 @@ class GeminiWebAutomation(BaseAutomation):
                         resp_count = 0
                         resp_len = 0
 
-                    if resp_len > last_response_len:
-                        last_response_len = resp_len
-                        last_progress_at = now
+                    if phase != last_phase:
+                        last_phase = phase
+                        last_phase_change_at = now
+                        finalize_attempted = False
+
+                    if thinking_len > last_thinking_len:
+                        last_thinking_len = thinking_len
+                        last_thinking_progress_at = now
+
+                    if response_body_len > last_response_body_len:
+                        last_response_body_len = response_body_len
+                        last_response_progress_at = now
                         finalize_attempted = False
 
                     log(
                         f"[{self._request_id}] Wait state: elapsed={elapsed}s stop={snap.get('stop_visible')} "
                         f"send={snap.get('send_visible')} resp={resp_count} "
-                        f"len={resp_len} copy={snap.get('copy_count')} vis={snap.get('visibility')} "
-                        f"seen_new={seen_new_response} net_age={int(recent_activity_age) if recent_activity_age is not None else '-'}",
+                        f"len={resp_len} body={response_body_len} think={thinking_len} phase={phase} "
+                        f"copy={snap.get('copy_count')}/{response_copy_count} input_copy={input_copy_count} "
+                        f"vis={snap.get('visibility')} seen_new={seen_new_response} "
+                        f"net_age={int(recent_activity_age) if recent_activity_age is not None else '-'}",
                         f"Worker {self.worker_id}"
                     )
 
                     # Progress watchdog: recover poisoned/stalled generation before full timeout
                     stop_visible = bool(snap.get("stop_visible"))
                     send_visible = bool(snap.get("send_visible"))
-                    no_progress_age = int(now - last_progress_at)
+                    if phase == "thinking_only":
+                        progress_age_basis = max(last_phase_change_at, last_thinking_progress_at)
+                    else:
+                        progress_age_basis = max(last_phase_change_at, last_response_progress_at)
+                    no_progress_age = int(now - progress_age_basis)
                     stall_reason = ""
 
                     # Guardrail: request likely never sent, avoid waiting full timeout.
@@ -2018,13 +2103,14 @@ class GeminiWebAutomation(BaseAutomation):
                     if (
                         (not finalize_attempted)
                         and stop_visible
+                        and phase in ("response_streaming", "response_complete_postprocessing")
                         and seen_new_response
-                        and resp_len >= FINALIZE_STABLE_RESPONSE_LEN
+                        and response_body_len >= FINALIZE_STABLE_RESPONSE_LEN
                         and no_progress_age >= FINALIZE_STABLE_RESPONSE_SECONDS
                     ):
                         finalize_attempted = True
                         log(
-                            f"Attempting finalize after stable response len={resp_len} no_progress={no_progress_age}s",
+                            f"Attempting finalize after stable response body={response_body_len} no_progress={no_progress_age}s",
                             f"Worker {self.worker_id}"
                         )
                         finalized_text = await self._attempt_finalize_stalled_response(
@@ -2040,7 +2126,26 @@ class GeminiWebAutomation(BaseAutomation):
                     if backend_activity_live:
                         empty_threshold = max(empty_threshold, STALL_EMPTY_SECONDS_WITH_ACTIVITY)
 
-                    if (not stall_reason) and stop_visible and resp_count == 0 and elapsed >= empty_threshold:
+                    can_track_thinking_progress = thinking_len > 0 or last_thinking_len > 0
+
+                    if (
+                        (not stall_reason)
+                        and stop_visible
+                        and phase == "thinking_only"
+                        and can_track_thinking_progress
+                    ):
+                        thinking_threshold = STALL_THINKING_NO_PROGRESS_SECONDS
+                        if backend_activity_live:
+                            thinking_threshold = max(
+                                thinking_threshold,
+                                STALL_THINKING_NO_PROGRESS_SECONDS_WITH_ACTIVITY,
+                            )
+                        if no_progress_age >= thinking_threshold:
+                            stall_reason = (
+                                f"Stalled generation: thinking made no progress for {thinking_threshold}s "
+                                f"(thinking_len={thinking_len})"
+                            )
+                    elif (not stall_reason) and stop_visible and resp_count == 0 and elapsed >= empty_threshold:
                         stall_reason = f"Stalled generation: no output for {empty_threshold}s"
                     elif (not stall_reason) and stop_visible and resp_count > 0:
                         no_progress_threshold = self._stall_no_progress_seconds
@@ -2049,7 +2154,7 @@ class GeminiWebAutomation(BaseAutomation):
                                 no_progress_threshold,
                                 STALL_NO_PROGRESS_SECONDS_WITH_ACTIVITY,
                             )
-                        if resp_len < STALL_SMALL_LEN_THRESHOLD:
+                        if response_body_len < STALL_SMALL_LEN_THRESHOLD:
                             no_progress_threshold = STALL_NO_PROGRESS_SECONDS_SMALL
                             if backend_activity_live:
                                 no_progress_threshold = max(
@@ -2058,7 +2163,10 @@ class GeminiWebAutomation(BaseAutomation):
                                 )
 
                         if no_progress_age >= no_progress_threshold:
-                            stall_reason = f"Stalled generation: no progress for {no_progress_threshold}s (len={resp_len})"
+                            stall_reason = (
+                                f"Stalled generation: no progress for {no_progress_threshold}s "
+                                f"(body_len={response_body_len})"
+                            )
 
                     if stall_reason:
                         log(f"⚠️ {stall_reason}", f"Worker {self.worker_id}")
@@ -2846,12 +2954,15 @@ class WorkerPool:
         # Retry configuration
         # With 2 workers, allow a third total attempt so a refreshed/recreated worker
         # can be reused if the alternate worker is still occupied.
-        MAX_RETRIES = 2 if len(self.workers) == 1 else 3
+        max_attempts = 2 if len(self.workers) == 1 else 3
+        extra_recovery_attempts_remaining = 1 if len(self.workers) > 1 else 0
         tried_workers = set()
         last_error = None
         last_failure_worker_index: Optional[int] = None
+        attempts_used = 0
         
-        for attempt in range(MAX_RETRIES):
+        while attempts_used < max_attempts:
+            attempts_used += 1
             # Acquire semaphore (limits concurrent requests to N workers)
             sem_wait_start = time.time()
             async with self._browser_semaphore:
@@ -2940,6 +3051,13 @@ class WorkerPool:
                     if attempt_error and allow_same_worker_retry:
                         tried_workers.discard(worker_index)
                         if recreated_ok:
+                            if extra_recovery_attempts_remaining > 0:
+                                max_attempts += 1
+                                extra_recovery_attempts_remaining -= 1
+                                log(
+                                    f"Granted extra recovery attempt after recreating worker {worker_index+1}",
+                                    "WorkerPool",
+                                )
                             log(
                                 f"Worker {worker_index+1} retry reopened after recreation",
                                 "WorkerPool",
@@ -2951,7 +3069,7 @@ class WorkerPool:
                             )
         
         # All retries exhausted
-        log(f"❌ All {MAX_RETRIES} attempts failed. Last error: {last_error}", "WorkerPool")
+        log(f"❌ All {attempts_used} attempts failed. Last error: {last_error}", "WorkerPool")
         await self._notify_final_failure(last_error or "unknown", last_failure_worker_index)
         return {"success": False, "error": f"All workers failed. Last error: {last_error}"}
 
