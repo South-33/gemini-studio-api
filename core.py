@@ -1696,24 +1696,52 @@ class GeminiWebAutomation(BaseAutomation):
                 self._request_count = 0
             
             # 1. New Chat (starts fresh) - VERIFIED
-            async def get_copy_count():
-                return await self.page.locator(copy_selector).count()
-            
-            async def verify_chat_cleared(before_count):
-                # Give extra time for chat to clear
-                await self._human_delay(500, 800)
-                after_count = await self.page.locator(copy_selector).count()
-                # Success if count dropped (ideally to 0, but at least fewer than before)
-                return after_count == 0 or after_count < before_count
+            async def get_chat_state():
+                snap = await self._capture_state_snapshot()
+                return {
+                    "response_count": int(snap.get("response_count") or 0),
+                    "last_response_len": int(snap.get("last_response_len") or 0),
+                    "last_response_signature": str(snap.get("last_response_signature") or ""),
+                    "stop_visible": bool(snap.get("stop_visible")),
+                }
+
+            async def verify_chat_cleared(before_state):
+                before_state = before_state or {}
+                before_count = int(before_state.get("response_count") or 0)
+                before_len = int(before_state.get("last_response_len") or 0)
+                before_sig = str(before_state.get("last_response_signature") or "")
+                deadline = time.time() + 2.0
+
+                while time.time() < deadline:
+                    snap = await get_chat_state()
+                    after_count = int(snap.get("response_count") or 0)
+                    after_len = int(snap.get("last_response_len") or 0)
+                    after_sig = str(snap.get("last_response_signature") or "")
+                    stop_visible = bool(snap.get("stop_visible"))
+
+                    if stop_visible:
+                        await asyncio.sleep(0.15)
+                        continue
+
+                    if after_count == 0:
+                        return True
+
+                    if before_count > 0 and after_sig != before_sig and after_len <= max(40, before_len // 4):
+                        return True
+
+                    await asyncio.sleep(0.15)
+
+                return False
             
             new_chat_success = False
             for selector in self._selector_candidates("new_chat"):
                 new_chat_success = await self._verified_click(
                     selector,
                     "New Chat",
-                    verify_before=get_copy_count,
+                    verify_before=get_chat_state,
                     verify_after=verify_chat_cleared,
-                    timeout=5000
+                    timeout=1500,
+                    max_retries=0,
                 )
                 if new_chat_success:
                     break
