@@ -1111,6 +1111,7 @@ class GeminiWebAutomation(BaseAutomation):
             "url": "",
             "stop_visible": False,
             "send_visible": False,
+            "input_visible": False,
             "copy_count": 0,
             "response_count": 0,
             "last_response_len": 0,
@@ -1163,6 +1164,12 @@ class GeminiWebAutomation(BaseAutomation):
                         const text = (b.innerText || '').toLowerCase();
                         return label.includes('send') || text.includes('send');
                     });
+                    const inputBox = Array.from(document.querySelectorAll(
+                        'div[role="textbox"][aria-label="Enter a prompt for Gemini"], ' +
+                        'div[role="textbox"][aria-label="Enter a prompt here"], ' +
+                        'div[role="textbox"][contenteditable="true"], ' +
+                        '.ql-editor[role="textbox"], .ql-editor'
+                    )).find(isVisible) || null;
 
                     let responses = document.querySelectorAll('[data-content-type="response"]');
                     if (!responses.length) responses = document.querySelectorAll('model-response, assistant-message-content');
@@ -1215,6 +1222,7 @@ class GeminiWebAutomation(BaseAutomation):
                     return {
                         stop_visible: !!stopBtn,
                         send_visible: !!sendBtn,
+                        input_visible: !!inputBox,
                         active_button: (stopBtn?.getAttribute('aria-label') || stopBtn?.innerText || sendBtn?.getAttribute('aria-label') || sendBtn?.innerText || '').trim().slice(0, 80),
                         copy_count: document.querySelectorAll('button[aria-label="Copy"]').length,
                         response_copy_count: responseCopyButtons.length,
@@ -1411,11 +1419,14 @@ class GeminiWebAutomation(BaseAutomation):
         user_query_count = int(snap.get("user_query_count") or 0)
         empty_chat_visible = bool(snap.get("empty_chat_visible"))
         stop_visible = bool(snap.get("stop_visible"))
+        input_visible = bool(snap.get("input_visible"))
 
-        if response_count == 0 and user_query_count == 0 and empty_chat_visible and not stop_visible:
+        if response_count == 0 and user_query_count == 0 and not stop_visible and input_visible:
             return "confirmed_cleared"
         if response_count > 0 or user_query_count > 0 or stop_visible:
             return "definitely_not_cleared"
+        if empty_chat_visible and input_visible and not stop_visible:
+            return "confirmed_cleared"
         return "transitional_or_uncertain"
 
     async def _ensure_fresh_chat(self) -> bool:
