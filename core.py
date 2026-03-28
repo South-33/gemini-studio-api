@@ -1120,6 +1120,8 @@ class GeminiWebAutomation(BaseAutomation):
             "response_visible": False,
             "response_copy_count": 0,
             "input_copy_count": 0,
+            "user_query_count": 0,
+            "empty_chat_visible": False,
             "thinking_visible": False,
             "thinking_active": False,
             "thinking_label": "",
@@ -1164,6 +1166,8 @@ class GeminiWebAutomation(BaseAutomation):
 
                     let responses = document.querySelectorAll('[data-content-type="response"]');
                     if (!responses.length) responses = document.querySelectorAll('model-response, assistant-message-content');
+                    const userQueries = document.querySelectorAll('user-query');
+                    const emptyChat = document.querySelector('modular-zero-state, zero-state, bard-zero-state');
                     const last = responses.length ? responses[responses.length - 1] : null;
                     const lastText = last ? (last.innerText || '') : '';
                     const responseCopyButtons = last
@@ -1215,6 +1219,8 @@ class GeminiWebAutomation(BaseAutomation):
                         copy_count: document.querySelectorAll('button[aria-label="Copy"]').length,
                         response_copy_count: responseCopyButtons.length,
                         input_copy_count: inputCopyButtons.length,
+                        user_query_count: userQueries.length,
+                        empty_chat_visible: !!emptyChat,
                         response_count: responses.length,
                         last_response_len: lastText.length,
                         last_response_signature: `${lastText.slice(0, 80)}|${lastText.slice(-80)}`.slice(0, 200),
@@ -1397,6 +1403,90 @@ class GeminiWebAutomation(BaseAutomation):
             )
         except:
             pass
+
+    @staticmethod
+    def _classify_new_chat_state(snapshot: Optional[Dict[str, Any]]) -> str:
+        snap = snapshot or {}
+        response_count = int(snap.get("response_count") or 0)
+        user_query_count = int(snap.get("user_query_count") or 0)
+        empty_chat_visible = bool(snap.get("empty_chat_visible"))
+        stop_visible = bool(snap.get("stop_visible"))
+
+        if response_count == 0 and user_query_count == 0 and empty_chat_visible and not stop_visible:
+            return "confirmed_cleared"
+        if response_count > 0 or user_query_count > 0 or stop_visible:
+            return "definitely_not_cleared"
+        return "transitional_or_uncertain"
+
+    async def _ensure_fresh_chat(self) -> bool:
+        """Ensure the worker is on a genuinely fresh Gemini chat before sending."""
+        baseline = await self._capture_state_snapshot()
+        baseline_state = self._classify_new_chat_state(baseline)
+        if baseline_state == "confirmed_cleared":
+            return True
+
+        new_chat_selectors = self._selector_candidates("new_chat")
+        if not new_chat_selectors:
+            return False
+
+        click_attempts = 0
+        max_click_attempts = 2
+        last_state = baseline_state
+
+        while click_attempts < max_click_attempts:
+            clicked = False
+            for selector in new_chat_selectors:
+                try:
+                    locator = self.page.locator(selector).first
+                    if await locator.count() == 0:
+                        continue
+                    if not await locator.is_visible():
+                        continue
+                    try:
+                        await locator.click(timeout=1500)
+                    except Exception:
+                        safe_selector = selector.replace("'", "\\'")
+                        await self.page.evaluate(
+                            f"""
+                            () => {{
+                                const el = document.querySelector('{safe_selector}');
+                                if (el) el.click();
+                            }}
+                            """
+                        )
+                    clicked = True
+                    break
+                except:
+                    continue
+
+            if not clicked:
+                break
+
+            click_attempts += 1
+            deadline = time.time() + 4.0
+            while time.time() < deadline:
+                snap = await self._capture_state_snapshot()
+                state = self._classify_new_chat_state(snap)
+                last_state = state
+                if state == "confirmed_cleared":
+                    if click_attempts > 1:
+                        log(f"New Chat confirmed after {click_attempts} attempts", f"Worker {self.worker_id}")
+                    return True
+                await asyncio.sleep(0.2)
+
+            log(
+                f"⚠️ New Chat attempt {click_attempts}: state remained {last_state}",
+                f"Worker {self.worker_id}",
+            )
+
+        final_snapshot = await self._capture_state_snapshot()
+        final_state = self._classify_new_chat_state(final_snapshot)
+        if final_state == "confirmed_cleared":
+            return True
+
+        log(f"⚠️ New Chat reset not confirmed ({final_state})", f"Worker {self.worker_id}")
+        self._track_error("New chat reset not confirmed", "new_chat", "ensure_fresh_chat", final_snapshot)
+        return False
 
     def _track_error(self, error: str, selector_key: str, action: str, diagnostics: Optional[Dict[str, Any]] = None):
         payload = {
@@ -1695,60 +1785,9 @@ class GeminiWebAutomation(BaseAutomation):
                 await self._human_delay(1000, 1500)
                 self._request_count = 0
             
-            # 1. New Chat (starts fresh) - VERIFIED
-            async def get_chat_state():
-                snap = await self._capture_state_snapshot()
-                return {
-                    "response_count": int(snap.get("response_count") or 0),
-                    "last_response_len": int(snap.get("last_response_len") or 0),
-                    "last_response_signature": str(snap.get("last_response_signature") or ""),
-                    "stop_visible": bool(snap.get("stop_visible")),
-                }
-
-            async def verify_chat_cleared(before_state):
-                before_state = before_state or {}
-                before_count = int(before_state.get("response_count") or 0)
-                before_len = int(before_state.get("last_response_len") or 0)
-                before_sig = str(before_state.get("last_response_signature") or "")
-                deadline = time.time() + 2.0
-
-                while time.time() < deadline:
-                    snap = await get_chat_state()
-                    after_count = int(snap.get("response_count") or 0)
-                    after_len = int(snap.get("last_response_len") or 0)
-                    after_sig = str(snap.get("last_response_signature") or "")
-                    stop_visible = bool(snap.get("stop_visible"))
-
-                    if stop_visible:
-                        await asyncio.sleep(0.15)
-                        continue
-
-                    if after_count == 0:
-                        return True
-
-                    if before_count > 0 and after_sig != before_sig and after_len <= max(40, before_len // 4):
-                        return True
-
-                    await asyncio.sleep(0.15)
-
-                return False
-            
-            new_chat_success = False
-            for selector in self._selector_candidates("new_chat"):
-                new_chat_success = await self._verified_click(
-                    selector,
-                    "New Chat",
-                    verify_before=get_chat_state,
-                    verify_after=verify_chat_cleared,
-                    timeout=1500,
-                    max_retries=0,
-                )
-                if new_chat_success:
-                    break
-            
-            if not new_chat_success:
-                log("⚠️ New Chat reset not confirmed, proceeding anyway", f"Worker {self.worker_id}")
-                self._track_error("New chat reset not confirmed", "new_chat", "send_message")
+            # 1. New Chat (starts fresh)
+            if not await self._ensure_fresh_chat():
+                return {"success": False, "error": "New chat reset not confirmed"}
 
             
             # 1.5 Enable Temporary Chat
