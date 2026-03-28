@@ -1499,6 +1499,127 @@ class GeminiWebAutomation(BaseAutomation):
         self._track_error("New chat reset not confirmed", "new_chat", "ensure_fresh_chat", final_snapshot)
         return False
 
+    async def _get_temp_chat_button(self):
+        temp_btn = await self._resolve_locator("temp_chat")
+        if temp_btn is None:
+            return None
+
+        try:
+            if not await temp_btn.is_visible():
+                sidebar_btn = await self._resolve_locator("sidebar_toggle")
+                if sidebar_btn is not None and await sidebar_btn.is_visible():
+                    await sidebar_btn.click()
+                    await self._human_delay(300, 500)
+        except:
+            pass
+
+        try:
+            if await temp_btn.is_visible():
+                return temp_btn
+        except:
+            pass
+        return None
+
+    async def _is_temp_chat_active(self, temp_btn=None) -> bool:
+        try:
+            temp_active_selector = await self._resolve_selector("temp_chat_active")
+            if temp_active_selector:
+                temp_active = self.page.locator(temp_active_selector)
+                if await temp_active.count() > 0:
+                    return True
+        except:
+            pass
+
+        try:
+            btn = temp_btn or await self._get_temp_chat_button()
+            if btn is None:
+                return False
+            return bool(
+                await btn.evaluate(
+                    """
+                    (el) => el.classList.contains('temp-chat-on') || el.getAttribute('aria-pressed') === 'true'
+                    """
+                )
+            )
+        except:
+            return False
+
+    async def _click_temp_chat_toggle(self) -> bool:
+        btn = await self._get_temp_chat_button()
+        if btn is None:
+            return False
+
+        try:
+            await btn.click(timeout=1500)
+            await self._human_delay(250, 400)
+            return True
+        except Exception:
+            try:
+                selector = await self._resolve_selector("temp_chat")
+                if not selector:
+                    return False
+                safe_selector = selector.replace("'", "\\'")
+                await self.page.evaluate(
+                    f"""
+                    () => {{
+                        const el = document.querySelector('{safe_selector}');
+                        if (el) el.click();
+                    }}
+                    """
+                )
+                await self._human_delay(250, 400)
+                return True
+            except:
+                return False
+
+    async def _ensure_fresh_temp_chat(self) -> bool:
+        """Use the temp-chat toggle as the primary fresh-chat generator."""
+        temp_btn = await self._get_temp_chat_button()
+        if temp_btn is None:
+            return await self._ensure_fresh_chat()
+
+        was_active = await self._is_temp_chat_active(temp_btn)
+        expected_states = [False, True] if was_active else [True]
+
+        for idx, expected_active in enumerate(expected_states, start=1):
+            if not await self._click_temp_chat_toggle():
+                log("⚠️ Temp Chat toggle click failed", f"Worker {self.worker_id}")
+                return await self._ensure_fresh_chat()
+
+            deadline = time.time() + 3.0
+            state_matched = False
+            while time.time() < deadline:
+                if await self._is_temp_chat_active():
+                    current_active = True
+                else:
+                    current_active = False
+                if current_active == expected_active:
+                    state_matched = True
+                    break
+                await asyncio.sleep(0.2)
+
+            if not state_matched:
+                log(
+                    f"⚠️ Temp Chat toggle {idx}: active state did not become {expected_active}",
+                    f"Worker {self.worker_id}",
+                )
+                return await self._ensure_fresh_chat()
+
+        deadline = time.time() + 4.0
+        last_state = "transitional_or_uncertain"
+        while time.time() < deadline:
+            snap = await self._capture_state_snapshot()
+            last_state = self._classify_new_chat_state(snap)
+            if last_state == "confirmed_cleared":
+                return True
+            await asyncio.sleep(0.2)
+
+        log(
+            f"⚠️ Temp Chat reset not confirmed ({last_state}), falling back to New Chat",
+            f"Worker {self.worker_id}",
+        )
+        return await self._ensure_fresh_chat()
+
     def _track_error(self, error: str, selector_key: str, action: str, diagnostics: Optional[Dict[str, Any]] = None):
         payload = {
             "error": error,
@@ -1796,13 +1917,10 @@ class GeminiWebAutomation(BaseAutomation):
                 await self._human_delay(1000, 1500)
                 self._request_count = 0
             
-            # 1. New Chat (starts fresh)
-            if not await self._ensure_fresh_chat():
-                return {"success": False, "error": "New chat reset not confirmed"}
+            # 1. Fresh temp chat
+            if not await self._ensure_fresh_temp_chat():
+                return {"success": False, "error": "Fresh temp chat reset not confirmed"}
 
-            
-            # 1.5 Enable Temporary Chat
-            await self._enable_temp_chat()
             await self._human_delay()
 
             # 2. Select Model
