@@ -1109,6 +1109,7 @@ class GeminiWebAutomation(BaseAutomation):
         snapshot: Dict[str, Any] = {
             "request_id": self._request_id,
             "url": "",
+            "page_title": "",
             "stop_visible": False,
             "send_visible": False,
             "input_visible": False,
@@ -1128,6 +1129,7 @@ class GeminiWebAutomation(BaseAutomation):
             "thinking_label": "",
             "thinking_len": 0,
             "phase": "idle_or_unknown",
+            "error_page_500": False,
             "active_button": "",
             "visibility": "unknown",
             "network_events": [],
@@ -1152,6 +1154,13 @@ class GeminiWebAutomation(BaseAutomation):
                         if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
                         return !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
                     };
+
+                    const pageTitle = (document.title || '').trim();
+                    const bodyText = (document.body?.innerText || '').toLowerCase();
+                    const isGoogle500 =
+                        pageTitle.toLowerCase().includes('500') ||
+                        bodyText.includes("500. that's an error") ||
+                        bodyText.includes('there was an error. please try again later. that\'s all we know.');
 
                     const buttons = Array.from(document.querySelectorAll('button')).filter(isVisible);
                     const stopBtn = buttons.find((b) => {
@@ -1220,6 +1229,7 @@ class GeminiWebAutomation(BaseAutomation):
                     }
 
                     return {
+                        page_title: pageTitle.slice(0, 160),
                         stop_visible: !!stopBtn,
                         send_visible: !!sendBtn,
                         input_visible: !!inputBox,
@@ -1240,6 +1250,7 @@ class GeminiWebAutomation(BaseAutomation):
                         thinking_label: thinkingLabel,
                         thinking_len: thinkingLen,
                         phase,
+                        error_page_500: isGoogle500,
                         visibility: document.visibilityState || 'unknown',
                     };
                 }
@@ -1354,6 +1365,17 @@ class GeminiWebAutomation(BaseAutomation):
             return None
         except:
             return None
+
+    async def _recover_from_google_500_page(self, reason: str) -> bool:
+        """Refresh away from transient Google 500 pages before giving up on the worker."""
+        try:
+            log(f"Detected Google 500 page ({reason}), refreshing", f"Worker {self.worker_id}")
+            await self.page.reload(wait_until="domcontentloaded", timeout=30000)
+            await self._human_delay(1000, 1500)
+            return True
+        except Exception as e:
+            log(f"Google 500 recovery failed: {e}", f"Worker {self.worker_id}")
+            return False
 
     async def _hard_refresh_and_reinit(self, reason: str) -> bool:
         """Hard refresh page and re-run worker init path."""
@@ -1782,24 +1804,45 @@ class GeminiWebAutomation(BaseAutomation):
         self.page = page
         self.context = context
         try:
-            # Wait for input to be ready (login check)
-            input_selector = await self._resolve_selector("input", require_visible=True, timeout_ms=12000)
-            if not input_selector:
-                raise Exception("Input selector not found")
+            for attempt in range(2):
+                snapshot = await self._capture_state_snapshot()
+                if snapshot.get("error_page_500"):
+                    if attempt == 0:
+                        recovered = await self._recover_from_google_500_page("init_precheck")
+                        if recovered:
+                            continue
+                    raise Exception(f"Google 500 error page during init: {snapshot.get('page_title') or self.page.url}")
 
-            await self.page.wait_for_selector(input_selector, timeout=30000)
-            await self._human_delay(500, 1000)
-            print("[GeminiWeb] ✅ Logged in and ready")
-            
-            # Default to Temporary Chat if possible for clean sessions
-            await self._enable_temp_chat()
-            await self._human_delay(200, 500)
-            await self._reset_browser_zoom(force=True)
-            await self._apply_headed_zoom(force=True)
-            self._attach_network_logging()
-            
-            self._initialized = True
-            return True
+                # Wait for input to be ready (login check)
+                input_selector = await self._resolve_selector("input", require_visible=True, timeout_ms=12000)
+                if not input_selector:
+                    if attempt == 0 and snapshot.get("error_page_500"):
+                        recovered = await self._recover_from_google_500_page("init_missing_input")
+                        if recovered:
+                            continue
+                    raise Exception("Input selector not found")
+
+                try:
+                    await self.page.wait_for_selector(input_selector, timeout=30000)
+                    await self._human_delay(500, 1000)
+                    print("[GeminiWeb] ✅ Logged in and ready")
+                    
+                    # Default to Temporary Chat if possible for clean sessions
+                    await self._enable_temp_chat()
+                    await self._human_delay(200, 500)
+                    await self._reset_browser_zoom(force=True)
+                    await self._apply_headed_zoom(force=True)
+                    self._attach_network_logging()
+                    
+                    self._initialized = True
+                    return True
+                except Exception as e:
+                    snapshot = await self._capture_state_snapshot()
+                    if attempt == 0 and snapshot.get("error_page_500"):
+                        recovered = await self._recover_from_google_500_page("init_wait_timeout")
+                        if recovered:
+                            continue
+                    raise e
         except Exception as e:
             print(f"[GeminiWeb] ❌ Init failed: {e}")
             self._track_error(str(e), "input", "init")
@@ -1875,6 +1918,22 @@ class GeminiWebAutomation(BaseAutomation):
 
             # Preflight: if previous run left tab in Stop state, recover before sending
             preflight = await self._capture_state_snapshot()
+            if preflight.get("error_page_500"):
+                log("Preflight detected Google 500 page, refreshing", f"Worker {self.worker_id}")
+                recovered = await self._recover_from_google_500_page("preflight_error_page_500")
+                if not recovered:
+                    self._track_error("Preflight 500-page recovery failed", "input", "preflight_recovery", preflight)
+                    return {"success": False, "error": "Preflight 500-page recovery failed"}
+                init_ok = await self.init_with_page(self.page, self.context)
+                if not init_ok:
+                    self._track_error("Preflight 500-page re-init failed", "input", "preflight_recovery", preflight)
+                    return {"success": False, "error": "Preflight 500-page re-init failed"}
+                copy_selector = await self._resolve_selector("copy_btn")
+                if not copy_selector:
+                    err = "Copy selector not found after 500-page recovery"
+                    self._track_error(err, "copy_btn", "send_message")
+                    return {"success": False, "error": err}
+
             if preflight.get("stop_visible", False):
                 log("Preflight detected stale stop state, refreshing", f"Worker {self.worker_id}")
                 recovered = await self._hard_refresh_and_reinit("preflight_stop_visible")
@@ -2187,6 +2246,13 @@ class GeminiWebAutomation(BaseAutomation):
                     log(f"⚠️ {outage_error}", f"Worker {self.worker_id}")
                     self._track_error(outage_error, "copy_btn", "wait_for_response_network_outage", snapshot)
                     return {"success": False, "error": outage_error}
+
+                page_snapshot = await self._capture_state_snapshot()
+                if page_snapshot.get("error_page_500"):
+                    log("⚠️ Google 500 error page detected during response wait", f"Worker {self.worker_id}")
+                    self._track_error("Google 500 error page", "input", "wait_for_response_500_page", page_snapshot)
+                    await self._hard_refresh_and_reinit("google_500_page")
+                    return {"success": False, "error": "Google 500 error page"}
 
                 btns = self.page.locator(copy_selector)
                 current_count = await btns.count()
