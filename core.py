@@ -1124,6 +1124,7 @@ class GeminiWebAutomation(BaseAutomation):
             "input_copy_count": 0,
             "user_query_count": 0,
             "empty_chat_visible": False,
+            "temp_chat_landing_visible": False,
             "thinking_visible": False,
             "thinking_active": False,
             "thinking_label": "",
@@ -1161,6 +1162,9 @@ class GeminiWebAutomation(BaseAutomation):
                         pageTitle.toLowerCase().includes('500') ||
                         bodyText.includes("500. that's an error") ||
                         bodyText.includes('there was an error. please try again later. that\'s all we know.');
+                    const tempChatLandingVisible =
+                        bodyText.includes('temporary chats don\'t appear in recent chats') ||
+                        bodyText.includes('temporary chats are saved for 72 hours');
 
                     const buttons = Array.from(document.querySelectorAll('button')).filter(isVisible);
                     const stopBtn = buttons.find((b) => {
@@ -1239,6 +1243,7 @@ class GeminiWebAutomation(BaseAutomation):
                         input_copy_count: inputCopyButtons.length,
                         user_query_count: userQueries.length,
                         empty_chat_visible: !!emptyChat,
+                        temp_chat_landing_visible: tempChatLandingVisible,
                         response_count: responses.length,
                         last_response_len: lastText.length,
                         last_response_signature: `${lastText.slice(0, 80)}|${lastText.slice(-80)}`.slice(0, 200),
@@ -1440,14 +1445,22 @@ class GeminiWebAutomation(BaseAutomation):
         response_count = int(snap.get("response_count") or 0)
         user_query_count = int(snap.get("user_query_count") or 0)
         empty_chat_visible = bool(snap.get("empty_chat_visible"))
+        temp_chat_landing_visible = bool(snap.get("temp_chat_landing_visible"))
         stop_visible = bool(snap.get("stop_visible"))
         input_visible = bool(snap.get("input_visible"))
+        error_page_500 = bool(snap.get("error_page_500"))
 
-        if response_count == 0 and user_query_count == 0 and not stop_visible and input_visible:
+        if (
+            response_count == 0
+            and user_query_count == 0
+            and not stop_visible
+            and not error_page_500
+            and (input_visible or empty_chat_visible or temp_chat_landing_visible)
+        ):
             return "confirmed_cleared"
         if response_count > 0 or user_query_count > 0 or stop_visible:
             return "definitely_not_cleared"
-        if empty_chat_visible and input_visible and not stop_visible:
+        if (empty_chat_visible or temp_chat_landing_visible) and not stop_visible and not error_page_500:
             return "confirmed_cleared"
         return "transitional_or_uncertain"
 
