@@ -1116,6 +1116,7 @@ class GeminiWebAutomation(BaseAutomation):
             "input_visible": False,
             "input_placeholder": "",
             "new_chat_visible": False,
+            "sidebar_expanded": False,
             "copy_count": 0,
             "response_count": 0,
             "last_response_len": 0,
@@ -1174,6 +1175,11 @@ class GeminiWebAutomation(BaseAutomation):
 
                     const buttons = Array.from(document.querySelectorAll('button')).filter(isVisible);
                     const newChatLink = Array.from(document.querySelectorAll('a[aria-label="New chat"], [data-test-id="new-chat-button"], a[href="/app"]')).find(isVisible) || null;
+                    const sidebarExpanded = Array.from(document.querySelectorAll('a, button, div, span')).some((el) => {
+                        if (!isVisible(el)) return false;
+                        const text = (el.innerText || '').trim();
+                        return text === 'Scheduled actions' || text === 'Gems' || text === 'My stuff';
+                    });
                     const stopBtn = buttons.find((b) => {
                         const label = (b.getAttribute('aria-label') || '').toLowerCase();
                         const text = (b.innerText || '').toLowerCase();
@@ -1251,6 +1257,7 @@ class GeminiWebAutomation(BaseAutomation):
                         input_visible: !!inputBox,
                         input_placeholder: inputPlaceholder.slice(0, 160),
                         new_chat_visible: !!newChatLink,
+                        sidebar_expanded: sidebarExpanded,
                         active_button: (stopBtn?.getAttribute('aria-label') || stopBtn?.innerText || sendBtn?.getAttribute('aria-label') || sendBtn?.innerText || '').trim().slice(0, 80),
                         copy_count: document.querySelectorAll('button[aria-label="Copy"]').length,
                         response_copy_count: responseCopyButtons.length,
@@ -1534,7 +1541,7 @@ class GeminiWebAutomation(BaseAutomation):
 
     async def _ensure_sidebar_open(self) -> bool:
         snapshot = await self._capture_state_snapshot()
-        if snapshot.get("new_chat_visible"):
+        if snapshot.get("sidebar_expanded"):
             return True
 
         sidebar_btn = await self._resolve_locator("sidebar_toggle")
@@ -1551,7 +1558,7 @@ class GeminiWebAutomation(BaseAutomation):
         deadline = time.time() + 3.0
         while time.time() < deadline:
             snap = await self._capture_state_snapshot()
-            if snap.get("new_chat_visible"):
+            if snap.get("sidebar_expanded"):
                 return True
             await asyncio.sleep(0.2)
         return False
@@ -1932,6 +1939,7 @@ class GeminiWebAutomation(BaseAutomation):
                     await self._reset_browser_zoom(force=True)
                     await self._apply_headed_zoom(force=True)
                     self._attach_network_logging()
+                    await self._ensure_sidebar_open()
                     
                     self._initialized = True
                     return True
