@@ -1258,7 +1258,7 @@ class GeminiWebAutomation(BaseAutomation):
                         temp_chat_button_visible: !!(tempBtn && isVisible(tempBtn)),
                         temp_chat_active: !!(tempBtn && tempBtn.classList.contains('temp-chat-on')),
                         temp_chat_button_classes: tempBtn ? Array.from(tempBtn.classList).slice(0, 20) : [],
-                        transition_state: !!transitionSpinner,
+                        transition_state: !!(transitionSpinner && isVisible(transitionSpinner)),
                         response_count: responses.length,
                         last_response_len: lastText.length,
                         last_response_signature: `${lastText.slice(0, 80)}|${lastText.slice(-80)}`.slice(0, 200),
