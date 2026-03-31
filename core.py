@@ -1582,31 +1582,6 @@ class GeminiWebAutomation(BaseAutomation):
             pass
         return None
 
-    async def _is_temp_chat_active(self, temp_btn=None) -> bool:
-        try:
-            snapshot = await self._capture_state_snapshot()
-            if snapshot.get("temp_chat_button_visible"):
-                return bool(snapshot.get("temp_chat_active"))
-        except:
-            pass
-
-        try:
-            temp_active_selector = await self._resolve_selector("temp_chat_active")
-            if temp_active_selector:
-                temp_active = self.page.locator(temp_active_selector)
-                if await temp_active.count() > 0:
-                    return True
-        except:
-            pass
-
-        try:
-            btn = temp_btn or await self._get_temp_chat_button()
-            if btn is None:
-                return False
-            return bool(await btn.evaluate("(el) => el.classList.contains('temp-chat-on')"))
-        except:
-            return False
-
     async def _click_temp_chat_toggle(self) -> bool:
         btn = await self._get_temp_chat_button()
         if btn is None:
@@ -1645,33 +1620,24 @@ class GeminiWebAutomation(BaseAutomation):
         if self._is_fresh_temp_chat_ready(baseline):
             return True
 
-        was_active = bool(baseline.get("temp_chat_active")) if baseline.get("temp_chat_button_visible") else await self._is_temp_chat_active(temp_btn)
-        expected_states = [False, True] if was_active else [True]
-
-        for idx, expected_active in enumerate(expected_states, start=1):
+        for idx in range(1, 3):
             if not await self._click_temp_chat_toggle():
                 log("⚠️ Temp Chat toggle click failed", f"Worker {self.worker_id}")
                 return False
 
             deadline = time.time() + 5.0
-            state_matched = False
             while time.time() < deadline:
                 snap = await self._capture_state_snapshot()
                 if self._is_fresh_temp_chat_ready(snap):
                     return True
-                current_active = bool(snap.get("temp_chat_active"))
-                transition_state = bool(snap.get("transition_state"))
-                if not transition_state and current_active == expected_active:
-                    state_matched = True
+                if not bool(snap.get("transition_state")):
                     break
                 await asyncio.sleep(0.2)
 
-            if not state_matched:
-                log(
-                    f"⚠️ Temp Chat toggle {idx}: active state did not become {expected_active}",
-                    f"Worker {self.worker_id}",
-                )
-                return False
+            log(
+                f"⚠️ Temp Chat toggle {idx}: page not fresh yet",
+                f"Worker {self.worker_id}",
+            )
 
         deadline = time.time() + 10.0
         last_state = "transitional_or_uncertain"
@@ -1875,9 +1841,6 @@ class GeminiWebAutomation(BaseAutomation):
                     await self._human_delay(500, 1000)
                     print("[GeminiWeb] ✅ Logged in and ready")
                     
-                    # Default to Temporary Chat if possible for clean sessions
-                    await self._enable_temp_chat()
-                    await self._human_delay(200, 500)
                     await self._reset_browser_zoom(force=True)
                     await self._apply_headed_zoom(force=True)
                     self._attach_network_logging()
@@ -1895,42 +1858,6 @@ class GeminiWebAutomation(BaseAutomation):
             print(f"[GeminiWeb] ❌ Init failed: {e}")
             self._track_error(str(e), "input", "init")
             return False
-
-    async def _enable_temp_chat(self):
-        """Enable temporary chat mode."""
-        try:
-            temp_btn = await self._resolve_locator("temp_chat")
-            if temp_btn is None:
-                return
-            
-            # Check if temp chat is already enabled
-            temp_active_selector = await self._resolve_selector("temp_chat_active")
-            temp_active = self.page.locator(temp_active_selector) if temp_active_selector else None
-            if temp_active and await temp_active.count() > 0:
-                return
-            
-            # Expand sidebar if button not visible
-            if not await temp_btn.is_visible():
-                sidebar_btn = await self._resolve_locator("sidebar_toggle")
-                if sidebar_btn is None:
-                    return
-                if await sidebar_btn.is_visible():
-                    await sidebar_btn.click()
-                    await self._human_delay(300, 500)
-                else:
-                    return
-            
-            # Click temp chat button
-            if await temp_btn.is_visible():
-                temp_active_selector = await self._resolve_selector("temp_chat_active")
-                temp_active = self.page.locator(temp_active_selector) if temp_active_selector else None
-                if (not temp_active) or (await temp_active.count() == 0):
-                    await temp_btn.click()
-                    await self._human_delay(200, 400)
-                    
-        except Exception as e:
-            log(f"⚠️ Temp chat error: {e}", f"Worker {self.worker_id}")
-            self._track_error(str(e), "temp_chat", "enable_temp_chat")
 
     async def send_message(
         self,
