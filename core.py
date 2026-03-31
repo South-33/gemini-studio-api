@@ -1746,6 +1746,7 @@ class GeminiWebAutomation(BaseAutomation):
         )
 
         if self._is_fresh_temp_chat_ready(baseline):
+            log("Temp reset path: already on fresh temporary chat", f"Worker {self.worker_id}")
             return True
 
         if not self._is_fresh_regular_chat_ready(baseline):
@@ -1757,6 +1758,9 @@ class GeminiWebAutomation(BaseAutomation):
                 final_snapshot = await self._capture_state_snapshot()
                 self._track_error("Fresh regular chat wait timed out", "new_chat", "ensure_fresh_temp_chat", final_snapshot)
                 return False
+            log("Temp reset path: stale chat -> fresh regular via New Chat", f"Worker {self.worker_id}")
+        else:
+            log("Temp reset path: fresh regular -> entering temporary chat", f"Worker {self.worker_id}")
 
         temp_btn = await self._get_temp_chat_button()
         if temp_btn is None:
@@ -1772,6 +1776,7 @@ class GeminiWebAutomation(BaseAutomation):
         while time.time() < deadline:
             snap = await self._capture_state_snapshot()
             if self._is_fresh_temp_chat_ready(snap):
+                log("Temp reset path: fresh temporary chat ready", f"Worker {self.worker_id}")
                 return True
             await asyncio.sleep(0.2)
 
