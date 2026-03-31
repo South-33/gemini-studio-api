@@ -1167,7 +1167,7 @@ class GeminiWebAutomation(BaseAutomation):
                     const isGoogle500 =
                         pageTitle.toLowerCase().includes('500') ||
                         bodyText.includes("500. that's an error") ||
-                        bodyText.includes('there was an error. please try again later. that\'s all we know.');
+                        bodyText.includes("there was an error. please try again later. that's all we know.");
                     const tempBtn = document.querySelector('[data-test-id="temp-chat-button"]');
                     const transitionSpinner = document.querySelector('.loading-content-spinner-container');
 
@@ -1191,7 +1191,7 @@ class GeminiWebAutomation(BaseAutomation):
                     const inputPlaceholder = inputBox ? ((inputBox.getAttribute('data-placeholder') || '').trim()) : '';
                     const tempChatLandingVisible =
                         inputPlaceholder.toLowerCase().includes('temporary') ||
-                        bodyText.includes('temporary chats don\'t appear in recent chats') ||
+                        bodyText.includes("temporary chats don't appear in recent chats") ||
                         bodyText.includes('temporary chats are saved for 72 hours');
 
                     let responses = document.querySelectorAll('[data-content-type="response"]');
