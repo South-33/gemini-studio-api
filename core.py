@@ -1115,6 +1115,7 @@ class GeminiWebAutomation(BaseAutomation):
             "send_visible": False,
             "input_visible": False,
             "input_placeholder": "",
+            "new_chat_visible": False,
             "copy_count": 0,
             "response_count": 0,
             "last_response_len": 0,
@@ -1172,6 +1173,7 @@ class GeminiWebAutomation(BaseAutomation):
                     const transitionSpinner = document.querySelector('.loading-content-spinner-container');
 
                     const buttons = Array.from(document.querySelectorAll('button')).filter(isVisible);
+                    const newChatLink = Array.from(document.querySelectorAll('a[aria-label="New chat"], [data-test-id="new-chat-button"], a[href="/app"]')).find(isVisible) || null;
                     const stopBtn = buttons.find((b) => {
                         const label = (b.getAttribute('aria-label') || '').toLowerCase();
                         const text = (b.innerText || '').toLowerCase();
@@ -1248,6 +1250,7 @@ class GeminiWebAutomation(BaseAutomation):
                         send_visible: !!sendBtn,
                         input_visible: !!inputBox,
                         input_placeholder: inputPlaceholder.slice(0, 160),
+                        new_chat_visible: !!newChatLink,
                         active_button: (stopBtn?.getAttribute('aria-label') || stopBtn?.innerText || sendBtn?.getAttribute('aria-label') || sendBtn?.innerText || '').trim().slice(0, 80),
                         copy_count: document.querySelectorAll('button[aria-label="Copy"]').length,
                         response_copy_count: responseCopyButtons.length,
@@ -1491,6 +1494,19 @@ class GeminiWebAutomation(BaseAutomation):
         )
 
     @staticmethod
+    def _is_fresh_regular_chat_ready(snapshot: Optional[Dict[str, Any]]) -> bool:
+        snap = snapshot or {}
+        placeholder = str(snap.get("input_placeholder") or "").lower()
+        return bool(
+            int(snap.get("user_query_count") or 0) == 0
+            and int(snap.get("response_count") or 0) == 0
+            and snap.get("input_visible")
+            and snap.get("new_chat_visible")
+            and not snap.get("error_page_500")
+            and "temporary" not in placeholder
+        )
+
+    @staticmethod
     def _is_temp_mode_page(snapshot: Optional[Dict[str, Any]]) -> bool:
         snap = snapshot or {}
         return bool(
@@ -1513,6 +1529,39 @@ class GeminiWebAutomation(BaseAutomation):
                 if (not should_be_temp) and (not current_temp) and bool(snap.get("input_visible")):
                     return True
 
+            await asyncio.sleep(0.2)
+        return False
+
+    async def _ensure_sidebar_open(self) -> bool:
+        snapshot = await self._capture_state_snapshot()
+        if snapshot.get("new_chat_visible"):
+            return True
+
+        sidebar_btn = await self._resolve_locator("sidebar_toggle")
+        if sidebar_btn is None:
+            return False
+
+        try:
+            if await sidebar_btn.is_visible():
+                await sidebar_btn.click(timeout=1500)
+                await self._human_delay(300, 500)
+        except Exception:
+            return False
+
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            snap = await self._capture_state_snapshot()
+            if snap.get("new_chat_visible"):
+                return True
+            await asyncio.sleep(0.2)
+        return False
+
+    async def _wait_for_fresh_regular_chat(self, timeout_seconds: float) -> bool:
+        deadline = time.time() + timeout_seconds
+        while time.time() < deadline:
+            snap = await self._capture_state_snapshot()
+            if self._is_fresh_regular_chat_ready(snap):
+                return True
             await asyncio.sleep(0.2)
         return False
 
@@ -1636,57 +1685,60 @@ class GeminiWebAutomation(BaseAutomation):
                 return False
 
     async def _ensure_fresh_temp_chat(self) -> bool:
-        """Use the temp-chat toggle as the primary fresh-chat generator."""
-        temp_btn = await self._get_temp_chat_button()
-        if temp_btn is None:
-            return await self._ensure_fresh_chat()
+        """Ensure each request starts from a fresh regular page, then enters temp chat."""
+        if not await self._ensure_sidebar_open():
+            self._track_error("Sidebar did not open", "sidebar_toggle", "ensure_fresh_temp_chat")
+            return False
 
         baseline = await self._capture_state_snapshot()
         log(
             f"Temp baseline: input={baseline.get('input_visible')} placeholder={baseline.get('input_placeholder')!r} "
             f"resp={baseline.get('response_count')} user={baseline.get('user_query_count')} "
-            f"landing={baseline.get('temp_chat_landing_visible')} transition={baseline.get('transition_state')} "
-            f"temp_active={baseline.get('temp_chat_active')} 500={baseline.get('error_page_500')}",
+            f"new_chat={baseline.get('new_chat_visible')} temp_btn={baseline.get('temp_chat_button_visible')} "
+            f"landing={baseline.get('temp_chat_landing_visible')} temp_active={baseline.get('temp_chat_active')} 500={baseline.get('error_page_500')}",
             f"Worker {self.worker_id}",
         )
+
         if self._is_fresh_temp_chat_ready(baseline):
             return True
 
-        currently_temp = self._is_temp_mode_page(baseline)
-
-        if currently_temp:
-            if not await self._click_temp_chat_toggle():
-                log("⚠️ Temp Chat toggle off click failed", f"Worker {self.worker_id}")
-                return False
-            if not await self._wait_for_temp_page_mode(False, 6.0):
+        if not self._is_fresh_regular_chat_ready(baseline):
+            if not await self._ensure_fresh_chat():
                 final_snapshot = await self._capture_state_snapshot()
-                log("⚠️ Temp Chat did not exit temp mode cleanly", f"Worker {self.worker_id}")
-                self._track_error("Temp chat did not exit temp mode cleanly", "temp_chat", "ensure_fresh_temp_chat", final_snapshot)
+                self._track_error("Fresh regular chat reset not confirmed", "new_chat", "ensure_fresh_temp_chat", final_snapshot)
                 return False
+            if not await self._wait_for_fresh_regular_chat(6.0):
+                final_snapshot = await self._capture_state_snapshot()
+                self._track_error("Fresh regular chat wait timed out", "new_chat", "ensure_fresh_temp_chat", final_snapshot)
+                return False
+
+        temp_btn = await self._get_temp_chat_button()
+        if temp_btn is None:
+            final_snapshot = await self._capture_state_snapshot()
+            self._track_error("Temp chat button not visible on fresh regular chat", "temp_chat", "ensure_fresh_temp_chat", final_snapshot)
+            return False
 
         if not await self._click_temp_chat_toggle():
             log("⚠️ Temp Chat toggle on click failed", f"Worker {self.worker_id}")
             return False
 
         deadline = time.time() + 8.0
-        last_state = "transitional_or_uncertain"
         while time.time() < deadline:
             snap = await self._capture_state_snapshot()
             if self._is_fresh_temp_chat_ready(snap):
                 return True
-            last_state = self._classify_new_chat_state(snap)
             await asyncio.sleep(0.2)
 
+        final_snapshot = await self._capture_state_snapshot()
         log(
-            f"⚠️ Temp Chat reset not confirmed ({last_state})",
+            f"⚠️ Temp Chat reset not confirmed ({self._classify_new_chat_state(final_snapshot)})",
             f"Worker {self.worker_id}",
         )
-        final_snapshot = await self._capture_state_snapshot()
         log(
             f"Temp final: input={final_snapshot.get('input_visible')} placeholder={final_snapshot.get('input_placeholder')!r} "
             f"resp={final_snapshot.get('response_count')} user={final_snapshot.get('user_query_count')} "
-            f"landing={final_snapshot.get('temp_chat_landing_visible')} transition={final_snapshot.get('transition_state')} "
-            f"temp_active={final_snapshot.get('temp_chat_active')} 500={final_snapshot.get('error_page_500')}",
+            f"new_chat={final_snapshot.get('new_chat_visible')} temp_btn={final_snapshot.get('temp_chat_button_visible')} "
+            f"landing={final_snapshot.get('temp_chat_landing_visible')} temp_active={final_snapshot.get('temp_chat_active')} 500={final_snapshot.get('error_page_500')}",
             f"Worker {self.worker_id}",
         )
         self._track_error("Temp chat reset not confirmed", "temp_chat", "ensure_fresh_temp_chat", final_snapshot)
