@@ -1491,6 +1491,32 @@ class GeminiWebAutomation(BaseAutomation):
             and not snap.get("error_page_500")
         )
 
+    @staticmethod
+    def _is_temp_mode_page(snapshot: Optional[Dict[str, Any]]) -> bool:
+        snap = snapshot or {}
+        return bool(
+            not snap.get("error_page_500")
+            and "temporary" in str(snap.get("input_placeholder") or "").lower()
+        )
+
+    async def _wait_for_temp_page_mode(self, should_be_temp: bool, timeout_seconds: float) -> bool:
+        deadline = time.time() + timeout_seconds
+        while time.time() < deadline:
+            snap = await self._capture_state_snapshot()
+            if self._is_fresh_temp_chat_ready(snap):
+                return should_be_temp
+
+            transition_state = bool(snap.get("transition_state"))
+            current_temp = self._is_temp_mode_page(snap)
+            if not transition_state:
+                if should_be_temp and current_temp:
+                    return True
+                if (not should_be_temp) and (not current_temp) and bool(snap.get("input_visible")):
+                    return True
+
+            await asyncio.sleep(0.2)
+        return False
+
     async def _ensure_fresh_chat(self) -> bool:
         """Ensure the worker is on a genuinely fresh Gemini chat before sending."""
         baseline = await self._capture_state_snapshot()
@@ -1620,26 +1646,23 @@ class GeminiWebAutomation(BaseAutomation):
         if self._is_fresh_temp_chat_ready(baseline):
             return True
 
-        for idx in range(1, 3):
+        currently_temp = self._is_temp_mode_page(baseline)
+
+        if currently_temp:
             if not await self._click_temp_chat_toggle():
-                log("⚠️ Temp Chat toggle click failed", f"Worker {self.worker_id}")
+                log("⚠️ Temp Chat toggle off click failed", f"Worker {self.worker_id}")
+                return False
+            if not await self._wait_for_temp_page_mode(False, 6.0):
+                final_snapshot = await self._capture_state_snapshot()
+                log("⚠️ Temp Chat did not exit temp mode cleanly", f"Worker {self.worker_id}")
+                self._track_error("Temp chat did not exit temp mode cleanly", "temp_chat", "ensure_fresh_temp_chat", final_snapshot)
                 return False
 
-            deadline = time.time() + 5.0
-            while time.time() < deadline:
-                snap = await self._capture_state_snapshot()
-                if self._is_fresh_temp_chat_ready(snap):
-                    return True
-                if not bool(snap.get("transition_state")):
-                    break
-                await asyncio.sleep(0.2)
+        if not await self._click_temp_chat_toggle():
+            log("⚠️ Temp Chat toggle on click failed", f"Worker {self.worker_id}")
+            return False
 
-            log(
-                f"⚠️ Temp Chat toggle {idx}: page not fresh yet",
-                f"Worker {self.worker_id}",
-            )
-
-        deadline = time.time() + 10.0
+        deadline = time.time() + 8.0
         last_state = "transitional_or_uncertain"
         while time.time() < deadline:
             snap = await self._capture_state_snapshot()
