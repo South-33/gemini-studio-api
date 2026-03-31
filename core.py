@@ -747,11 +747,12 @@ class GeminiWebAutomation(BaseAutomation):
             'a[href="/app"]',
         ],
         "temp_chat": [
+            '[data-test-id="temp-chat-button"]',
             'button[aria-label="Temporary chat"]',
             '[aria-label="Temporary chat"]',
         ],
         "temp_chat_active": [
-            'button[aria-label*="Temporary" i][aria-pressed="true"]',
+            '[data-test-id="temp-chat-button"].temp-chat-on',
             '[aria-label="Temporary chat"].temp-chat-on',
         ],
         "sidebar_toggle": [
@@ -1113,6 +1114,7 @@ class GeminiWebAutomation(BaseAutomation):
             "stop_visible": False,
             "send_visible": False,
             "input_visible": False,
+            "input_placeholder": "",
             "copy_count": 0,
             "response_count": 0,
             "last_response_len": 0,
@@ -1125,6 +1127,10 @@ class GeminiWebAutomation(BaseAutomation):
             "user_query_count": 0,
             "empty_chat_visible": False,
             "temp_chat_landing_visible": False,
+            "temp_chat_button_visible": False,
+            "temp_chat_active": False,
+            "temp_chat_button_classes": [],
+            "transition_state": False,
             "thinking_visible": False,
             "thinking_active": False,
             "thinking_label": "",
@@ -1162,9 +1168,8 @@ class GeminiWebAutomation(BaseAutomation):
                         pageTitle.toLowerCase().includes('500') ||
                         bodyText.includes("500. that's an error") ||
                         bodyText.includes('there was an error. please try again later. that\'s all we know.');
-                    const tempChatLandingVisible =
-                        bodyText.includes('temporary chats don\'t appear in recent chats') ||
-                        bodyText.includes('temporary chats are saved for 72 hours');
+                    const tempBtn = document.querySelector('[data-test-id="temp-chat-button"]');
+                    const transitionSpinner = document.querySelector('.loading-content-spinner-container');
 
                     const buttons = Array.from(document.querySelectorAll('button')).filter(isVisible);
                     const stopBtn = buttons.find((b) => {
@@ -1183,6 +1188,11 @@ class GeminiWebAutomation(BaseAutomation):
                         'div[role="textbox"][contenteditable="true"], ' +
                         '.ql-editor[role="textbox"], .ql-editor'
                     )).find(isVisible) || null;
+                    const inputPlaceholder = inputBox ? ((inputBox.getAttribute('data-placeholder') || '').trim()) : '';
+                    const tempChatLandingVisible =
+                        inputPlaceholder.toLowerCase().includes('temporary') ||
+                        bodyText.includes('temporary chats don\'t appear in recent chats') ||
+                        bodyText.includes('temporary chats are saved for 72 hours');
 
                     let responses = document.querySelectorAll('[data-content-type="response"]');
                     if (!responses.length) responses = document.querySelectorAll('model-response, assistant-message-content');
@@ -1237,6 +1247,7 @@ class GeminiWebAutomation(BaseAutomation):
                         stop_visible: !!stopBtn,
                         send_visible: !!sendBtn,
                         input_visible: !!inputBox,
+                        input_placeholder: inputPlaceholder.slice(0, 160),
                         active_button: (stopBtn?.getAttribute('aria-label') || stopBtn?.innerText || sendBtn?.getAttribute('aria-label') || sendBtn?.innerText || '').trim().slice(0, 80),
                         copy_count: document.querySelectorAll('button[aria-label="Copy"]').length,
                         response_copy_count: responseCopyButtons.length,
@@ -1244,6 +1255,10 @@ class GeminiWebAutomation(BaseAutomation):
                         user_query_count: userQueries.length,
                         empty_chat_visible: !!emptyChat,
                         temp_chat_landing_visible: tempChatLandingVisible,
+                        temp_chat_button_visible: !!(tempBtn && isVisible(tempBtn)),
+                        temp_chat_active: !!(tempBtn && tempBtn.classList.contains('temp-chat-on')),
+                        temp_chat_button_classes: tempBtn ? Array.from(tempBtn.classList).slice(0, 20) : [],
+                        transition_state: !!transitionSpinner,
                         response_count: responses.length,
                         last_response_len: lastText.length,
                         last_response_signature: `${lastText.slice(0, 80)}|${lastText.slice(-80)}`.slice(0, 200),
@@ -1464,6 +1479,19 @@ class GeminiWebAutomation(BaseAutomation):
             return "confirmed_cleared"
         return "transitional_or_uncertain"
 
+    @staticmethod
+    def _is_fresh_temp_chat_ready(snapshot: Optional[Dict[str, Any]]) -> bool:
+        snap = snapshot or {}
+        return bool(
+            snap.get("temp_chat_active")
+            and int(snap.get("user_query_count") or 0) == 0
+            and int(snap.get("response_count") or 0) == 0
+            and snap.get("input_visible")
+            and not snap.get("transition_state")
+            and "temporary" in str(snap.get("input_placeholder") or "").lower()
+            and not snap.get("error_page_500")
+        )
+
     async def _ensure_fresh_chat(self) -> bool:
         """Ensure the worker is on a genuinely fresh Gemini chat before sending."""
         baseline = await self._capture_state_snapshot()
@@ -1557,6 +1585,13 @@ class GeminiWebAutomation(BaseAutomation):
 
     async def _is_temp_chat_active(self, temp_btn=None) -> bool:
         try:
+            snapshot = await self._capture_state_snapshot()
+            if snapshot.get("temp_chat_button_visible"):
+                return bool(snapshot.get("temp_chat_active"))
+        except:
+            pass
+
+        try:
             temp_active_selector = await self._resolve_selector("temp_chat_active")
             if temp_active_selector:
                 temp_active = self.page.locator(temp_active_selector)
@@ -1569,13 +1604,7 @@ class GeminiWebAutomation(BaseAutomation):
             btn = temp_btn or await self._get_temp_chat_button()
             if btn is None:
                 return False
-            return bool(
-                await btn.evaluate(
-                    """
-                    (el) => el.classList.contains('temp-chat-on') || el.getAttribute('aria-pressed') === 'true'
-                    """
-                )
-            )
+            return bool(await btn.evaluate("(el) => el.classList.contains('temp-chat-on')"))
         except:
             return False
 
@@ -1613,22 +1642,25 @@ class GeminiWebAutomation(BaseAutomation):
         if temp_btn is None:
             return await self._ensure_fresh_chat()
 
-        was_active = await self._is_temp_chat_active(temp_btn)
+        baseline = await self._capture_state_snapshot()
+        if self._is_fresh_temp_chat_ready(baseline):
+            return True
+
+        was_active = bool(baseline.get("temp_chat_active")) if baseline.get("temp_chat_button_visible") else await self._is_temp_chat_active(temp_btn)
         expected_states = [False, True] if was_active else [True]
 
         for idx, expected_active in enumerate(expected_states, start=1):
             if not await self._click_temp_chat_toggle():
                 log("⚠️ Temp Chat toggle click failed", f"Worker {self.worker_id}")
-                return await self._ensure_fresh_chat()
+                return False
 
-            deadline = time.time() + 3.0
+            deadline = time.time() + 5.0
             state_matched = False
             while time.time() < deadline:
-                if await self._is_temp_chat_active():
-                    current_active = True
-                else:
-                    current_active = False
-                if current_active == expected_active:
+                snap = await self._capture_state_snapshot()
+                current_active = bool(snap.get("temp_chat_active"))
+                transition_state = bool(snap.get("transition_state"))
+                if not transition_state and current_active == expected_active:
                     state_matched = True
                     break
                 await asyncio.sleep(0.2)
@@ -1638,22 +1670,24 @@ class GeminiWebAutomation(BaseAutomation):
                     f"⚠️ Temp Chat toggle {idx}: active state did not become {expected_active}",
                     f"Worker {self.worker_id}",
                 )
-                return await self._ensure_fresh_chat()
+                return False
 
-        deadline = time.time() + 4.0
+        deadline = time.time() + 10.0
         last_state = "transitional_or_uncertain"
         while time.time() < deadline:
             snap = await self._capture_state_snapshot()
-            last_state = self._classify_new_chat_state(snap)
-            if last_state == "confirmed_cleared":
+            if self._is_fresh_temp_chat_ready(snap):
                 return True
+            last_state = self._classify_new_chat_state(snap)
             await asyncio.sleep(0.2)
 
         log(
-            f"⚠️ Temp Chat reset not confirmed ({last_state}), falling back to New Chat",
+            f"⚠️ Temp Chat reset not confirmed ({last_state})",
             f"Worker {self.worker_id}",
         )
-        return await self._ensure_fresh_chat()
+        final_snapshot = await self._capture_state_snapshot()
+        self._track_error("Temp chat reset not confirmed", "temp_chat", "ensure_fresh_temp_chat", final_snapshot)
+        return False
 
     def _track_error(self, error: str, selector_key: str, action: str, diagnostics: Optional[Dict[str, Any]] = None):
         payload = {
