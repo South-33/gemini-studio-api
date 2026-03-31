@@ -1278,8 +1278,8 @@ class GeminiWebAutomation(BaseAutomation):
             )
             if isinstance(data, dict):
                 snapshot.update(data)
-        except:
-            pass
+        except Exception as e:
+            log(f"Snapshot DOM eval failed: {e}", f"Worker {self.worker_id}")
 
         try:
             snapshot["network_events"] = list(self._recent_network_events)[-8:]
@@ -1642,6 +1642,13 @@ class GeminiWebAutomation(BaseAutomation):
             return await self._ensure_fresh_chat()
 
         baseline = await self._capture_state_snapshot()
+        log(
+            f"Temp baseline: input={baseline.get('input_visible')} placeholder={baseline.get('input_placeholder')!r} "
+            f"resp={baseline.get('response_count')} user={baseline.get('user_query_count')} "
+            f"landing={baseline.get('temp_chat_landing_visible')} transition={baseline.get('transition_state')} "
+            f"temp_active={baseline.get('temp_chat_active')} 500={baseline.get('error_page_500')}",
+            f"Worker {self.worker_id}",
+        )
         if self._is_fresh_temp_chat_ready(baseline):
             return True
 
@@ -1675,6 +1682,13 @@ class GeminiWebAutomation(BaseAutomation):
             f"Worker {self.worker_id}",
         )
         final_snapshot = await self._capture_state_snapshot()
+        log(
+            f"Temp final: input={final_snapshot.get('input_visible')} placeholder={final_snapshot.get('input_placeholder')!r} "
+            f"resp={final_snapshot.get('response_count')} user={final_snapshot.get('user_query_count')} "
+            f"landing={final_snapshot.get('temp_chat_landing_visible')} transition={final_snapshot.get('transition_state')} "
+            f"temp_active={final_snapshot.get('temp_chat_active')} 500={final_snapshot.get('error_page_500')}",
+            f"Worker {self.worker_id}",
+        )
         self._track_error("Temp chat reset not confirmed", "temp_chat", "ensure_fresh_temp_chat", final_snapshot)
         return False
 
