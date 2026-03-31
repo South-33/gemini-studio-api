@@ -1486,7 +1486,6 @@ class GeminiWebAutomation(BaseAutomation):
             int(snap.get("user_query_count") or 0) == 0
             and int(snap.get("response_count") or 0) == 0
             and snap.get("input_visible")
-            and not snap.get("transition_state")
             and "temporary" in str(snap.get("input_placeholder") or "").lower()
             and not snap.get("error_page_500")
         )
