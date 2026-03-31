@@ -1483,8 +1483,7 @@ class GeminiWebAutomation(BaseAutomation):
     def _is_fresh_temp_chat_ready(snapshot: Optional[Dict[str, Any]]) -> bool:
         snap = snapshot or {}
         return bool(
-            snap.get("temp_chat_active")
-            and int(snap.get("user_query_count") or 0) == 0
+            int(snap.get("user_query_count") or 0) == 0
             and int(snap.get("response_count") or 0) == 0
             and snap.get("input_visible")
             and not snap.get("transition_state")
@@ -1658,6 +1657,8 @@ class GeminiWebAutomation(BaseAutomation):
             state_matched = False
             while time.time() < deadline:
                 snap = await self._capture_state_snapshot()
+                if self._is_fresh_temp_chat_ready(snap):
+                    return True
                 current_active = bool(snap.get("temp_chat_active"))
                 transition_state = bool(snap.get("transition_state"))
                 if not transition_state and current_active == expected_active:
