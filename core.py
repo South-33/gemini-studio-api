@@ -1115,9 +1115,17 @@ class GeminiWebAutomation(BaseAutomation):
             "send_visible": False,
             "input_visible": False,
             "input_placeholder": "",
+            "input_text_len": 0,
+            "input_text_head": "",
             "new_chat_visible": False,
             "sidebar_expanded": False,
             "copy_count": 0,
+            "send_btn_disabled": False,
+            "send_btn_aria_disabled": None,
+            "send_btn_class": "",
+            "active_element_tag": "",
+            "active_element_aria_label": "",
+            "overlay_visible": False,
             "response_count": 0,
             "last_response_len": 0,
             "last_response_signature": "",
@@ -1197,6 +1205,7 @@ class GeminiWebAutomation(BaseAutomation):
                         '.ql-editor[role="textbox"], .ql-editor'
                     )).find(isVisible) || null;
                     const inputPlaceholder = inputBox ? ((inputBox.getAttribute('data-placeholder') || '').trim()) : '';
+                    const inputText = inputBox ? ((inputBox.innerText || inputBox.textContent || '').trim()) : '';
                     const tempChatLandingVisible =
                         inputPlaceholder.toLowerCase().includes('temporary') ||
                         bodyText.includes("temporary chats don't appear in recent chats") ||
@@ -1206,6 +1215,8 @@ class GeminiWebAutomation(BaseAutomation):
                     if (!responses.length) responses = document.querySelectorAll('model-response, assistant-message-content');
                     const userQueries = document.querySelectorAll('user-query');
                     const emptyChat = document.querySelector('modular-zero-state, zero-state, bard-zero-state');
+                    const overlay = document.querySelector('.cdk-overlay-backdrop');
+                    const activeElement = document.activeElement;
                     const last = responses.length ? responses[responses.length - 1] : null;
                     const lastText = last ? (last.innerText || '') : '';
                     const responseCopyButtons = last
@@ -1256,9 +1267,17 @@ class GeminiWebAutomation(BaseAutomation):
                         send_visible: !!sendBtn,
                         input_visible: !!inputBox,
                         input_placeholder: inputPlaceholder.slice(0, 160),
+                        input_text_len: inputText.length,
+                        input_text_head: inputText.slice(0, 160),
                         new_chat_visible: !!newChatLink,
                         sidebar_expanded: sidebarExpanded,
                         active_button: (stopBtn?.getAttribute('aria-label') || stopBtn?.innerText || sendBtn?.getAttribute('aria-label') || sendBtn?.innerText || '').trim().slice(0, 80),
+                        send_btn_disabled: !!(sendBtn && (sendBtn.disabled || sendBtn.getAttribute('disabled') !== null)),
+                        send_btn_aria_disabled: sendBtn?.getAttribute('aria-disabled') || null,
+                        send_btn_class: (sendBtn?.className || '').toString().slice(0, 240),
+                        active_element_tag: activeElement?.tagName || '',
+                        active_element_aria_label: activeElement?.getAttribute?.('aria-label') || '',
+                        overlay_visible: !!(overlay && isVisible(overlay)),
                         copy_count: document.querySelectorAll('button[aria-label="Copy"]').length,
                         response_copy_count: responseCopyButtons.length,
                         input_copy_count: inputCopyButtons.length,
@@ -2460,6 +2479,13 @@ class GeminiWebAutomation(BaseAutomation):
                         prompt_still_present = prompt_len > 0 and input_now_len >= max(1, prompt_len // 2)
 
                         if prompt_still_present:
+                            log(
+                                f"[{self._request_id}] Unsent diagnostics: input_len={snap.get('input_text_len')} "
+                                f"send_disabled={snap.get('send_btn_disabled')} aria_disabled={snap.get('send_btn_aria_disabled')} "
+                                f"overlay={snap.get('overlay_visible')} active={snap.get('active_element_tag')}:{snap.get('active_element_aria_label')} "
+                                f"send_class={snap.get('send_btn_class')}",
+                                f"Worker {self.worker_id}"
+                            )
                             stall_reason = (
                                 f"Unsent stuck: send visible and no output for {UNSENT_STUCK_SECONDS}s"
                             )
