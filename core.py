@@ -2179,6 +2179,37 @@ class GeminiWebAutomation(BaseAutomation):
                 except Exception as e:
                     log(f"⚠️ Send verification error: {e}", f"Worker {worker_id}")
                     return False  # Don't assume success on error
+
+            async def attempt_same_page_resend(reason: str) -> bool:
+                log(f"Attempting same-page resend ({reason})", f"Worker {self.worker_id}")
+                try:
+                    await self.page.bring_to_front()
+                except:
+                    pass
+
+                try:
+                    await input_area.click()
+                    await self._human_delay(80, 160)
+                except:
+                    pass
+
+                try:
+                    await self.page.keyboard.press("Control+Enter")
+                    await self._human_delay(250, 400)
+                except:
+                    pass
+
+                try:
+                    for selector in self._selector_candidates("send_btn"):
+                        send_btn = self.page.locator(selector).first
+                        if await send_btn.is_visible():
+                            await send_btn.click()
+                            await self._human_delay(250, 400)
+                            break
+                except:
+                    pass
+
+                return True
             
             send_success = False
             for selector in self._selector_candidates("send_btn"):
@@ -2273,14 +2304,7 @@ class GeminiWebAutomation(BaseAutomation):
                         f"⚠️ Confirmed unsent; retrying send (attempt {send_attempt + 2}/{MAX_SEND_RETRIES})",
                         f"Worker {self.worker_id}"
                     )
-                    for selector in self._selector_candidates("send_btn"):
-                        try:
-                            send_btn = self.page.locator(selector).first
-                            if await send_btn.is_visible():
-                                await send_btn.click()
-                                break
-                        except:
-                            continue
+                    await attempt_same_page_resend(f"soft_retry_{send_attempt + 2}")
                     continue
 
                 if not confirmed_unsent:
@@ -2486,6 +2510,24 @@ class GeminiWebAutomation(BaseAutomation):
                                 f"send_class={snap.get('send_btn_class')}",
                                 f"Worker {self.worker_id}"
                             )
+                            resend_ok = await attempt_same_page_resend("unsent_stuck")
+                            if resend_ok:
+                                resend_deadline = time.time() + 5.0
+                                while time.time() < resend_deadline:
+                                    resend_snap = await self._capture_state_snapshot()
+                                    resend_stop = bool(resend_snap.get("stop_visible"))
+                                    resend_send = bool(resend_snap.get("send_visible"))
+                                    resend_resp = int(resend_snap.get("response_count") or 0)
+                                    resend_input_len = int(resend_snap.get("input_text_len") or 0)
+                                    resend_input_cleared = prompt_len == 0 or resend_input_len < max(1, prompt_len // 2)
+                                    if resend_stop or resend_resp > 0 or resend_input_cleared or not resend_send:
+                                        log("✅ Same-page resend recovered unsent start", f"Worker {self.worker_id}")
+                                        stall_reason = ""
+                                        break
+                                    await asyncio.sleep(0.2)
+                                if not stall_reason:
+                                    last_wait_log = now
+                                    continue
                             stall_reason = (
                                 f"Unsent stuck: send visible and no output for {UNSENT_STUCK_SECONDS}s"
                             )
