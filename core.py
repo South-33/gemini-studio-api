@@ -2180,8 +2180,8 @@ class GeminiWebAutomation(BaseAutomation):
                     log(f"⚠️ Send verification error: {e}", f"Worker {worker_id}")
                     return False  # Don't assume success on error
 
-            async def attempt_same_page_resend(reason: str) -> bool:
-                log(f"Attempting same-page resend ({reason})", f"Worker {self.worker_id}")
+            async def attempt_send_submission(reason: str, before_text: str) -> bool:
+                log(f"Attempting send submission ({reason})", f"Worker {self.worker_id}")
                 try:
                     await self.page.bring_to_front()
                 except:
@@ -2196,6 +2196,9 @@ class GeminiWebAutomation(BaseAutomation):
                 try:
                     await self.page.keyboard.press("Control+Enter")
                     await self._human_delay(250, 400)
+                    if await verify_send_worked(before_text):
+                        log(f"Send submission worked via Ctrl+Enter ({reason})", f"Worker {self.worker_id}")
+                        return True
                 except:
                     pass
 
@@ -2205,23 +2208,20 @@ class GeminiWebAutomation(BaseAutomation):
                         if await send_btn.is_visible():
                             await send_btn.click()
                             await self._human_delay(250, 400)
-                            break
+                            if await verify_send_worked(before_text):
+                                log(f"Send submission worked via button ({reason})", f"Worker {self.worker_id}")
+                                return True
                 except:
                     pass
 
-                return True
+                return False
+
+            async def attempt_same_page_resend(reason: str) -> bool:
+                before_text = await get_input_text()
+                return await attempt_send_submission(reason, before_text)
             
-            send_success = False
-            for selector in self._selector_candidates("send_btn"):
-                send_success = await self._verified_click(
-                    selector,
-                    "Send",
-                    verify_before=get_input_text,
-                    verify_after=verify_send_worked,
-                    timeout=5000,
-                )
-                if send_success:
-                    break
+            send_before_text = await get_input_text()
+            send_success = await attempt_send_submission("initial_send", send_before_text)
             
             if not send_success:
                 log(f"❌ Send button click failed", f"Worker {self.worker_id}")
@@ -2269,15 +2269,13 @@ class GeminiWebAutomation(BaseAutomation):
                     input_now_len = len((input_now or "").strip())
                     input_cleared = prompt_len == 0 or input_now_len < max(1, prompt_len // 2)
 
-                    if stop_now:
-                        start_signal = "stop_visible"
-                    elif not send_now:
-                        start_signal = "send_hidden"
-                    elif copy_now > pre_send_count:
+                    if copy_now > pre_send_count:
                         start_signal = "copy_increased"
                     elif resp_now > pre_send_resp_count:
                         start_signal = "response_increased"
-                    elif input_cleared:
+                    elif stop_now and not send_now:
+                        start_signal = "stop_visible"
+                    elif input_cleared and not send_now:
                         start_signal = "input_cleared"
 
                     if start_signal:
