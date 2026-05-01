@@ -1,3 +1,5 @@
+This is the project's AGENTS.md
+
 # Project AGENTS Notes
 
 ## Notes
@@ -9,3 +11,4 @@
 - For stable-response finalize attempts, try copy extraction before clicking Stop; otherwise diagnostics can get polluted with `You stopped this response` even when Gemini was still post-processing.
 - Retries are total attempts, not unique-worker-only now; after recoverable stall/refresh/recreation, the same worker can be retried if the alternate worker is still busy.
 - Gemini last-turn diagnostics can track thinking separately via `button.thoughts-header-button`; treat assistant `button[aria-label="Copy"]` inside the latest `model-response` as response-ready even if `Stop response` is still visible, and ignore user `Copy prompt` buttons.
+- Idle maintenance is pre-request and marks all workers busy; keep it bounded and clear stale busy flags or Playwright transport failures can poison the pool with assignment timeouts.

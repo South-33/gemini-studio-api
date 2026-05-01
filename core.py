@@ -46,6 +46,9 @@ FINALIZE_STABLE_RESPONSE_LEN = 800
 RECENT_NETWORK_ACTIVITY_SECONDS = 75
 MAX_SEND_RETRIES = 3
 IDLE_REFRESH_AFTER_SECONDS = 600
+IDLE_REFRESH_WORKER_TIMEOUT_SECONDS = 45
+POOL_RECOVERY_WORKER_TIMEOUT_SECONDS = 75
+STALE_BUSY_WITHOUT_ACTIVE_SECONDS = 90
 SCROLL_NUDGE_AFTER_NO_PROGRESS_SECONDS = 8
 SCROLL_NUDGE_MIN_INTERVAL_SECONDS = 4
 UNSENT_STUCK_SECONDS = 20
@@ -2845,6 +2848,7 @@ class WorkerPool:
         # Array of Gemini Web workers (1 worker = 1 tab)
         self.workers: List[GeminiWebAutomation] = []
         self._worker_busy: List[bool] = []  # Track which workers are busy
+        self._worker_busy_since: List[Optional[float]] = []
         self._worker_lock = asyncio.Lock()  # Lock for worker assignment
         self._next_worker_index = 0
         self._worker_stall_failures: Dict[int, int] = {}
@@ -2858,6 +2862,7 @@ class WorkerPool:
         self._active_requests = 0
         self._has_processed_request = False
         self._idle_refresh_lock = asyncio.Lock()
+        self._pool_recovery_lock = asyncio.Lock()
         self._last_idle_refresh_at = 0.0
     
     async def _get_available_worker(self, exclude: set = None) -> Tuple[int, GeminiWebAutomation]:
@@ -2869,6 +2874,7 @@ class WorkerPool:
         max_wait = 60
         
         while time.time() - start_time < max_wait:
+            await self._clear_stale_busy_flags_if_safe()
             async with self._worker_lock:
                 count = len(self._worker_busy)
                 for offset in range(count):
@@ -2877,6 +2883,7 @@ class WorkerPool:
                         continue
                     if (not self._worker_busy[i]) and self.workers[i]._initialized:
                         self._worker_busy[i] = True
+                        self._worker_busy_since[i] = time.time()
                         self._next_worker_index = (i + 1) % count
                         return i, self.workers[i]
             await asyncio.sleep(0.5)
@@ -2889,11 +2896,39 @@ class WorkerPool:
         async with self._worker_lock:
             if 0 <= index < len(self._worker_busy):
                 self._worker_busy[index] = False
+                if index < len(self._worker_busy_since):
+                    self._worker_busy_since[index] = None
 
     async def _set_all_workers_busy(self, busy: bool):
         async with self._worker_lock:
+            now = time.time() if busy else None
             for i in range(len(self._worker_busy)):
                 self._worker_busy[i] = busy
+                if i < len(self._worker_busy_since):
+                    self._worker_busy_since[i] = now
+
+    async def _clear_stale_busy_flags_if_safe(self) -> bool:
+        """Recover from cancelled maintenance/request paths that left workers marked busy."""
+        if self._active_requests != 0:
+            return False
+
+        now = time.time()
+        cleared = []
+        async with self._worker_lock:
+            for i, busy in enumerate(self._worker_busy):
+                if not busy:
+                    continue
+                busy_since = self._worker_busy_since[i] if i < len(self._worker_busy_since) else None
+                if busy_since and (now - busy_since) >= STALE_BUSY_WITHOUT_ACTIVE_SECONDS:
+                    self._worker_busy[i] = False
+                    if i < len(self._worker_busy_since):
+                        self._worker_busy_since[i] = None
+                    cleared.append(i + 1)
+
+        if cleared:
+            log(f"Cleared stale busy worker flags with no active requests: {cleared}", "WorkerPool")
+            return True
+        return False
 
     @staticmethod
     def _is_stall_class_error(error: str) -> bool:
@@ -3031,9 +3066,18 @@ class WorkerPool:
                     if not worker or not worker._initialized:
                         continue
                     try:
-                        ok = await worker._hard_refresh_and_reinit("idle_maintenance")
+                        ok = await asyncio.wait_for(
+                            worker._hard_refresh_and_reinit("idle_maintenance"),
+                            timeout=IDLE_REFRESH_WORKER_TIMEOUT_SECONDS,
+                        )
                         if not ok:
                             log(f"Worker {i+1} idle refresh failed", "WorkerPool")
+                    except asyncio.TimeoutError:
+                        log(
+                            f"Worker {i+1} idle refresh timed out after {IDLE_REFRESH_WORKER_TIMEOUT_SECONDS}s",
+                            "WorkerPool",
+                        )
+                        break
                     except Exception as e:
                         log(f"Worker {i+1} idle refresh exception: {e}", "WorkerPool")
             finally:
@@ -3041,6 +3085,56 @@ class WorkerPool:
 
             self._last_idle_refresh_at = time.time()
             self._last_activity = self._last_idle_refresh_at
+
+    async def _recover_after_assignment_timeout(self) -> bool:
+        """Best-effort pool recovery when no worker can be assigned."""
+        if self._pool_recovery_lock.locked():
+            log("Pool recovery already running", "WorkerPool")
+            return False
+
+        async with self._pool_recovery_lock:
+            await self._clear_stale_busy_flags_if_safe()
+            if self._active_requests != 0:
+                log(
+                    f"Skipping assignment-timeout recovery; active_requests={self._active_requests}",
+                    "WorkerPool",
+                )
+                return False
+
+            log("Assignment timeout recovery: refreshing/recreating workers", "WorkerPool")
+            await self._set_all_workers_busy(True)
+            recovered = False
+            try:
+                for i, worker in enumerate(self.workers):
+                    ok = False
+                    try:
+                        if worker and worker._initialized and worker.page and not worker.page.is_closed():
+                            ok = await asyncio.wait_for(
+                                worker._hard_refresh_and_reinit("assignment_timeout"),
+                                timeout=POOL_RECOVERY_WORKER_TIMEOUT_SECONDS,
+                            )
+                    except asyncio.TimeoutError:
+                        log(f"Worker {i+1} assignment-timeout refresh timed out", "WorkerPool")
+                    except Exception as e:
+                        log(f"Worker {i+1} assignment-timeout refresh failed: {e}", "WorkerPool")
+
+                    if not ok:
+                        try:
+                            ok = await asyncio.wait_for(
+                                self._recreate_worker(i, "assignment_timeout"),
+                                timeout=POOL_RECOVERY_WORKER_TIMEOUT_SECONDS,
+                            )
+                        except asyncio.TimeoutError:
+                            log(f"Worker {i+1} assignment-timeout recreate timed out", "WorkerPool")
+                        except Exception as e:
+                            log(f"Worker {i+1} assignment-timeout recreate failed: {e}", "WorkerPool")
+
+                    recovered = recovered or bool(ok)
+            finally:
+                await self._set_all_workers_busy(False)
+
+            log(f"Assignment timeout recovery result: recovered={recovered}", "WorkerPool")
+            return recovered
 
     def _get_reusable_context_pages(self) -> List[Page]:
         """Collect existing live pages that can be reused as worker windows."""
@@ -3319,6 +3413,7 @@ class WorkerPool:
                     workers_ok += 1
                 self.workers.append(worker)
                 self._worker_busy.append(False)
+                self._worker_busy_since.append(None)
                 
                 # Stagger tab creation to avoid rate limiting
                 if i < self.worker_count - 1:
@@ -3418,6 +3513,12 @@ class WorkerPool:
                 
                 if worker is None:
                     log(f"⚠️ No available workers left to try", "WorkerPool")
+                    if await self._recover_after_assignment_timeout():
+                        tried_workers.clear()
+                        if extra_recovery_attempts_remaining > 0:
+                            max_attempts += 1
+                            extra_recovery_attempts_remaining -= 1
+                        continue
                     break
 
                 self._active_requests += 1
@@ -3524,6 +3625,7 @@ class WorkerPool:
                 "worker_id": idx + 1,
                 "initialized": bool(worker and worker._initialized),
                 "busy": bool(self._worker_busy[idx]) if idx < len(self._worker_busy) else False,
+                "busy_since_unix": int(self._worker_busy_since[idx]) if idx < len(self._worker_busy_since) and self._worker_busy_since[idx] else None,
                 "generation_in_progress": bool(worker and worker._generation_in_progress),
                 "last_error": errors.get(idx + 1),
             })
