@@ -12,6 +12,8 @@ set PORT=8000
 for /f "tokens=1,2 delims==" %%a in (.env) do (
     if "%%a"=="PORT" set PORT=%%b
     if "%%a"=="NGROK_DOMAIN" set NGROK_DOMAIN=%%b
+    if "%%a"=="DISCORD_WEBHOOK" set DISCORD_WEBHOOK=%%b
+    if "%%a"=="DISCORD_USER_ID" set DISCORD_USER_ID=%%b
 )
 
 :: Normalize ngrok domain so .env can contain either the bare host or a full URL
@@ -21,6 +23,7 @@ if "%NGROK_DOMAIN:~-1%"=="/" set "NGROK_DOMAIN=%NGROK_DOMAIN:~0,-1%"
 
 echo [Config] PORT=%PORT%
 echo [Config] NGROK_DOMAIN=%NGROK_DOMAIN%
+set "NGROK_CMD=ngrok http %PORT% --domain=%NGROK_DOMAIN%"
 
 if not defined NGROK_DOMAIN (
     echo [ERROR] NGROK_DOMAIN not set in .env file!
@@ -43,7 +46,9 @@ start "GeminiAPI" /min cmd /c "set PYTHONUNBUFFERED=1 && python -u main.py"
 :: Start ngrok in a visible window so tunnel errors are easy to inspect
 echo [3/3] Starting ngrok tunnel on port %PORT%...
 echo Using domain: %NGROK_DOMAIN%
-start "NgrokTunnel" cmd /k "ngrok http %PORT% --domain=%NGROK_DOMAIN%"
+call :start_ngrok
+call :verify_ngrok_startup
+if %errorlevel% neq 0 exit /b 1
 
 echo.
 echo ==========================================
@@ -61,8 +66,9 @@ timeout /t 60 /nobreak >nul
 tasklist /FI "IMAGENAME eq ngrok.exe" 2>nul | find /I "ngrok.exe" >nul
 if %errorlevel% neq 0 (
     echo [%time%] ⚠️ Tunnel died! Restarting...
-    start "NgrokTunnel" cmd /k "ngrok http %PORT% --domain=%NGROK_DOMAIN%"
-    timeout /t 5 /nobreak >nul
+    call :start_ngrok
+    call :verify_ngrok_startup
+    if %errorlevel% neq 0 exit /b 1
 )
 
 :: Check if API port is still listening (more reliable than checking python.exe)
@@ -74,3 +80,27 @@ if %errorlevel% neq 0 (
 )
 
 goto monitor
+
+:start_ngrok
+start "NgrokTunnel" cmd /k "%NGROK_CMD%"
+exit /b 0
+
+:verify_ngrok_startup
+timeout /t 5 /nobreak >nul
+tasklist /FI "IMAGENAME eq ngrok.exe" 2>nul | find /I "ngrok.exe" >nul
+if %errorlevel% neq 0 (
+    call :notify_discord "Gemini API Tunnel Failure" "ngrok exited immediately. Check the visible NgrokTunnel window. Common causes are missing auth token, unverified ngrok account, or a claimed domain from a different account."
+    echo [FATAL] ngrok exited immediately.
+    echo [FATAL] Check the visible NgrokTunnel window for the real error.
+    echo [FATAL] Common causes: missing auth token, unverified ngrok account, or a domain from a different account.
+    pause
+    exit /b 1
+)
+exit /b 0
+
+:notify_discord
+if not defined DISCORD_WEBHOOK exit /b 0
+set "DISCORD_TITLE=%~1"
+set "DISCORD_MESSAGE=%~2"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$payload = @{ embeds = @(@{ title = $env:DISCORD_TITLE; description = $env:DISCORD_MESSAGE; color = 16711680; footer = @{ text = 'Gemini Studio API' } }) }; if ($env:DISCORD_USER_ID) { $payload.content = '<@' + $env:DISCORD_USER_ID + '>' }; $json = $payload | ConvertTo-Json -Depth 6; Invoke-RestMethod -Method Post -Uri $env:DISCORD_WEBHOOK -ContentType 'application/json' -Body $json | Out-Null" >nul 2>nul
+exit /b 0
