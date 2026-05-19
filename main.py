@@ -110,17 +110,9 @@ def parse_model_and_thinking(model_name: str) -> tuple:
     Parse thinking level from model name suffix.
     Returns (model_for_provider, thinking_level)
     
-    Gemini Web models: thinking, pro, fast
+    Gemini Web models: thinking, pro, fast, flash
     AI Studio models: gemini-3-flash-preview, gemini-3-pro-preview, etc.
     """
-    # Check if it's a Gemini Web model
-    gemini_web_models = ["thinking", "pro", "fast"]
-    for gw_model in gemini_web_models:
-        if gw_model in model_name.lower():
-            # Gemini Web - capitalize the model name
-            return model_name.capitalize() if model_name.lower() in gemini_web_models else model_name, "High"
-    
-    # AI Studio model parsing
     thinking_levels = ["minimal", "low", "medium", "high"]
     
     for level in thinking_levels:
@@ -128,7 +120,15 @@ def parse_model_and_thinking(model_name: str) -> tuple:
             base_model = model_name[:-(len(level) + 1)]
             return base_model, level.capitalize()
     
-    return model_name, "High"
+    # Check if it's a Gemini Web model
+    gemini_web_models = ["thinking", "pro", "fast", "flash"]
+    for gw_model in gemini_web_models:
+        if gw_model in model_name.lower():
+            # Gemini Web model choice is separate from thinking level; only set
+            # thinking when the caller explicitly uses a suffix or field.
+            return model_name.capitalize() if model_name.lower() in gemini_web_models else model_name, None
+    
+    return model_name, None
 
 
 def extract_request_source(request: Request, body: Dict) -> Dict[str, str]:
@@ -180,6 +180,7 @@ async def list_models():
     return {
         "data": [
             {"id": "fast", "object": "model", "provider": "gemini-web"},
+            {"id": "flash", "object": "model", "provider": "gemini-web"},
             {"id": "thinking", "object": "model", "provider": "gemini-web"},
             {"id": "pro", "object": "model", "provider": "gemini-web"},
         ]

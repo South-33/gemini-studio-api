@@ -744,8 +744,13 @@ class GeminiWebAutomation(BaseAutomation):
             'button[aria-label="Open mode picker"]',
             '.input-area-switch',
         ],
+        "thinking_level": [
+            'gem-menu-item[value="thinking_level"]',
+        ],
         "new_chat": [
             'a[aria-label="New chat"]',
+            'button[aria-label="New chat"]',
+            '[data-test-id="new-chat-button"] a',
             '[data-test-id="new-chat-button"]',
             'a[href="/app"]',
         ],
@@ -759,6 +764,11 @@ class GeminiWebAutomation(BaseAutomation):
             '[aria-label="Temporary chat"].temp-chat-on',
         ],
         "sidebar_toggle": [
+            'button[aria-label="Open sidebar"]',
+            'button[data-test-id="side-nav-sparkle-button"]',
+            'button[aria-label="Close sidebar"]',
+            'button.close-sidenav-button',
+            'button[aria-label*="sidebar" i]',
             'button[aria-label="Main menu"]',
             '[aria-label="Main menu"]',
         ],
@@ -770,6 +780,8 @@ class GeminiWebAutomation(BaseAutomation):
             '.mat-mdc-menu-panel',
         ],
         "menu_item": [
+            'gem-menu-item[role="menuitem"]',
+            'gem-menu-item',
             '.mat-mdc-menu-item',
             '[role="menuitem"]',
         ],
@@ -1088,14 +1100,28 @@ class GeminiWebAutomation(BaseAutomation):
             return True
 
         aliases = {
-            "fast": ["fast", "flash"],
-            "thinking": ["thinking", "reasoning"],
+            "fast": ["flash", "lite"],
+            "flash": ["flash"],
+            "thinking": ["flash"],
             "pro": ["pro", "advanced"],
         }
+        if target == "fast":
+            return "flash" in tokens and "lite" in tokens
+        if target in {"flash", "thinking"}:
+            return "flash" in tokens and "lite" not in tokens
         for alias in aliases.get(target, [target]):
             if alias in tokens:
                 return True
         return False
+
+    def _model_target_selector(self, model_name: str) -> Optional[str]:
+        mapping = {
+            "fast": 'gem-menu-item[data-test-id="bard-mode-option-cf41b0e0dd7d53e5"]',
+            "flash": 'gem-menu-item[data-test-id="bard-mode-option-fbb127bbb056c959"]',
+            "thinking": 'gem-menu-item[data-test-id="bard-mode-option-fbb127bbb056c959"]',
+            "pro": 'gem-menu-item[data-test-id="bard-mode-option-9d8ca3786ebdfbea"]',
+        }
+        return mapping.get((model_name or "").strip().lower())
 
     @staticmethod
     def _estimate_tokens(text: str) -> int:
@@ -1181,15 +1207,19 @@ class GeminiWebAutomation(BaseAutomation):
                         pageTitle.toLowerCase().includes('500') ||
                         bodyText.includes("500. that's an error") ||
                         bodyText.includes("there was an error. please try again later. that's all we know.");
-                    const tempBtn = document.querySelector('[data-test-id="temp-chat-button"]');
+                    const tempBtn = document.querySelector('[data-test-id="temp-chat-button"], button[aria-label="Temporary chat"]');
                     const transitionSpinner = document.querySelector('.loading-content-spinner-container');
 
                     const buttons = Array.from(document.querySelectorAll('button')).filter(isVisible);
-                    const newChatLink = Array.from(document.querySelectorAll('a[aria-label="New chat"], [data-test-id="new-chat-button"], a[href="/app"]')).find(isVisible) || null;
-                    const sidebarExpanded = Array.from(document.querySelectorAll('a, button, div, span')).some((el) => {
+                    const newChatLink = Array.from(document.querySelectorAll('a[aria-label="New chat"], button[aria-label="New chat"], [data-test-id="new-chat-button"] a, [data-test-id="new-chat-button"], a[href="/app"]')).find(isVisible) || null;
+                    const sidebarEl = document.querySelector('bard-sidenav');
+                    const closeSidebarBtn = document.querySelector('button[aria-label="Close sidebar"]');
+                    const sidebarExpanded = !!(sidebarEl && !sidebarEl.classList.contains('collapsed')) || !!closeSidebarBtn || Array.from(document.querySelectorAll('a, button, div, span')).some((el) => {
                         if (!isVisible(el)) return false;
                         const text = (el.innerText || '').trim();
-                        return text === 'Scheduled actions' || text === 'Gems' || text === 'My stuff';
+                        return text === 'Scheduled actions' || text === 'Gems' || text === 'My stuff' ||
+                            text === 'Search chats' || text === 'Library' || text === 'New notebook' ||
+                            text === 'All notebooks' || text === 'Recents';
                     });
                     const stopBtn = buttons.find((b) => {
                         const label = (b.getAttribute('aria-label') || '').toLowerCase();
@@ -1288,7 +1318,10 @@ class GeminiWebAutomation(BaseAutomation):
                         empty_chat_visible: !!emptyChat,
                         temp_chat_landing_visible: tempChatLandingVisible,
                         temp_chat_button_visible: !!(tempBtn && isVisible(tempBtn)),
-                        temp_chat_active: !!(tempBtn && tempBtn.classList.contains('temp-chat-on')),
+                        temp_chat_active: !!(tempBtn && (
+                            tempBtn.classList.contains('temp-chat-on') ||
+                            tempBtn.querySelector('mat-icon[data-mat-icon-name="close"], mat-icon[fonticon="close"]')
+                        )),
                         temp_chat_button_classes: tempBtn ? Array.from(tempBtn.classList).slice(0, 20) : [],
                         transition_state: !!(transitionSpinner && isVisible(transitionSpinner)),
                         response_count: responses.length,
@@ -2122,6 +2155,8 @@ class GeminiWebAutomation(BaseAutomation):
             # 2. Select Model
             if model:
                 await self._select_model(model)
+            if thinking_level:
+                await self._set_thinking_level(thinking_level)
 
             # 3. Enter Prompt
             input_selector = await self._resolve_selector("input", require_visible=True, timeout_ms=2000)
@@ -2731,7 +2766,7 @@ class GeminiWebAutomation(BaseAutomation):
             self._request_id = None
 
     async def _select_model(self, model_name: str):
-        """Select model from dropdown (Fast, Thinking, Pro)."""
+        """Select model from dropdown."""
         try:
             # Click model picker
             model_selector = await self._resolve_selector("model_btn", require_visible=True, timeout_ms=1500)
@@ -2745,7 +2780,19 @@ class GeminiWebAutomation(BaseAutomation):
                 return
             
             await btn.click()
-            await self._human_delay(400, 600)
+            await self._human_delay(300, 450)
+
+            target_selector = self._model_target_selector(model_name)
+            if target_selector:
+                try:
+                    target = self.page.locator(target_selector).first
+                    await target.wait_for(state="visible", timeout=1500)
+                    await target.click(timeout=1500)
+                    print(f"[Worker {self.worker_id}] ✅ Selected model: {model_name}")
+                    await self._human_delay(300, 500)
+                    return
+                except Exception:
+                    pass
             
             # Select from menu
             menu_item_selector = await self._resolve_selector("menu_item")
@@ -2768,6 +2815,41 @@ class GeminiWebAutomation(BaseAutomation):
         except Exception as e:
             print(f"[Worker {self.worker_id}] ⚠️ Model selection failed: {e}")
             self._track_error(str(e), "model_btn", "select_model")
+
+    async def _set_thinking_level(self, level: str):
+        """Set Gemini Web thinking level when explicitly requested."""
+        normalized = (level or "").strip().lower()
+        if not normalized:
+            return
+        if normalized in {"high", "extended", "deep"}:
+            target_text = "Extended"
+        elif normalized in {"standard", "medium", "low", "minimal"}:
+            target_text = "Standard"
+        else:
+            return
+
+        try:
+            model_selector = await self._resolve_selector("model_btn", require_visible=True, timeout_ms=1500)
+            if not model_selector:
+                self._track_error("Model picker not found", "model_btn", "set_thinking_level")
+                return
+
+            await self.page.locator(model_selector).first.click()
+            await self._human_delay(300, 450)
+
+            trigger = self.page.locator('gem-menu-item[value="thinking_level"]').first
+            await trigger.wait_for(state="visible", timeout=1500)
+            await trigger.click(timeout=1500)
+            await self._human_delay(300, 450)
+
+            option = self.page.locator(f'gem-menu-item:has-text("{target_text}")').filter(has_not_text="Thinking level").first
+            await option.wait_for(state="visible", timeout=1500)
+            await option.click(timeout=1500)
+            log(f"Selected thinking level: {target_text}", f"Worker {self.worker_id}")
+            await self._human_delay(250, 400)
+        except Exception as e:
+            log(f"Thinking level selection failed: {e}", f"Worker {self.worker_id}")
+            self._track_error(str(e), "thinking_level", "set_thinking_level")
 
     async def _paste_image(self, image_path: str):
         """Paste an image via clipboard into Gemini Web."""
@@ -2828,7 +2910,7 @@ class WorkerPool:
     """Multi-worker pool for Gemini Web with round-robin dispatch."""
     
     # Supported models (all route to Gemini Web)
-    SUPPORTED_MODELS = ["thinking", "pro", "fast"]
+    SUPPORTED_MODELS = ["thinking", "pro", "fast", "flash"]
     
     def __init__(self, worker_count: int = 1, provider: str = "auto"):
         self.worker_count = max(1, worker_count)  # At least 1 worker

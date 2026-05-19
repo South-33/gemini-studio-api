@@ -1,9 +1,9 @@
 # Gemini Studio API
 
-A lightweight API that automates Gemini Web to provide OpenAI-compatible endpoints. Use Gemini's thinking, pro, or fast models directly from Roo Code, Cline, or any OpenAI-compatible tool.
+A lightweight API that automates Gemini Web to provide OpenAI-compatible endpoints. Use Gemini's thinking, pro, flash, or fast models directly from Roo Code, Cline, or any OpenAI-compatible tool.
 
 - **OpenAI Compatible** - Works with Roo Code, Cline, Continue, etc.
-- **Simplified Models** - Use `thinking`, `pro`, or `fast`
+- **Simplified Models** - Use `thinking`, `pro`, `flash`, or `fast`
 - **Image Upload** - Send images via OpenAI Vision API format
 - **Session Persistence** - Login once via Chrome, stays authenticated forever
 - **ngrok Tunnel** - Expose your local API to the internet with a static domain
@@ -62,7 +62,7 @@ ngrok http 8000 --domain=your-subdomain.ngrok-free.app
 | **Provider** | OpenAI Compatible |
 | **Base URL** | `https://your-subdomain.ngrok-free.app/v1` |
 | **API Key** | `anything` (ignored) |
-| **Model** | `thinking` (recommended) or `pro`, `fast` |
+| **Model** | `thinking`, `pro`, `flash`, or `fast` |
 
 ---
 
@@ -70,9 +70,10 @@ ngrok http 8000 --domain=your-subdomain.ngrok-free.app
 
 | Model | Description |
 |-------|-------------|
-| `fast` | Quick responses |
-| `thinking` | Complex problem solving |
-| `pro` | Advanced math & reasoning |
+| `fast` | Gemini 3.1 Flash-Lite |
+| `flash` | Gemini 3 Flash |
+| `thinking` | Legacy alias for Gemini 3 Flash |
+| `pro` | Gemini 3.1 Pro |
 
 ---
 
