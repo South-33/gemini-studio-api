@@ -71,8 +71,8 @@ ngrok http 8000 --domain=your-subdomain.ngrok-free.app
 | Model | Description |
 |-------|-------------|
 | `fast` | Gemini 3.1 Flash-Lite |
-| `flash` | Gemini 3 Flash |
-| `thinking` | Legacy alias for Gemini 3 Flash |
+| `flash` | Gemini 3.5 Flash |
+| `thinking` | Legacy alias for Gemini 3.5 Flash |
 | `pro` | Gemini 3.1 Pro |
 
 ---

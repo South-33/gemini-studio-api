@@ -1547,11 +1547,12 @@ class GeminiWebAutomation(BaseAutomation):
     @staticmethod
     def _is_fresh_temp_chat_ready(snapshot: Optional[Dict[str, Any]]) -> bool:
         snap = snapshot or {}
+        placeholder = str(snap.get("input_placeholder") or "").lower()
         return bool(
             int(snap.get("user_query_count") or 0) == 0
             and int(snap.get("response_count") or 0) == 0
             and snap.get("input_visible")
-            and "temporary" in str(snap.get("input_placeholder") or "").lower()
+            and (snap.get("temp_chat_active") or "temporary" in placeholder)
             and not snap.get("error_page_500")
         )
 
@@ -1565,6 +1566,7 @@ class GeminiWebAutomation(BaseAutomation):
             and snap.get("input_visible")
             and snap.get("new_chat_visible")
             and not snap.get("error_page_500")
+            and not snap.get("temp_chat_active")
             and "temporary" not in placeholder
         )
 
@@ -1573,7 +1575,10 @@ class GeminiWebAutomation(BaseAutomation):
         snap = snapshot or {}
         return bool(
             not snap.get("error_page_500")
-            and "temporary" in str(snap.get("input_placeholder") or "").lower()
+            and (
+                snap.get("temp_chat_active")
+                or "temporary" in str(snap.get("input_placeholder") or "").lower()
+            )
         )
 
     async def _wait_for_temp_page_mode(self, should_be_temp: bool, timeout_seconds: float) -> bool:
