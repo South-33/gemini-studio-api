@@ -18,6 +18,7 @@ import json
 import time
 import uuid
 import math
+import pathlib
 from collections import deque
 from datetime import datetime, timezone
 from typing import List, Optional, Dict, Union
@@ -172,6 +173,90 @@ def estimate_text_tokens(text: str) -> int:
     by_words = max(1, math.ceil(words * 1.3))
     return max(by_chars, by_words)
 
+
+ERROR_LOG_DIR = pathlib.Path(__file__).parent / "logs" / "errors"
+ERROR_LOG_MAX_FILES = 200
+
+
+def write_error_transaction_log(
+    trace: Dict,
+    result: Dict,
+    recent_req_snapshot: List[Dict],
+) -> None:
+    """Write a self-contained error report for a failed request to disk.
+
+    Each file captures:
+    - Request metadata (model, prompt size, source, timestamps)
+    - Per-attempt worker log lines from all retry attempts
+    - The last few recent requests for context (did subsequent requests succeed?)
+
+    Files are named:  {timestamp}_{request_id}.log
+    Capped at ERROR_LOG_MAX_FILES; oldest files are deleted when the cap is hit.
+    """
+    try:
+        ERROR_LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+        # Rotate: delete oldest files if over cap
+        existing = sorted(ERROR_LOG_DIR.glob("*.log"), key=lambda p: p.stat().st_mtime)
+        while len(existing) >= ERROR_LOG_MAX_FILES:
+            existing.pop(0).unlink(missing_ok=True)
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        req_id = trace.get("request_id", "unknown")
+        filename = ERROR_LOG_DIR / f"{ts}_{req_id}.log"
+
+        lines = []
+        sep = "=" * 72
+        thin = "-" * 72
+
+        lines.append(sep)
+        lines.append("GEMINI-STUDIO-API  ERROR TRANSACTION REPORT")
+        lines.append(sep)
+        lines.append(f"Request ID  : {req_id}")
+        lines.append(f"Started     : {trace.get('started_at', '')}")
+        lines.append(f"Finished    : {trace.get('finished_at', '')}")
+        lines.append(f"Source      : project={trace.get('project','')} client={trace.get('client','')} ip={trace.get('ip','')}")
+        lines.append(f"Model       : {trace.get('model', '')}")
+        lines.append(f"Prompt      : chars={trace.get('prompt_chars', 0)} tokens_est={trace.get('prompt_tokens_est', 0)} images={trace.get('image_count', 0)}")
+        lines.append(f"Error       : {result.get('error', 'unknown')}")
+        lines.append("")
+
+        attempt_logs = result.get("attempt_logs") or []
+        if attempt_logs:
+            lines.append(thin)
+            lines.append("WORKER ATTEMPT LOGS (all retry attempts)")
+            lines.append(thin)
+            lines.extend(attempt_logs)
+            lines.append("")
+        else:
+            lines.append("[No per-attempt logs captured]")
+            lines.append("")
+
+        lines.append(thin)
+        lines.append("RECENT REQUEST CONTEXT (last 6 requests before/including this one)")
+        lines.append(thin)
+        for r in recent_req_snapshot[-6:]:
+            status = r.get("status", "?")
+            marker = ">>> FAILED <<<" if r.get("request_id") == req_id else (
+                "  OK" if status == "ok" else f"  {status.upper()}"
+            )
+            lines.append(
+                f"  {marker}  [{r.get('request_id','?')}] "
+                f"model={r.get('model','?')} "
+                f"chars={r.get('prompt_chars','?')} "
+                f"tokens={r.get('prompt_tokens_est','?')} "
+                f"status={status} "
+                f"started={r.get('started_at','')} "
+                f"finished={r.get('finished_at','')}"
+            )
+        lines.append("")
+        lines.append(sep)
+
+        filename.write_text("\n".join(lines), encoding="utf-8")
+        log(f"Error transaction log written: {filename.name}", "API")
+    except Exception as exc:
+        log(f"Failed to write error transaction log: {exc}", "API")
+
 # --- Endpoints ---
 
 @app.get("/v1/models")
@@ -312,6 +397,7 @@ async def openai_chat(request: Request):
         trace["status"] = "failed"
         trace["error"] = result.get("error")
         trace["finished_at"] = datetime.now(timezone.utc).isoformat()
+        write_error_transaction_log(trace, result, list(recent_requests))
         raise HTTPException(status_code=500, detail=result.get("error"))
 
     content = result["response"] or ""

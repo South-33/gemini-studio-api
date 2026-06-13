@@ -34,6 +34,9 @@ DEBUG_SCREENSHOT_DIR = os.path.join(os.path.dirname(__file__), "debug_screenshot
 WAIT_LOG_INTERVAL_SECONDS = 10
 STALL_EMPTY_SECONDS = 45
 STALL_EMPTY_SECONDS_WITH_ACTIVITY = 90
+# Extra grace for large prompts (>15k tokens) where backend prefill can take 2+ minutes
+STALL_EMPTY_SECONDS_LARGE_PROMPT = 180
+LARGE_PROMPT_TOKEN_THRESHOLD = 15000
 STALL_NO_PROGRESS_SECONDS = 90
 STALL_NO_PROGRESS_SECONDS_SMALL = 180
 STALL_NO_PROGRESS_SECONDS_SMALL_WITH_ACTIVITY = 300
@@ -803,6 +806,8 @@ class GeminiWebAutomation(BaseAutomation):
         self._last_network_outage: Optional[Dict[str, Any]] = None
         self._zoom_applied = False
         self._browser_zoom_reset = False
+        self._current_prompt_tokens_est: int = 0  # Set per-request for stall scaling
+        self._request_log_lines: List[str] = []   # Per-request log buffer for error reports
 
     async def _reset_browser_zoom(self, force: bool = False):
         try:
@@ -997,6 +1002,40 @@ class GeminiWebAutomation(BaseAutomation):
                 continue
             return max(0.0, now - event_time)
         return None
+
+    def _get_recent_any_relevant_activity_age(self) -> Optional[float]:
+        """Like _get_recent_generation_activity_age but accepts ANY relevant 200 response
+        from gemini.google.com — not just generation-specific URLs. Used as a broader
+        liveness signal during the pre-first-token phase where the streaming connection
+        headers have already fired but body chunks haven't appeared in the DOM yet.
+        Playwright only fires on_response once per request (on headers), so the strict
+        generation URL check goes stale after 75s even on healthy long-running requests.
+        """
+        now = time.time()
+        for evt in reversed(self._recent_network_events):
+            if evt.get("request_id") != self._request_id:
+                continue
+            if evt.get("kind") != "response":
+                continue
+            status = int(evt.get("status") or 0)
+            if status < 200 or status >= 400:
+                continue
+            event_time = float(evt.get("t") or 0)
+            if event_time <= 0:
+                continue
+            return max(0.0, now - event_time)
+        return None
+
+    def get_request_log(self) -> List[str]:
+        """Return buffered log lines for the current/last request (for error reports)."""
+        return list(self._request_log_lines)
+
+    def _log(self, msg: str):
+        """Log to stderr (via module log()) AND append to the per-request buffer."""
+        tag = f"Worker {self.worker_id}"
+        log(msg, tag)
+        ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        self._request_log_lines.append(f"[{ts}] [{tag}] {msg}")
 
     def _attach_network_logging(self):
         if not self.page or self._network_logging_attached:
@@ -2078,11 +2117,12 @@ class GeminiWebAutomation(BaseAutomation):
             self._recent_network_events.clear()
             self._network_failure_counts.clear()
             self._last_network_outage = None
+            self._request_log_lines = []  # Reset per-request log buffer
             prompt_chars = len(prompt or "")
             prompt_tokens_est = self._estimate_tokens(prompt or "")
-            log(
-                f"[{self._request_id}] Request: model={model}, prompt_chars={prompt_chars}, prompt_tokens_est={prompt_tokens_est}",
-                f"Worker {self.worker_id}",
+            self._current_prompt_tokens_est = prompt_tokens_est
+            self._log(
+                f"[{self._request_id}] Request: model={model}, prompt_chars={prompt_chars}, prompt_tokens_est={prompt_tokens_est}"
             )
 
             copy_selector = await self._resolve_selector("copy_btn")
@@ -2611,6 +2651,33 @@ class GeminiWebAutomation(BaseAutomation):
                     empty_threshold = self._stall_empty_seconds
                     if backend_activity_live:
                         empty_threshold = max(empty_threshold, STALL_EMPTY_SECONDS_WITH_ACTIVITY)
+
+                    # For the pre-first-token phase (no output yet), also check broader network
+                    # liveness from any relevant gemini.google.com traffic. Playwright fires
+                    # on_response once per request (on headers), so the strict generation-URL
+                    # check goes stale after RECENT_NETWORK_ACTIVITY_SECONDS even on healthy
+                    # long-running prefills. The broader check keeps backend_activity_live=True
+                    # as long as any relevant polling/keepalive traffic is flowing.
+                    if stop_visible and resp_count == 0:
+                        broader_age = self._get_recent_any_relevant_activity_age()
+                        broader_live = (
+                            broader_age is not None and broader_age <= RECENT_NETWORK_ACTIVITY_SECONDS
+                        )
+                        if broader_live and not backend_activity_live:
+                            # Broader traffic is alive even though generation URL is stale —
+                            # use the extended threshold so we don't kill a healthy slow prefill.
+                            empty_threshold = max(empty_threshold, STALL_EMPTY_SECONDS_WITH_ACTIVITY)
+                            log(
+                                f"[{self._request_id}] Broader liveness active (broad_net_age={int(broader_age)}s); "
+                                f"extending empty threshold to {empty_threshold}s",
+                                f"Worker {self.worker_id}",
+                            )
+                        # Large-prompt additional grace: server prefill of very large contexts
+                        # (>LARGE_PROMPT_TOKEN_THRESHOLD tokens) can silently take 2+ minutes before
+                        # any DOM output appears. Belt-and-suspenders on top of the broader check.
+                        if self._current_prompt_tokens_est >= LARGE_PROMPT_TOKEN_THRESHOLD:
+                            if broader_live or backend_activity_live:
+                                empty_threshold = max(empty_threshold, STALL_EMPTY_SECONDS_LARGE_PROMPT)
 
                     can_track_thinking_progress = thinking_len > 0 or last_thinking_len > 0
 
@@ -3585,6 +3652,7 @@ class WorkerPool:
         last_error = None
         last_failure_worker_index: Optional[int] = None
         attempts_used = 0
+        all_attempt_logs: List[str] = []  # Accumulated per-attempt log lines for error reports
         
         while attempts_used < max_attempts:
             attempts_used += 1
@@ -3609,13 +3677,13 @@ class WorkerPool:
                     break
 
                 self._active_requests += 1
-                
+
                 tried_workers.add(worker_index)
                 should_recreate_worker = False
                 recreate_reason = ""
                 allow_same_worker_retry = False
                 attempt_error = ""
-                
+
                 try:
                     result = await worker.send_message(
                         prompt,
@@ -3625,7 +3693,7 @@ class WorkerPool:
                         images,
                         request_id=request_id,
                     )
-                    
+
                     # Validate response
                     if result.get("success"):
                         response = result.get("response", "")
@@ -3655,7 +3723,7 @@ class WorkerPool:
                         if self._is_network_outage_error(last_error):
                             log("Network outage detected; skipping cross-worker retry", "WorkerPool")
                             break
-                        
+
                 except Exception as e:
                     last_error = str(e)
                     attempt_error = last_error
@@ -3671,6 +3739,14 @@ class WorkerPool:
                         log("Network outage detected; skipping cross-worker retry", "WorkerPool")
                         break
                 finally:
+                    # Collect per-attempt log lines into the shared buffer for error reports.
+                    # This always runs regardless of success, failure dict, or exception.
+                    attempt_lines = worker.get_request_log()
+                    if attempt_lines:
+                        all_attempt_logs.append(
+                            f"--- Attempt {attempts_used} (Worker {worker.worker_id}) ---"
+                        )
+                        all_attempt_logs.extend(attempt_lines)
                     recreated_ok = False
                     if should_recreate_worker:
                         recreated_ok = await self._recreate_worker(worker_index, recreate_reason)
@@ -3702,7 +3778,11 @@ class WorkerPool:
         # All retries exhausted
         log(f"❌ All {attempts_used} attempts failed. Last error: {last_error}", "WorkerPool")
         await self._notify_final_failure(last_error or "unknown", last_failure_worker_index)
-        return {"success": False, "error": f"All workers failed. Last error: {last_error}"}
+        return {
+            "success": False,
+            "error": f"All workers failed. Last error: {last_error}",
+            "attempt_logs": all_attempt_logs,
+        }
 
     def get_diagnostics(self) -> Dict[str, Any]:
         errors = GeminiWebAutomation.get_all_errors()
