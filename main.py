@@ -114,21 +114,27 @@ def parse_model_and_thinking(model_name: str) -> tuple:
     Gemini Web models: thinking, pro, fast, flash
     AI Studio models: gemini-3-flash-preview, gemini-3-pro-preview, etc.
     """
+    model_lower = model_name.lower()
+    
+    # Check for explicit suffixes like model-high, model-medium, etc.
     thinking_levels = ["minimal", "low", "medium", "high"]
-    
     for level in thinking_levels:
-        if model_name.lower().endswith(f"-{level}"):
-            base_model = model_name[:-(len(level) + 1)]
-            return base_model, level.capitalize()
-    
-    # Check if it's a Gemini Web model
-    gemini_web_models = ["thinking", "pro", "fast", "flash"]
-    for gw_model in gemini_web_models:
-        if gw_model in model_name.lower():
-            # Gemini Web model choice is separate from thinking level; only set
-            # thinking when the caller explicitly uses a suffix or field.
-            return model_name.capitalize() if model_name.lower() in gemini_web_models else model_name, None
-    
+        if model_lower.endswith(f"-{level}"):
+            base = model_name[:-(len(level) + 1)]
+            if base.lower() == "thinking":
+                return "Flash", level.capitalize()
+            return base, level.capitalize()
+            
+    # Default mappings if no explicit suffix is provided
+    if model_lower == "thinking":
+        return "Flash", "Extended"
+    elif model_lower == "flash":
+        return "Flash", "Standard"
+    elif model_lower == "fast":
+        return "Fast", None
+    elif model_lower == "pro":
+        return "Pro", None
+        
     return model_name, None
 
 
@@ -199,7 +205,15 @@ def write_error_transaction_log(
         # Rotate: delete oldest files if over cap
         existing = sorted(ERROR_LOG_DIR.glob("*.log"), key=lambda p: p.stat().st_mtime)
         while len(existing) >= ERROR_LOG_MAX_FILES:
-            existing.pop(0).unlink(missing_ok=True)
+            old_log = existing.pop(0)
+            prefix = old_log.stem
+            old_log.unlink(missing_ok=True)
+            # Delete any HTML or PNG files associated with this transaction ID
+            for related in ERROR_LOG_DIR.glob(f"{prefix}*"):
+                try:
+                    related.unlink(missing_ok=True)
+                except Exception as rotate_err:
+                    log(f"Failed to delete related diagnostic file {related.name}: {rotate_err}", "API")
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         req_id = trace.get("request_id", "unknown")

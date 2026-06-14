@@ -13,12 +13,22 @@ from typing import Any, List, Dict, Optional, Tuple
 from urllib.parse import urlparse
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page, Route
 from notifier import notify_error
+import contextvars
+
+# ContextVar to hold current request's log lines buffer
+current_request_log_buffer = contextvars.ContextVar("current_request_log_buffer", default=None)
 
 # --- Timestamped Logging (use stderr - always unbuffered) ---
 def log(msg: str, tag: str = "Core"):
     """Print with timestamp for debugging. Uses stderr for guaranteed immediate output."""
     ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    print(f"[{ts}] [{tag}] {msg}", file=sys.stderr, flush=True)
+    formatted_msg = f"[{ts}] [{tag}] {msg}"
+    print(formatted_msg, file=sys.stderr, flush=True)
+    
+    # Also append to request log buffer if active in current context
+    buf = current_request_log_buffer.get()
+    if buf is not None:
+        buf.append(formatted_msg)
 
 # Low memory mode: block images, fonts, etc.
 LOW_MEMORY_MODE = os.getenv("LOW_MEMORY_MODE", "true").lower() == "true"
@@ -55,7 +65,7 @@ STALE_BUSY_WITHOUT_ACTIVE_SECONDS = 90
 SCROLL_NUDGE_AFTER_NO_PROGRESS_SECONDS = 8
 SCROLL_NUDGE_MIN_INTERVAL_SECONDS = 4
 UNSENT_STUCK_SECONDS = 20
-STALL_RECREATE_THRESHOLD = 2
+STALL_RECREATE_THRESHOLD = 1
 NETWORK_OUTAGE_PROBE_TIMEOUT_SECONDS = 2.0
 
 
@@ -1030,12 +1040,48 @@ class GeminiWebAutomation(BaseAutomation):
         """Return buffered log lines for the current/last request (for error reports)."""
         return list(self._request_log_lines)
 
+    async def _save_diagnostic_artifacts(self, reason: str):
+        """Save HTML source and screenshot of the page at the moment of failure."""
+        if not self.page or not self._request_id:
+            return
+        
+        try:
+            import pathlib
+            from datetime import datetime
+            diag_dir = pathlib.Path(__file__).parent / "logs" / "errors"
+            diag_dir.mkdir(parents=True, exist_ok=True)
+            
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            req_id = self._request_id
+            w_id = self.worker_id
+            
+            safe_reason = "".join(c for c in str(reason) if c.isalnum() or c in ("-", "_", " ")).strip().replace(" ", "_")
+            safe_reason = safe_reason[:30]
+            
+            # HTML
+            html_path = diag_dir / f"{ts}_{req_id}_worker_{w_id}_{safe_reason}.html"
+            try:
+                content = await self.page.content()
+                html_path.write_text(content, encoding="utf-8")
+                log(f"Saved diagnostic HTML: {html_path.name}", f"Worker {w_id}")
+            except Exception as e:
+                log(f"Failed to save diagnostic HTML: {e}", f"Worker {w_id}")
+                
+            # Screenshot
+            png_path = diag_dir / f"{ts}_{req_id}_worker_{w_id}_{safe_reason}.png"
+            try:
+                await self.page.screenshot(path=str(png_path), full_page=False, timeout=5000)
+                log(f"Saved diagnostic screenshot: {png_path.name}", f"Worker {w_id}")
+            except Exception as e:
+                log(f"Failed to save diagnostic screenshot: {e}", f"Worker {w_id}")
+                
+        except Exception as e:
+            log(f"Error saving diagnostic artifacts: {e}", f"Worker {self.worker_id}")
+
     def _log(self, msg: str):
         """Log to stderr (via module log()) AND append to the per-request buffer."""
         tag = f"Worker {self.worker_id}"
         log(msg, tag)
-        ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-        self._request_log_lines.append(f"[{ts}] [{tag}] {msg}")
 
     def _attach_network_logging(self):
         if not self.page or self._network_logging_attached:
@@ -2110,6 +2156,11 @@ class GeminiWebAutomation(BaseAutomation):
         if not self._initialized: 
             return {"success": False, "error": "Not initialized"}
 
+        log_buffer = []
+        self._request_log_lines = log_buffer
+        token = current_request_log_buffer.set(log_buffer)
+        self._last_request_success = False
+
         try:
             self._generation_in_progress = True
             self._request_count += 1
@@ -2117,7 +2168,6 @@ class GeminiWebAutomation(BaseAutomation):
             self._recent_network_events.clear()
             self._network_failure_counts.clear()
             self._last_network_outage = None
-            self._request_log_lines = []  # Reset per-request log buffer
             prompt_chars = len(prompt or "")
             prompt_tokens_est = self._estimate_tokens(prompt or "")
             self._current_prompt_tokens_est = prompt_tokens_est
@@ -2646,6 +2696,7 @@ class GeminiWebAutomation(BaseAutomation):
                         )
                         if finalized_text:
                             log("✅ Finalized stable response during post-processing", f"Worker {self.worker_id}")
+                            self._last_request_success = True
                             return {"success": True, "response": finalized_text}
 
                     empty_threshold = self._stall_empty_seconds
@@ -2674,10 +2725,16 @@ class GeminiWebAutomation(BaseAutomation):
                             )
                         # Large-prompt additional grace: server prefill of very large contexts
                         # (>LARGE_PROMPT_TOKEN_THRESHOLD tokens) can silently take 2+ minutes before
-                        # any DOM output appears. Belt-and-suspenders on top of the broader check.
+                        # any DOM output appears. Grant this grace period unconditionally when stop is
+                        # visible and there's no output yet, since the server won't start responding or
+                        # firing network events until prefill is done.
                         if self._current_prompt_tokens_est >= LARGE_PROMPT_TOKEN_THRESHOLD:
-                            if broader_live or backend_activity_live:
-                                empty_threshold = max(empty_threshold, STALL_EMPTY_SECONDS_LARGE_PROMPT)
+                            empty_threshold = max(empty_threshold, STALL_EMPTY_SECONDS_LARGE_PROMPT)
+                            log(
+                                f"[{self._request_id}] Large prompt prefill grace active (prompt_tokens_est={self._current_prompt_tokens_est}); "
+                                f"extending empty threshold to {empty_threshold}s",
+                                f"Worker {self.worker_id}",
+                            )
 
                     can_track_thinking_progress = thinking_len > 0 or last_thinking_len > 0
 
@@ -2738,6 +2795,7 @@ class GeminiWebAutomation(BaseAutomation):
                         recovered_text = await self._attempt_finalize_stalled_response(copy_selector, pre_send_count)
                         if recovered_text:
                             log("✅ Recovered stalled generation via finalize path", f"Worker {self.worker_id}")
+                            self._last_request_success = True
                             return {"success": True, "response": recovered_text}
 
                         error_snapshot = dict(snap)
@@ -2801,6 +2859,7 @@ class GeminiWebAutomation(BaseAutomation):
                 f"✅ Response: chars={out_chars}, tokens_est={out_tokens_est}",
                 f"Worker {self.worker_id}",
             )
+            self._last_request_success = True
             return {"success": True, "response": markdown.strip()}
 
         except Exception as e:
@@ -2834,8 +2893,14 @@ class GeminiWebAutomation(BaseAutomation):
             
             return {"success": False, "error": str(e)}
         finally:
+            if not self._last_request_success:
+                try:
+                    await self._save_diagnostic_artifacts("failed")
+                except:
+                    pass
             self._generation_in_progress = False
             self._request_id = None
+            current_request_log_buffer.reset(token)
 
     async def _select_model(self, model_name: str):
         """Select model from dropdown."""
@@ -3170,9 +3235,30 @@ class WorkerPool:
             self._worker_stall_failures[index] = 0
 
             try:
-                await old_worker.close()
-            except:
-                pass
+                # If in headed mode, freeze the tab rather than closing it
+                is_headless = os.getenv("HEADLESS", "false").lower() == "true"
+                if not is_headless and old_worker.page:
+                    try:
+                        await old_worker.page.evaluate("document.title = '[FROZEN STALL] - ' + document.title")
+                        log(f"Worker {index + 1} page frozen for user inspection", "WorkerPool")
+                    except Exception as e:
+                        log(f"Failed to set frozen page title: {e}", "WorkerPool")
+                    
+                    if not hasattr(self, "_frozen_pages"):
+                        self._frozen_pages = []
+                    self._frozen_pages.append(old_worker.page)
+                    # Cap at 10 frozen pages to avoid excessive resource leaks
+                    while len(self._frozen_pages) > 10:
+                        oldest_page = self._frozen_pages.pop(0)
+                        try:
+                            await oldest_page.close()
+                        except:
+                            pass
+                else:
+                    # In headless mode, close the page normally
+                    await old_worker.close()
+            except Exception as e:
+                log(f"Error handling old worker closure/freezing: {e}", "WorkerPool")
 
             log(f"Worker {index + 1} recreated successfully", "WorkerPool")
             return True
@@ -3823,6 +3909,14 @@ class WorkerPool:
         for w in self.workers:
             await w.close()
         
+        # Close all frozen pages
+        if hasattr(self, "_frozen_pages"):
+            for page in self._frozen_pages:
+                try:
+                    await page.close()
+                except:
+                    pass
+            self._frozen_pages.clear()
+        
         if self.shared_context: await self.shared_context.close()
         if self.playwright: await self.playwright.stop()
-
