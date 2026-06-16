@@ -9,7 +9,8 @@ This is the project's AGENTS.md
 - If Gemini endpoints and Discord both show `ERR_NAME_NOT_RESOLVED` / `getaddrinfo failed`, treat it as local DNS/network outage -> skip cross-worker retries -> refresh/retry logic alone will not recover it.
 - Repeated `200` generation responses with tiny visible text (`len~50`) can still be live post-processing; use recent network activity (`net_age`) to extend tiny/no-output stall grace before killing the worker.
 - For stable-response finalize attempts, try copy extraction before clicking Stop; otherwise diagnostics can get polluted with `You stopped this response` even when Gemini was still post-processing.
+- Gemini 2026 UI uses `<thinking-overlay>` containing static status text (e.g., `Defining the Project Scope`) instead of legacy `button.thoughts-header-button`. Bypass progress-based stalls while it is active because these labels do not stream character-by-character.
+- Thinking models require a fail-fast cooked check: if `thinking_active` is false and `response_body_len == 0` after 15s of elapsed wait time, flag the generation as stalled immediately.
 - Retries are total attempts, not unique-worker-only now; after recoverable stall/refresh/recreation, the same worker can be retried if the alternate worker is still busy.
-- Gemini last-turn diagnostics can track thinking separately via `button.thoughts-header-button`; treat assistant `button[aria-label="Copy"]` inside the latest `model-response` as response-ready even if `Stop response` is still visible, and ignore user `Copy prompt` buttons.
 - Idle maintenance is pre-request and marks all workers busy; keep it bounded and clear stale busy flags or Playwright transport failures can poison the pool with assignment timeouts.
 - Gemini 2026 UI uses `Open/Close sidebar`, `bard-sidenav.collapsed`, `gem-menu-item`, and temp active via inner `mat-icon=close`; prefer these attributes over old label-only sidebar detection.
