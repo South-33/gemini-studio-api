@@ -1041,42 +1041,120 @@ class GeminiWebAutomation(BaseAutomation):
         return list(self._request_log_lines)
 
     async def _save_diagnostic_artifacts(self, reason: str):
-        """Save HTML source and screenshot of the page at the moment of failure."""
+        """Save a screenshot + DOM text extract of the page at the moment of failure.
+
+        Must be called BEFORE any page.reload() / hard refresh so the evidence is
+        captured while the failing page is still live.  The old approach of saving
+        page.content() as HTML is dropped — Gemini is a JS SPA so the saved HTML
+        renders black locally and is useless.  A text extract + screenshot give us
+        everything we actually need for diagnosis.
+        """
         if not self.page or not self._request_id:
             return
-        
+
         try:
             import pathlib
             from datetime import datetime
             diag_dir = pathlib.Path(__file__).parent / "logs" / "errors"
             diag_dir.mkdir(parents=True, exist_ok=True)
-            
+
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             req_id = self._request_id
             w_id = self.worker_id
-            
+
             safe_reason = "".join(c for c in str(reason) if c.isalnum() or c in ("-", "_", " ")).strip().replace(" ", "_")
             safe_reason = safe_reason[:30]
-            
-            # HTML
-            html_path = diag_dir / f"{ts}_{req_id}_worker_{w_id}_{safe_reason}.html"
-            try:
-                content = await self.page.content()
-                html_path.write_text(content, encoding="utf-8")
-                log(f"Saved diagnostic HTML: {html_path.name}", f"Worker {w_id}")
-            except Exception as e:
-                log(f"Failed to save diagnostic HTML: {e}", f"Worker {w_id}")
-                
-            # Screenshot
+
+            # Screenshot (captured while page is still live)
             png_path = diag_dir / f"{ts}_{req_id}_worker_{w_id}_{safe_reason}.png"
             try:
-                await self.page.screenshot(path=str(png_path), full_page=False, timeout=5000)
+                await self.page.screenshot(path=str(png_path), full_page=False, timeout=8000)
                 log(f"Saved diagnostic screenshot: {png_path.name}", f"Worker {w_id}")
             except Exception as e:
                 log(f"Failed to save diagnostic screenshot: {e}", f"Worker {w_id}")
-                
+
+            # DOM text extract — pull the visible text the user would see:
+            # page URL, title, any error/toast messages, and the tail of the
+            # last model response.  Much more useful than a black HTML blob.
+            txt_path = diag_dir / f"{ts}_{req_id}_worker_{w_id}_{safe_reason}.diag.txt"
+            try:
+                dom_info = await self.page.evaluate("""
+                    () => {
+                        const url = window.location.href;
+                        const title = document.title;
+
+                        // Any visible error / toast messages
+                        const errorSels = [
+                            '[class*="error"]', '[class*="toast"]', '[class*="snack"]',
+                            '[role="alert"]', '[class*="banner"]', '.error-message',
+                        ];
+                        const errors = [];
+                        for (const sel of errorSels) {
+                            document.querySelectorAll(sel).forEach(el => {
+                                const t = (el.innerText || '').trim();
+                                if (t && t.length > 2 && t.length < 500) errors.push(t);
+                            });
+                        }
+
+                        // Last model response tail (up to 800 chars)
+                        const responseSels = [
+                            'model-response', '[data-content-type="response"]',
+                            'assistant-message-content', '.response-content',
+                        ];
+                        let responseTail = '';
+                        for (const sel of responseSels) {
+                            const nodes = document.querySelectorAll(sel);
+                            if (nodes.length > 0) {
+                                responseTail = (nodes[nodes.length - 1].innerText || '').slice(-800);
+                                break;
+                            }
+                        }
+
+                        // User prompt that was sent (first user-query bubble)
+                        let userPromptPreview = '';
+                        const uq = document.querySelectorAll('user-query');
+                        if (uq.length > 0) {
+                            userPromptPreview = (uq[uq.length - 1].innerText || '').slice(0, 500);
+                        }
+
+                        // Stop/Send button states
+                        const stopVisible = !!(document.querySelector('button[aria-label*="Stop"]'));
+                        const sendVisible = !!(document.querySelector('button[aria-label*="Send"]'));
+
+                        return { url, title, errors: [...new Set(errors)].slice(0, 10),
+                                 responseTail, userPromptPreview, stopVisible, sendVisible };
+                    }
+                """)
+                lines = [
+                    f"URL        : {dom_info.get('url', '')}",
+                    f"Title      : {dom_info.get('title', '')}",
+                    f"Stop btn   : {dom_info.get('stopVisible')}  Send btn: {dom_info.get('sendVisible')}",
+                    "",
+                    "=== ERROR / TOAST MESSAGES ===",
+                ]
+                for err in (dom_info.get("errors") or []):
+                    lines.append(f"  {err}")
+                if not dom_info.get("errors"):
+                    lines.append("  (none found)")
+                lines += [
+                    "",
+                    "=== USER PROMPT PREVIEW (last bubble, first 500 chars) ===",
+                    dom_info.get("userPromptPreview") or "  (not found)",
+                    "",
+                    "=== MODEL RESPONSE TAIL (last 800 chars) ===",
+                    dom_info.get("responseTail") or "  (empty)",
+                ]
+                txt_path.write_text("\n".join(lines), encoding="utf-8")
+                log(f"Saved diagnostic text extract: {txt_path.name}", f"Worker {w_id}")
+            except Exception as e:
+                log(f"Failed to save diagnostic text extract: {e}", f"Worker {w_id}")
+
         except Exception as e:
             log(f"Error saving diagnostic artifacts: {e}", f"Worker {self.worker_id}")
+
+    # Track whether diagnostics were already saved pre-refresh for this request
+    # so the finally-block doesn't double-save a post-refresh greeting page.
+    _diag_saved_pre_refresh: bool = False
 
     def _log(self, msg: str):
         """Log to stderr (via module log()) AND append to the per-request buffer."""
@@ -1547,9 +1625,16 @@ class GeminiWebAutomation(BaseAutomation):
             log(f"Google 500 recovery failed: {e}", f"Worker {self.worker_id}")
             return False
 
-    async def _hard_refresh_and_reinit(self, reason: str) -> bool:
-        """Hard refresh page and re-run worker init path."""
+    async def _hard_refresh_and_reinit(self, reason: str, save_diag: bool = False) -> bool:
+        """Hard refresh page and re-run worker init path.
+
+        If save_diag=True, save screenshot + DOM extract BEFORE reloading so we
+        capture the failing state rather than the post-reload greeting screen.
+        """
         try:
+            if save_diag and not self._diag_saved_pre_refresh:
+                await self._save_diagnostic_artifacts(reason)
+                self._diag_saved_pre_refresh = True
             log(f"Hard refresh recovery ({reason})", f"Worker {self.worker_id}")
             await self.page.reload(wait_until="domcontentloaded", timeout=30000)
             await self._human_delay(1000, 1500)
@@ -1938,6 +2023,29 @@ class GeminiWebAutomation(BaseAutomation):
             f"Worker {self.worker_id}",
         )
         self._track_error("Temp chat reset not confirmed", "temp_chat", "ensure_fresh_temp_chat", final_snapshot)
+
+        # The browser is in a broken post-refresh state (greeting screen but temp-chat
+        # toggle not responding).  Do a fresh full navigate rather than just sitting here
+        # — this is what causes the 21-instances-on-greeting-screen pileup.
+        log("Temp chat broken post-refresh: navigating fresh to recover", f"Worker {self.worker_id}")
+        try:
+            await self.page.goto(self.URL, wait_until="domcontentloaded", timeout=30000)
+            await self._human_delay(1500, 2500)
+            reinit_ok = await self.init_with_page(self.page, self.context)
+            if reinit_ok:
+                # One more attempt after clean navigate
+                temp_btn2 = await self._get_temp_chat_button()
+                if temp_btn2 and await self._click_temp_chat_toggle():
+                    deadline2 = time.time() + 8.0
+                    while time.time() < deadline2:
+                        snap2 = await self._capture_state_snapshot()
+                        if self._is_fresh_temp_chat_ready(snap2):
+                            log("Temp reset path: recovered via fresh navigate", f"Worker {self.worker_id}")
+                            return True
+                        await asyncio.sleep(0.2)
+            log("⚠️ Temp chat still broken after fresh navigate — worker needs recreation", f"Worker {self.worker_id}")
+        except Exception as nav_e:
+            log(f"Temp chat fresh-navigate recovery failed: {nav_e}", f"Worker {self.worker_id}")
         return False
 
     def _track_error(self, error: str, selector_key: str, action: str, diagnostics: Optional[Dict[str, Any]] = None):
@@ -2807,7 +2915,9 @@ class GeminiWebAutomation(BaseAutomation):
                         except:
                             pass
                         self._track_error(stall_reason, "copy_btn", "wait_for_response_stalled", error_snapshot)
-                        await self._hard_refresh_and_reinit("stalled_generation")
+                        # save_diag=True: capture screenshot + DOM extract BEFORE reload
+                        # so we see the stalled page, not the greeting screen after refresh.
+                        await self._hard_refresh_and_reinit("stalled_generation", save_diag=True)
                         return {"success": False, "error": stall_reason}
 
                     last_wait_log = now
@@ -2893,11 +3003,15 @@ class GeminiWebAutomation(BaseAutomation):
             
             return {"success": False, "error": str(e)}
         finally:
-            if not self._last_request_success:
+            # Only save diagnostics here if we didn't already save pre-refresh above.
+            # If we saved pre-refresh, the page is now the greeting screen and saving
+            # again would just overwrite with useless data.
+            if not self._last_request_success and not self._diag_saved_pre_refresh:
                 try:
                     await self._save_diagnostic_artifacts("failed")
                 except:
                     pass
+            self._diag_saved_pre_refresh = False
             self._generation_in_progress = False
             self._request_id = None
             current_request_log_buffer.reset(token)

@@ -235,6 +235,27 @@ def write_error_transaction_log(
         lines.append(f"Error       : {result.get('error', 'unknown')}")
         lines.append("")
 
+        # Prompt preview (first 3000 chars) — enough to identify what failed
+        prompt_preview = trace.get("prompt_preview", "")
+        if prompt_preview:
+            lines.append(thin)
+            lines.append("PROMPT PREVIEW (first 3000 chars)")
+            lines.append(thin)
+            lines.append(prompt_preview)
+            lines.append("")
+
+        # Save full prompt as a sidecar .prompt.txt so it can be replayed
+        prompt_full = trace.get("prompt_full", "")
+        if prompt_full:
+            prompt_path = ERROR_LOG_DIR / f"{ts}_{req_id}.prompt.txt"
+            try:
+                prompt_path.write_text(prompt_full, encoding="utf-8")
+                lines.append(f"Full prompt saved to: {prompt_path.name}")
+                lines.append("")
+            except Exception as pe:
+                lines.append(f"(Failed to save full prompt: {pe})")
+                lines.append("")
+
         attempt_logs = result.get("attempt_logs") or []
         if attempt_logs:
             lines.append(thin)
@@ -359,6 +380,9 @@ async def openai_chat(request: Request):
     trace["prompt_chars"] = prompt_chars
     trace["prompt_tokens_est"] = prompt_tokens_est
     trace["image_count"] = len(image_paths)
+    # Store prompt for error log / retry — full prompt so we can replay it if needed
+    trace["prompt_preview"] = prompt[:3000]
+    trace["prompt_full"] = prompt
 
     log(
         f"Prompt stats: chars={prompt_chars} tokens_est={prompt_tokens_est} images={len(image_paths)}",
