@@ -1068,10 +1068,16 @@ class GeminiWebAutomation(BaseAutomation):
             # Screenshot (captured while page is still live)
             png_path = diag_dir / f"{ts}_{req_id}_worker_{w_id}_{safe_reason}.png"
             try:
-                await self.page.screenshot(path=str(png_path), full_page=False, timeout=8000)
+                # Try full page screenshot first so we see all context
+                await self.page.screenshot(path=str(png_path), full_page=True, timeout=8000)
                 log(f"Saved diagnostic screenshot: {png_path.name}", f"Worker {w_id}")
             except Exception as e:
-                log(f"Failed to save diagnostic screenshot: {e}", f"Worker {w_id}")
+                try:
+                    # Fallback to viewport screenshot
+                    await self.page.screenshot(path=str(png_path), full_page=False, timeout=4000)
+                    log(f"Saved diagnostic screenshot (viewport fallback): {png_path.name}", f"Worker {w_id}")
+                except Exception as fallback_err:
+                    log(f"Failed to save diagnostic screenshot: {fallback_err}", f"Worker {w_id}")
 
             # DOM text extract — pull the visible text the user would see:
             # page URL, title, any error/toast messages, and the tail of the
@@ -2277,6 +2283,15 @@ class GeminiWebAutomation(BaseAutomation):
         if not self._initialized: 
             return {"success": False, "error": "Not initialized"}
 
+        # Prepend instruction to prevent accidental image generation on text-only prompts
+        if not images:
+            anti_image_inst = (
+                "IMPORTANT: Do NOT generate or create any images. "
+                "Respond ONLY with text/data. Do not attempt to draw, paint, or generate any visual output.\n\n"
+            )
+            if not prompt.strip().startswith("IMPORTANT: Do NOT generate or create any images"):
+                prompt = anti_image_inst + prompt
+
         log_buffer = []
         self._request_log_lines = log_buffer
         token = current_request_log_buffer.set(log_buffer)
@@ -2788,6 +2803,7 @@ class GeminiWebAutomation(BaseAutomation):
                     # If generation appears active but no progress, nudge scroll to bottom.
                     if (
                         stop_visible
+                        and phase != "thinking_only"
                         and no_progress_age >= SCROLL_NUDGE_AFTER_NO_PROGRESS_SECONDS
                         and (now - last_scroll_nudge_at) >= SCROLL_NUDGE_MIN_INTERVAL_SECONDS
                     ):
@@ -2864,7 +2880,13 @@ class GeminiWebAutomation(BaseAutomation):
                     # Cooked check for thinking models:
                     # If thinking was requested, we expect thinking_active to become True.
                     # If it doesn't start reasoning within 15 seconds (and has no response body), the request is cooked.
-                    if (not stall_reason) and getattr(self, "_thinking_requested", False) and elapsed >= 15:
+                    # For large prompts, we extend this cooked check threshold to STALL_EMPTY_SECONDS_LARGE_PROMPT (360s)
+                    # to allow time for the massive context prefill.
+                    cooked_threshold = 15
+                    if self._current_prompt_tokens_est and self._current_prompt_tokens_est >= LARGE_PROMPT_TOKEN_THRESHOLD:
+                        cooked_threshold = STALL_EMPTY_SECONDS_LARGE_PROMPT
+
+                    if (not stall_reason) and getattr(self, "_thinking_requested", False) and elapsed >= cooked_threshold:
                         if not snap.get("thinking_active") and response_body_len == 0:
                             stall_reason = "Stalled generation: thinking model failed to start reasoning (request cooked)"
 
@@ -2963,7 +2985,7 @@ class GeminiWebAutomation(BaseAutomation):
                     "wait_for_response",
                     snapshot,
                 )
-                await self._hard_refresh_and_reinit("copy_timeout")
+                await self._hard_refresh_and_reinit("copy_timeout", save_diag=True)
                 return {"success": False, "error": f"Timeout after {max_wait}s waiting for response"}
 
             # Auto-scroll to ensure copy button is visible
@@ -2990,7 +3012,7 @@ class GeminiWebAutomation(BaseAutomation):
                 log(f"⚠️ Clipboard empty after copy", f"Worker {self.worker_id}")
                 snapshot = await self._capture_state_snapshot()
                 self._track_error("Clipboard empty", "copy_btn", "extract_response", snapshot)
-                await self._hard_refresh_and_reinit("clipboard_empty")
+                await self._hard_refresh_and_reinit("clipboard_empty", save_diag=True)
                 return {"success": False, "error": "Clipboard extraction failed"}
 
             out_chars = len(markdown)

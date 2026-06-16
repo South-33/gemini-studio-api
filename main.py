@@ -488,7 +488,7 @@ async def diagnostics():
     }
 
 @app.get("/v1/screenshot")
-async def get_screenshot(worker: int = 1):
+async def get_screenshot(worker: int = 1, full_page: bool = False):
     if not worker_pool:
         raise HTTPException(status_code=503, detail="Worker pool not initialized")
     if worker < 1 or worker > len(worker_pool.workers):
@@ -501,7 +501,7 @@ async def get_screenshot(worker: int = 1):
     import tempfile
     screenshot_path = pathlib.Path(tempfile.gettempdir()) / f"worker_{worker}_screenshot.png"
     try:
-        await w.page.screenshot(path=str(screenshot_path))
+        await w.page.screenshot(path=str(screenshot_path), full_page=full_page)
         return FileResponse(str(screenshot_path), media_type="image/png")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to capture screenshot: {e}")
