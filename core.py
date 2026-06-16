@@ -44,8 +44,8 @@ DEBUG_SCREENSHOT_DIR = os.path.join(os.path.dirname(__file__), "debug_screenshot
 WAIT_LOG_INTERVAL_SECONDS = 10
 STALL_EMPTY_SECONDS = 45
 STALL_EMPTY_SECONDS_WITH_ACTIVITY = 90
-# Extra grace for large prompts (>15k tokens) where backend prefill can take 2+ minutes
-STALL_EMPTY_SECONDS_LARGE_PROMPT = 180
+# Extra grace for large prompts (>15k tokens) where backend prefill can take 5+ minutes
+STALL_EMPTY_SECONDS_LARGE_PROMPT = 360
 LARGE_PROMPT_TOKEN_THRESHOLD = 15000
 STALL_NO_PROGRESS_SECONDS = 90
 STALL_NO_PROGRESS_SECONDS_SMALL = 180
@@ -1419,33 +1419,46 @@ class GeminiWebAutomation(BaseAutomation):
                         ? Array.from(last.querySelectorAll('button[aria-label="Copy"]')).filter(isVisible)
                         : [];
                     const inputCopyButtons = Array.from(document.querySelectorAll('button[aria-label="Copy prompt"]')).filter(isVisible);
-                    const thinkingBtn = last
+                    const legacyThinkingBtn = last
                         ? Array.from(last.querySelectorAll('button.thoughts-header-button')).find(isVisible) || null
                         : Array.from(document.querySelectorAll('button.thoughts-header-button')).find(isVisible) || null;
-                    const thinkingLabel = (thinkingBtn?.innerText || thinkingBtn?.textContent || '').trim().slice(0, 120);
-                    const thinkingDoneLabels = new Set(['Show thinking', 'Hide thinking']);
-                    const thinkingActive = !!thinkingBtn && !thinkingDoneLabels.has(thinkingLabel);
+                    const legacyThinkingLabel = (legacyThinkingBtn?.innerText || legacyThinkingBtn?.textContent || '').trim().slice(0, 120);
+                    const legacyThinkingDoneLabels = new Set(['Show thinking', 'Hide thinking']);
+                    const legacyThinkingActive = !!legacyThinkingBtn && !legacyThinkingDoneLabels.has(legacyThinkingLabel);
 
-                    let thoughtContainer = null;
-                    if (thinkingBtn) {
-                        thoughtContainer =
+                    let legacyThoughtContainer = null;
+                    if (legacyThinkingBtn) {
+                        legacyThoughtContainer =
                             (last && (last.querySelector('.thought-container') || last.querySelector('[class*="thought-container"]'))) ||
-                            thinkingBtn.closest('[class*="thought-container"]');
-
-                        if (!thoughtContainer) {
-                            const sibling = thinkingBtn.parentElement?.nextElementSibling || null;
-                            if (sibling) {
-                                const siblingClass = String(sibling.className || '').toLowerCase();
-                                if (siblingClass.includes('thought') || siblingClass.includes('reason')) {
-                                    thoughtContainer = sibling;
-                                }
-                            }
-                        }
+                            legacyThinkingBtn.closest('[class*="thought-container"]');
                     }
+                    const legacyThinkingText = legacyThoughtContainer ? (legacyThoughtContainer.innerText || legacyThoughtContainer.textContent || '') : '';
 
-                    const thinkingText = thoughtContainer ? (thoughtContainer.innerText || thoughtContainer.textContent || '') : '';
+                    // Check for new 2026 thinking overlay
+                    const thinkingOverlay = last ? last.querySelector('thinking-overlay') : document.querySelector('thinking-overlay');
+                    const newThinkingVisible = !!(thinkingOverlay && isVisible(thinkingOverlay));
+                    const newThinkingActive = newThinkingVisible && !!(
+                        thinkingOverlay.querySelector('thinking-dots-animation, .thinking-dots-animation, .thinking-container')
+                    );
+                    const newThinkingLabel = thinkingOverlay ? (thinkingOverlay.innerText || '').trim().slice(0, 120) : '';
+
+                    // Resolve final values
+                    const thinkingVisible = legacyThinkingActive || newThinkingVisible;
+                    const thinkingActive = legacyThinkingActive || newThinkingActive;
+                    const thinkingLabel = legacyThinkingActive ? legacyThinkingLabel : newThinkingLabel;
+                    const thinkingText = legacyThinkingActive ? legacyThinkingText : newThinkingLabel;
                     const thinkingLen = thinkingText.trim().length;
-                    const responseBodyLen = Math.max(0, lastText.trim().length - thinkingLen);
+
+                    // Extract actual response body text (ignoring thinking status overlay)
+                    const msgContentEl = last ? last.querySelector('message-content') : null;
+                    const responseBodyText = msgContentEl ? (msgContentEl.innerText || msgContentEl.textContent || '') : '';
+                    
+                    let responseBodyLen = 0;
+                    if (msgContentEl) {
+                        responseBodyLen = responseBodyText.trim().length;
+                    } else {
+                        responseBodyLen = Math.max(0, lastText.trim().length - thinkingLen);
+                    }
                     const responseVisible = responseBodyLen > 0;
 
                     let phase = 'idle_or_unknown';
@@ -1493,7 +1506,7 @@ class GeminiWebAutomation(BaseAutomation):
                         last_response_tail: lastText.slice(-120),
                         response_body_len: responseBodyLen,
                         response_visible: responseVisible,
-                        thinking_visible: !!thinkingBtn,
+                        thinking_visible: thinkingVisible,
                         thinking_active: thinkingActive,
                         thinking_label: thinkingLabel,
                         thinking_len: thinkingLen,
@@ -2270,6 +2283,7 @@ class GeminiWebAutomation(BaseAutomation):
         self._last_request_success = False
 
         try:
+            self._thinking_requested = bool(thinking_level)
             self._generation_in_progress = True
             self._request_count += 1
             self._request_id = (request_id or "").strip() or uuid.uuid4().hex[:8]
@@ -2844,6 +2858,16 @@ class GeminiWebAutomation(BaseAutomation):
                                 f"Worker {self.worker_id}",
                             )
 
+                    # Check if this is the new 2026 thinking overlay (status text is static, doesn't stream character-by-character)
+                    is_new_thinking = snap.get("thinking_visible", False) and not snap.get("thinking_label", "").lower().startswith("show thinking")
+
+                    # Cooked check for thinking models:
+                    # If thinking was requested, we expect thinking_active to become True.
+                    # If it doesn't start reasoning within 15 seconds (and has no response body), the request is cooked.
+                    if (not stall_reason) and getattr(self, "_thinking_requested", False) and elapsed >= 15:
+                        if not snap.get("thinking_active") and response_body_len == 0:
+                            stall_reason = "Stalled generation: thinking model failed to start reasoning (request cooked)"
+
                     can_track_thinking_progress = thinking_len > 0 or last_thinking_len > 0
 
                     if (
@@ -2852,17 +2876,21 @@ class GeminiWebAutomation(BaseAutomation):
                         and phase == "thinking_only"
                         and can_track_thinking_progress
                     ):
-                        thinking_threshold = STALL_THINKING_NO_PROGRESS_SECONDS
-                        if backend_activity_live:
-                            thinking_threshold = max(
-                                thinking_threshold,
-                                STALL_THINKING_NO_PROGRESS_SECONDS_WITH_ACTIVITY,
-                            )
-                        if no_progress_age >= thinking_threshold:
-                            stall_reason = (
-                                f"Stalled generation: thinking made no progress for {thinking_threshold}s "
-                                f"(thinking_len={thinking_len})"
-                            )
+                        if is_new_thinking:
+                            # Skip legacy thinking progress stall for the static 2026 status labels
+                            pass
+                        else:
+                            thinking_threshold = STALL_THINKING_NO_PROGRESS_SECONDS
+                            if backend_activity_live:
+                                thinking_threshold = max(
+                                    thinking_threshold,
+                                    STALL_THINKING_NO_PROGRESS_SECONDS_WITH_ACTIVITY,
+                                )
+                            if no_progress_age >= thinking_threshold:
+                                stall_reason = (
+                                    f"Stalled generation: thinking made no progress for {thinking_threshold}s "
+                                    f"(thinking_len={thinking_len})"
+                                )
                     elif (not stall_reason) and stop_visible and resp_count == 0 and elapsed >= empty_threshold:
                         stall_reason = f"Stalled generation: no output for {empty_threshold}s"
                     elif (not stall_reason) and stop_visible and resp_count > 0:
@@ -2874,6 +2902,8 @@ class GeminiWebAutomation(BaseAutomation):
                             )
                         if response_body_len < STALL_SMALL_LEN_THRESHOLD:
                             no_progress_threshold = STALL_NO_PROGRESS_SECONDS_SMALL
+                            if self._current_prompt_tokens_est and self._current_prompt_tokens_est >= LARGE_PROMPT_TOKEN_THRESHOLD:
+                                no_progress_threshold = max(no_progress_threshold, STALL_EMPTY_SECONDS_LARGE_PROMPT)
                             if backend_activity_live:
                                 no_progress_threshold = max(
                                     no_progress_threshold,
@@ -3778,6 +3808,8 @@ class WorkerPool:
             self._initialized = True
             return workers_ok > 0  # Success if at least one works
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             print(f"[WorkerPool] Init error: {e}")
             return False
 

@@ -4,11 +4,11 @@ import os
 # Force unbuffered output (critical for Windows/ngrok)
 # Method 1: Set environment variable (for subprocesses)
 os.environ['PYTHONUNBUFFERED'] = '1'
-# Method 2: Reconfigure stdout/stderr
+# Method 2: Reconfigure stdout/stderr with utf-8 encoding
 if hasattr(sys.stdout, 'reconfigure'):
-    sys.stdout.reconfigure(line_buffering=True)
+    sys.stdout.reconfigure(line_buffering=True, encoding='utf-8')
 if hasattr(sys.stderr, 'reconfigure'):
-    sys.stderr.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True, encoding='utf-8')
 
 import asyncio
 import threading
@@ -486,6 +486,25 @@ async def diagnostics():
         "pool": pool_diag,
         "recent_requests": list(recent_requests),
     }
+
+@app.get("/v1/screenshot")
+async def get_screenshot(worker: int = 1):
+    if not worker_pool:
+        raise HTTPException(status_code=503, detail="Worker pool not initialized")
+    if worker < 1 or worker > len(worker_pool.workers):
+        raise HTTPException(status_code=400, detail="Invalid worker index")
+    w = worker_pool.workers[worker - 1]
+    if not w.page:
+        raise HTTPException(status_code=404, detail="Worker page not found")
+    
+    from fastapi.responses import FileResponse
+    import tempfile
+    screenshot_path = pathlib.Path(tempfile.gettempdir()) / f"worker_{worker}_screenshot.png"
+    try:
+        await w.page.screenshot(path=str(screenshot_path))
+        return FileResponse(str(screenshot_path), media_type="image/png")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to capture screenshot: {e}")
 
 if __name__ == "__main__":
     import uvicorn
