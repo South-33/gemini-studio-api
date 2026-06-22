@@ -754,7 +754,8 @@ class GeminiWebAutomation(BaseAutomation):
             'button[aria-label*="Send" i]',
         ],
         "model_btn": [
-            'button[aria-label="Open mode picker"]',
+            'button[data-test-id="bard-mode-menu-button"]',
+            'button[aria-label^="Open mode picker"]',
             '.input-area-switch',
         ],
         "thinking_level": [
