@@ -3170,7 +3170,10 @@ class GeminiWebAutomation(BaseAutomation):
                 return
 
             items = self.page.locator(menu_item_selector)
-            for i in range(await items.count()):
+            item_count = await items.count()
+            
+            # Try to match by text first
+            for i in range(item_count):
                 item = items.nth(i)
                 text = await item.inner_text()
                 if self._matches_model(text, model_name):
@@ -3178,7 +3181,42 @@ class GeminiWebAutomation(BaseAutomation):
                     print(f"[Worker {self.worker_id}] ✅ Selected model: {model_name}")
                     await self._human_delay(300, 600)
                     return
-            # If not found, close menu
+
+            # Wording change fallback (Index-based selection: lite = 0, flash = 1, pro = 2)
+            index_map = {
+                "gemini-3.1-flash-lite": 0,
+                "gemini-3.5-flash": 1,
+                "gemini-3.1-pro": 2,
+            }
+            target_index = index_map.get(model_name.strip().lower())
+            
+            if target_index is not None and item_count > target_index:
+                item = items.nth(target_index)
+                text_fallback = await item.inner_text()
+                await item.click()
+                print(f"[Worker {self.worker_id}] ⚠️ Model text matching failed for {model_name}. Fell back to index {target_index} ({text_fallback.strip()})")
+                
+                # Send a non-fatal Discord warning notification about the wording change
+                try:
+                    await notify_error(
+                        error=f"Model name/description changed: text matching failed for '{model_name}'. Fell back to index {target_index} ('{text_fallback.strip()}').",
+                        selector_key="model_btn",
+                        action="matches_model_fallback",
+                        worker_id=self.worker_id,
+                        diagnostics={
+                            "requested_model": model_name,
+                            "fallback_index": target_index,
+                            "fallback_text": text_fallback,
+                            "total_items": item_count
+                        }
+                    )
+                except Exception as ne:
+                    log(f"Failed to send model name change notification: {ne}", f"Worker {self.worker_id}")
+                
+                await self._human_delay(300, 600)
+                return
+
+            # If not found at all, close menu
             await self.page.keyboard.press("Escape")
             await self._human_delay(100, 300)
         except Exception as e:
@@ -3219,6 +3257,17 @@ class GeminiWebAutomation(BaseAutomation):
         except Exception as e:
             log(f"Thinking level selection failed: {e}", f"Worker {self.worker_id}")
             self._track_error(str(e), "thinking_level", "set_thinking_level")
+            # Send immediate Discord alert for thinking level failure
+            try:
+                await notify_error(
+                    error=f"Thinking level selection failed: {e}",
+                    selector_key="thinking_level",
+                    action="set_thinking_level",
+                    worker_id=self.worker_id,
+                    diagnostics={"requested_level": level, "target_text": target_text}
+                )
+            except Exception as ne:
+                log(f"Failed to send thinking level failure notification: {ne}", f"Worker {self.worker_id}")
 
     async def _paste_image(self, image_path: str):
         """Paste an image via clipboard into Gemini Web."""
