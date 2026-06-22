@@ -3141,6 +3141,16 @@ class GeminiWebAutomation(BaseAutomation):
             model_selector = await self._resolve_selector("model_btn", require_visible=True, timeout_ms=1500)
             if not model_selector:
                 self._track_error("Model picker not found", "model_btn", "select_model")
+                try:
+                    await notify_error(
+                        error=f"Model picker button not found: selector 'model_btn' failed for requested model '{model_name}'.",
+                        selector_key="model_btn",
+                        action="select_model_missing_picker",
+                        worker_id=self.worker_id,
+                        diagnostics={"requested_model": model_name}
+                    )
+                except Exception as ne:
+                    log(f"Failed to send model picker missing notification: {ne}", f"Worker {self.worker_id}")
                 return
 
             btn = self.page.locator(model_selector)
@@ -3167,6 +3177,18 @@ class GeminiWebAutomation(BaseAutomation):
             menu_item_selector = await self._resolve_selector("menu_item")
             if not menu_item_selector:
                 self._track_error("Model menu item selector missing", "menu_item", "select_model")
+                try:
+                    await notify_error(
+                        error=f"Model menu item selector missing: selector 'menu_item' failed for requested model '{model_name}'.",
+                        selector_key="menu_item",
+                        action="select_model_missing_menu_item",
+                        worker_id=self.worker_id,
+                        diagnostics={"requested_model": model_name}
+                    )
+                except Exception as ne:
+                    log(f"Failed to send model menu item missing notification: {ne}", f"Worker {self.worker_id}")
+                # Close the picker
+                await self.page.keyboard.press("Escape")
                 return
 
             items = self.page.locator(menu_item_selector)
@@ -3219,9 +3241,42 @@ class GeminiWebAutomation(BaseAutomation):
             # If not found at all, close menu
             await self.page.keyboard.press("Escape")
             await self._human_delay(100, 300)
+            
+            # Since both text-based matching and index-based fallback failed, this is a big structural change!
+            # Notify the user on Discord immediately, but do NOT crash/throw. Just print/log and proceed.
+            try:
+                await notify_error(
+                    error=f"CRITICAL MODEL CHANGE: Could not find or select model '{model_name}'. Wording matching failed and index fallback failed (total menu items: {item_count}). Proceeding with current/default model.",
+                    selector_key="model_btn",
+                    action="select_model_failed_completely",
+                    worker_id=self.worker_id,
+                    diagnostics={
+                        "requested_model": model_name,
+                        "menu_item_count": item_count,
+                    }
+                )
+            except Exception as ne:
+                log(f"Failed to send critical model selection failure notification: {ne}", f"Worker {self.worker_id}")
+
         except Exception as e:
             print(f"[Worker {self.worker_id}] ⚠️ Model selection failed: {e}")
             self._track_error(str(e), "model_btn", "select_model")
+            try:
+                await notify_error(
+                    error=f"Model selection exception: {e}",
+                    selector_key="model_btn",
+                    action="select_model_exception",
+                    worker_id=self.worker_id,
+                    diagnostics={"requested_model": model_name, "error": str(e)}
+                )
+            except Exception as ne:
+                log(f"Failed to send model selection exception notification: {ne}", f"Worker {self.worker_id}")
+            # Ensure menu is closed
+            try:
+                await self.page.keyboard.press("Escape")
+                await self._human_delay(100, 200)
+            except:
+                pass
 
     async def _set_thinking_level(self, level: str):
         """Set Gemini Web thinking level when explicitly requested."""
@@ -3239,6 +3294,16 @@ class GeminiWebAutomation(BaseAutomation):
             model_selector = await self._resolve_selector("model_btn", require_visible=True, timeout_ms=1500)
             if not model_selector:
                 self._track_error("Model picker not found", "model_btn", "set_thinking_level")
+                try:
+                    await notify_error(
+                        error=f"Model picker button not found for thinking level: selector 'model_btn' failed for level '{level}'.",
+                        selector_key="model_btn",
+                        action="set_thinking_level_missing_picker",
+                        worker_id=self.worker_id,
+                        diagnostics={"level": level, "target_text": target_text}
+                    )
+                except Exception as ne:
+                    log(f"Failed to send thinking level picker missing notification: {ne}", f"Worker {self.worker_id}")
                 return
 
             await self.page.locator(model_selector).first.click()
@@ -3249,25 +3314,73 @@ class GeminiWebAutomation(BaseAutomation):
             await trigger.click(timeout=1500)
             await self._human_delay(300, 450)
 
+            # Try to match by text first
             option = self.page.locator(f'gem-menu-item:has-text("{target_text}")').filter(has_not_text="Thinking level").first
-            await option.wait_for(state="visible", timeout=1500)
-            await option.click(timeout=1500)
-            log(f"Selected thinking level: {target_text}", f"Worker {self.worker_id}")
-            await self._human_delay(250, 400)
+            try:
+                await option.wait_for(state="visible", timeout=1500)
+                await option.click(timeout=1500)
+                log(f"Selected thinking level: {target_text}", f"Worker {self.worker_id}")
+                await self._human_delay(250, 400)
+                return
+            except Exception as te:
+                log(f"Thinking level text match failed for '{target_text}', attempting index fallback: {te}", f"Worker {self.worker_id}")
+
+            # Index-based fallback (Standard = 0 (top), Extended = 1 (bottom))
+            submenu_pane = self.page.locator('div[role="menu"], .mat-mdc-menu-panel, [class*="menu-panel"]').last
+            submenu_items = submenu_pane.locator('gem-menu-item, [role="menuitem"]')
+            item_count = await submenu_items.count()
+            
+            target_index = 0 if target_text == "Standard" else 1
+            if item_count > target_index:
+                option = submenu_items.nth(target_index)
+                fallback_text = await option.inner_text()
+                await option.click(timeout=1500)
+                log(f"⚠️ Selected thinking level via fallback index {target_index} ({fallback_text.strip()})", f"Worker {self.worker_id}")
+                
+                # Send a non-fatal Discord warning notification about the wording change
+                try:
+                    await notify_error(
+                        error=f"Thinking level name/description changed: text matching failed for '{target_text}'. Fell back to index {target_index} ('{fallback_text.strip()}').",
+                        selector_key="thinking_level",
+                        action="set_thinking_level_fallback",
+                        worker_id=self.worker_id,
+                        diagnostics={
+                            "requested_level": level,
+                            "target_text": target_text,
+                            "fallback_index": target_index,
+                            "fallback_text": fallback_text,
+                            "total_items": item_count
+                        }
+                    )
+                except Exception as ne:
+                    log(f"Failed to send thinking level change notification: {ne}", f"Worker {self.worker_id}")
+                
+                await self._human_delay(250, 400)
+                return
+            
+            raise Exception(f"No submenu option found for thinking level {target_text} (count={item_count})")
         except Exception as e:
             log(f"Thinking level selection failed: {e}", f"Worker {self.worker_id}")
             self._track_error(str(e), "thinking_level", "set_thinking_level")
             # Send immediate Discord alert for thinking level failure
             try:
                 await notify_error(
-                    error=f"Thinking level selection failed: {e}",
+                    error=f"CRITICAL THINKING LEVEL CHANGE: Could not select thinking level '{target_text}'. Wording matching failed and index fallback failed (total menu items: {item_count if 'item_count' in locals() else 'unknown'}). Proceeding with default/current thinking level.",
                     selector_key="thinking_level",
-                    action="set_thinking_level",
+                    action="set_thinking_level_failed_completely",
                     worker_id=self.worker_id,
-                    diagnostics={"requested_level": level, "target_text": target_text}
+                    diagnostics={"requested_level": level, "target_text": target_text, "error": str(e)}
                 )
             except Exception as ne:
                 log(f"Failed to send thinking level failure notification: {ne}", f"Worker {self.worker_id}")
+            # Ensure menu is closed
+            try:
+                await self.page.keyboard.press("Escape")
+                await self._human_delay(100, 200)
+                await self.page.keyboard.press("Escape")
+                await self._human_delay(100, 200)
+            except:
+                pass
 
     async def _paste_image(self, image_path: str):
         """Paste an image via clipboard into Gemini Web."""
