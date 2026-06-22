@@ -818,6 +818,12 @@ class GeminiWebAutomation(BaseAutomation):
         self._browser_zoom_reset = False
         self._current_prompt_tokens_est: int = 0  # Set per-request for stall scaling
         self._request_log_lines: List[str] = []   # Per-request log buffer for error reports
+        self._current_selected_model: Optional[str] = None
+        self._current_selected_thinking_level: Optional[str] = None
+
+    def _reset_model_tracking(self):
+        self._current_selected_model = None
+        self._current_selected_thinking_level = None
 
     async def _reset_browser_zoom(self, force: bool = False):
         try:
@@ -2239,6 +2245,7 @@ class GeminiWebAutomation(BaseAutomation):
     async def init_with_page(self, page: Page, context: BrowserContext) -> bool:
         self.page = page
         self.context = context
+        self._reset_model_tracking()
         try:
             for attempt in range(2):
                 snapshot = await self._capture_state_snapshot()
@@ -2386,6 +2393,7 @@ class GeminiWebAutomation(BaseAutomation):
             if self._request_count >= self.REFRESH_EVERY_N_REQUESTS:
                 log(f"Hard refresh (request #{self._request_count})", f"Worker {self.worker_id}")
                 await self.page.reload(wait_until="domcontentloaded", timeout=30000)
+                self._reset_model_tracking()
                 await self._human_delay(1000, 1500)
                 self._request_count = 0
             
@@ -2397,9 +2405,13 @@ class GeminiWebAutomation(BaseAutomation):
 
             # 2. Select Model
             if model:
-                await self._select_model(model)
+                if self._current_selected_model != model:
+                    await self._select_model(model)
+                    self._current_selected_model = model
             if thinking_level:
-                await self._set_thinking_level(thinking_level)
+                if self._current_selected_thinking_level != thinking_level:
+                    await self._set_thinking_level(thinking_level)
+                    self._current_selected_thinking_level = thinking_level
 
             # 3. Enter Prompt
             input_selector = await self._resolve_selector("input", require_visible=True, timeout_ms=2000)
