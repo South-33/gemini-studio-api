@@ -1296,18 +1296,44 @@ class GeminiWebAutomation(BaseAutomation):
         mapping = {
             "gemini-3.1-flash-lite": 'gem-menu-item[data-test-id="bard-mode-option-cf41b0e0dd7d53e5"]',
             "3.1-flash-lite": 'gem-menu-item[data-test-id="bard-mode-option-cf41b0e0dd7d53e5"]',
-            "fast": 'gem-menu-item[data-test-id="bard-mode-option-cf41b0e0dd7d53e5"]',
             
             "gemini-3.5-flash": 'gem-menu-item[data-test-id="bard-mode-option-fbb127bbb056c959"]',
             "3.5-flash": 'gem-menu-item[data-test-id="bard-mode-option-fbb127bbb056c959"]',
-            "flash": 'gem-menu-item[data-test-id="bard-mode-option-fbb127bbb056c959"]',
-            "thinking": 'gem-menu-item[data-test-id="bard-mode-option-fbb127bbb056c959"]',
             
             "gemini-3.1-pro": 'gem-menu-item[data-test-id="bard-mode-option-9d8ca3786ebdfbea"]',
             "3.1-pro": 'gem-menu-item[data-test-id="bard-mode-option-9d8ca3786ebdfbea"]',
-            "pro": 'gem-menu-item[data-test-id="bard-mode-option-9d8ca3786ebdfbea"]',
         }
         return mapping.get((model_name or "").strip().lower())
+
+    async def _get_current_ui_model_and_thinking(self) -> Tuple[Optional[str], Optional[str]]:
+        """Read the model button text to detect currently active model and thinking level in the UI."""
+        try:
+            model_selector = await self._resolve_selector("model_btn", require_visible=True, timeout_ms=1500)
+            if not model_selector:
+                return None, None
+            
+            btn = self.page.locator(model_selector).first
+            text = (await btn.inner_text()).strip().lower()
+            if not text:
+                return None, None
+
+            # Detect thinking level
+            ui_thinking = "Extended" if "extended" in text else "Standard"
+
+            # Detect model
+            if "lite" in text:
+                ui_model = "gemini-3.1-flash-lite"
+            elif "pro" in text:
+                ui_model = "gemini-3.1-pro"
+            elif "flash" in text:
+                ui_model = "gemini-3.5-flash"
+            else:
+                ui_model = None
+
+            return ui_model, ui_thinking
+        except Exception as e:
+            print(f"[Worker {self.worker_id}] Failed to read current model/thinking level from button: {e}")
+            return None, None
 
     @staticmethod
     def _estimate_tokens(text: str) -> int:
@@ -2403,15 +2429,31 @@ class GeminiWebAutomation(BaseAutomation):
 
             await self._human_delay()
 
-            # 2. Select Model
-            if model:
-                if self._current_selected_model != model:
+            # 2. Select Model and Thinking Level
+            if model or thinking_level:
+                # First check the current active UI configuration
+                ui_model, ui_thinking = await self._get_current_ui_model_and_thinking()
+                
+                # Update tracked state from what is currently on the screen
+                if ui_model:
+                    self._current_selected_model = ui_model
+                if ui_thinking:
+                    self._current_selected_thinking_level = ui_thinking
+
+                # Select model if it differs
+                if model and self._current_selected_model != model:
                     await self._select_model(model)
                     self._current_selected_model = model
-            if thinking_level:
-                if self._current_selected_thinking_level != thinking_level:
-                    await self._set_thinking_level(thinking_level)
-                    self._current_selected_thinking_level = thinking_level
+                    # Re-read UI state since selecting a model changes the layout / resets defaults
+                    ui_model, ui_thinking = await self._get_current_ui_model_and_thinking()
+                    if ui_thinking:
+                        self._current_selected_thinking_level = ui_thinking
+
+                # Select thinking level if it differs
+                target_thinking = thinking_level or "Standard"
+                if target_thinking and self._current_selected_thinking_level != target_thinking:
+                    await self._set_thinking_level(target_thinking)
+                    self._current_selected_thinking_level = target_thinking
 
             # 3. Enter Prompt
             input_selector = await self._resolve_selector("input", require_visible=True, timeout_ms=2000)
