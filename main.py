@@ -108,34 +108,47 @@ class OpenAIChatRequest(BaseModel):
 
 def parse_model_and_thinking(model_name: str) -> tuple:
     """
-    Parse thinking level from model name suffix.
-    Returns (model_for_provider, thinking_level)
+    Parse model and thinking level from model name.
+    Supported model formats:
+    - gemini-3.1-flash-lite, 3.1-flash-lite, flash-lite, fast
+    - gemini-3.5-flash, 3.5-flash, flash
+    - gemini-3.1-pro, 3.1-pro, pro
+    - thinking (alias for gemini-3.5-flash with Extended thinking)
     
-    Gemini Web models: thinking, pro, fast, flash
-    AI Studio models: gemini-3-flash-preview, gemini-3-pro-preview, etc.
+    Suffixes supported:
+    - -extended, -standard, -high, -medium, -low, -minimal
     """
-    model_lower = model_name.lower()
+    model_lower = model_name.lower().strip()
     
-    # Check for explicit suffixes like model-high, model-medium, etc.
-    thinking_levels = ["minimal", "low", "medium", "high"]
-    for level in thinking_levels:
-        if model_lower.endswith(f"-{level}"):
-            base = model_name[:-(len(level) + 1)]
-            if base.lower() == "thinking":
-                return "Flash", level.capitalize()
-            return base, level.capitalize()
-            
-    # Default mappings if no explicit suffix is provided
-    if model_lower == "thinking":
-        return "Flash", "Extended"
-    elif model_lower == "flash":
-        return "Flash", "Standard"
-    elif model_lower == "fast":
-        return "Fast", None
-    elif model_lower == "pro":
-        return "Pro", None
+    # 1. Parse thinking level suffix first
+    thinking_level = None
+    thinking_suffixes = ["extended", "standard", "high", "medium", "low", "minimal"]
+    for suffix in thinking_suffixes:
+        if model_lower.endswith(f"-{suffix}"):
+            thinking_level = suffix.capitalize()
+            model_lower = model_lower[:-(len(suffix) + 1)].strip()
+            break
+        elif model_lower.endswith(f":{suffix}"):
+            thinking_level = suffix.capitalize()
+            model_lower = model_lower[:-(len(suffix) + 1)].strip()
+            break
+
+    # 2. Map normalized model names to standard Web UI slugs
+    if model_lower in {"gemini-3.1-flash-lite", "3.1-flash-lite"}:
+        base_model = "gemini-3.1-flash-lite"
+    elif model_lower in {"gemini-3.5-flash", "3.5-flash"}:
+        base_model = "gemini-3.5-flash"
+    elif model_lower in {"gemini-3.1-pro", "3.1-pro"}:
+        base_model = "gemini-3.1-pro"
+    else:
+        # Fallback or unknown model
+        base_model = model_name
         
-    return model_name, None
+    # Default thinking level for all models is Standard if not explicitly specified
+    if not thinking_level:
+        thinking_level = "Standard"
+        
+    return base_model, thinking_level
 
 
 def extract_request_source(request: Request, body: Dict) -> Dict[str, str]:
@@ -299,10 +312,9 @@ async def list_models():
     """List available Gemini Web models."""
     return {
         "data": [
-            {"id": "fast", "object": "model", "provider": "gemini-web"},
-            {"id": "flash", "object": "model", "provider": "gemini-web"},
-            {"id": "thinking", "object": "model", "provider": "gemini-web"},
-            {"id": "pro", "object": "model", "provider": "gemini-web"},
+            {"id": "gemini-3.1-flash-lite", "object": "model", "provider": "gemini-web"},
+            {"id": "gemini-3.5-flash", "object": "model", "provider": "gemini-web"},
+            {"id": "gemini-3.1-pro", "object": "model", "provider": "gemini-web"},
         ]
     }
 

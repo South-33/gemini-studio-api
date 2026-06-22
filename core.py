@@ -1261,33 +1261,44 @@ class GeminiWebAutomation(BaseAutomation):
         if not item_text or not model_name:
             return False
 
-        import re
+        item_lower = item_text.lower()
+        model_lower = model_name.strip().lower()
 
-        tokens = re.findall(r"[a-z0-9]+", item_text.lower())
-        target = model_name.strip().lower()
-        if target in tokens:
+        # Check exact substrings first
+        if model_lower in item_lower:
             return True
 
-        aliases = {
-            "fast": ["flash", "lite"],
-            "flash": ["flash"],
-            "thinking": ["flash"],
-            "pro": ["pro", "advanced"],
-        }
-        if target == "fast":
-            return "flash" in tokens and "lite" in tokens
-        if target in {"flash", "thinking"}:
-            return "flash" in tokens and "lite" not in tokens
-        for alias in aliases.get(target, [target]):
-            if alias in tokens:
-                return True
-        return False
+        # Group equivalents
+        import re
+        tokens = set(re.findall(r"[a-z0-9]+", item_lower))
+        
+        # Define clean aliases/mapping for validation
+        if model_lower in {"gemini-3.1-flash-lite", "3.1-flash-lite", "flash-lite", "fast", "lite"}:
+            return "3" in tokens and "1" in tokens and "flash" in tokens and "lite" in tokens
+        
+        if model_lower in {"gemini-3.5-flash", "3.5-flash", "flash", "thinking"}:
+            return "3" in tokens and "5" in tokens and "flash" in tokens
+            
+        if model_lower in {"gemini-3.1-pro", "3.1-pro", "pro"}:
+            return "3" in tokens and "1" in tokens and "pro" in tokens
+
+        # Generic token-based fallback
+        model_tokens = re.findall(r"[a-z0-9]+", model_lower)
+        return all(t in tokens for t in model_tokens if t not in {"gemini"})
 
     def _model_target_selector(self, model_name: str) -> Optional[str]:
         mapping = {
+            "gemini-3.1-flash-lite": 'gem-menu-item[data-test-id="bard-mode-option-cf41b0e0dd7d53e5"]',
+            "3.1-flash-lite": 'gem-menu-item[data-test-id="bard-mode-option-cf41b0e0dd7d53e5"]',
             "fast": 'gem-menu-item[data-test-id="bard-mode-option-cf41b0e0dd7d53e5"]',
+            
+            "gemini-3.5-flash": 'gem-menu-item[data-test-id="bard-mode-option-fbb127bbb056c959"]',
+            "3.5-flash": 'gem-menu-item[data-test-id="bard-mode-option-fbb127bbb056c959"]',
             "flash": 'gem-menu-item[data-test-id="bard-mode-option-fbb127bbb056c959"]',
             "thinking": 'gem-menu-item[data-test-id="bard-mode-option-fbb127bbb056c959"]',
+            
+            "gemini-3.1-pro": 'gem-menu-item[data-test-id="bard-mode-option-9d8ca3786ebdfbea"]',
+            "3.1-pro": 'gem-menu-item[data-test-id="bard-mode-option-9d8ca3786ebdfbea"]',
             "pro": 'gem-menu-item[data-test-id="bard-mode-option-9d8ca3786ebdfbea"]',
         }
         return mapping.get((model_name or "").strip().lower())
@@ -2298,7 +2309,7 @@ class GeminiWebAutomation(BaseAutomation):
         self._last_request_success = False
 
         try:
-            self._thinking_requested = bool(thinking_level)
+            self._thinking_requested = bool(thinking_level and thinking_level.lower() in {"extended", "high", "deep"})
             self._generation_in_progress = True
             self._request_count += 1
             self._request_id = (request_id or "").strip() or uuid.uuid4().hex[:8]

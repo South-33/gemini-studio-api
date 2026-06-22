@@ -1,9 +1,9 @@
 # Gemini Studio API
 
-A lightweight API that automates Gemini Web to provide OpenAI-compatible endpoints. Use Gemini's thinking, pro, flash, or fast models directly from Roo Code, Cline, or any OpenAI-compatible tool.
+A lightweight API that automates Gemini Web to provide OpenAI-compatible endpoints. Use Gemini's actual Web UI models (3.5 Flash, 3.1 Pro, 3.1 Flash-Lite) directly from Roo Code, Cline, or any OpenAI-compatible tool.
 
 - **OpenAI Compatible** - Works with Roo Code, Cline, Continue, etc.
-- **Simplified Models** - Use `thinking`, `pro`, `flash`, or `fast`
+- **Web-Aligned Models** - Use exact actual web UI model slugs (e.g. `gemini-3.5-flash`, `gemini-3.1-pro`, `gemini-3.1-flash-lite`) or legacy simplified aliases (`thinking`, `pro`, `flash`, `fast`).
 - **Image Upload** - Send images via OpenAI Vision API format
 - **Session Persistence** - Login once via Chrome, stays authenticated forever
 - **ngrok Tunnel** - Expose your local API to the internet with a static domain
@@ -62,18 +62,35 @@ ngrok http 8000 --domain=your-subdomain.ngrok-free.app
 | **Provider** | OpenAI Compatible |
 | **Base URL** | `https://your-subdomain.ngrok-free.app/v1` |
 | **API Key** | `anything` (ignored) |
-| **Model** | `thinking`, `pro`, `flash`, or `fast` |
+| **Model** | `gemini-3.5-flash`, `gemini-3.1-pro`, `gemini-3.1-flash-lite`, `thinking`, `pro`, `flash`, or `fast` |
 
 ---
 
 ## Available Models
 
-| Model | Description |
-|-------|-------------|
-| `fast` | Gemini 3.1 Flash-Lite |
-| `flash` | Gemini 3.5 Flash |
-| `thinking` | Legacy alias for Gemini 3.5 Flash |
-| `pro` | Gemini 3.1 Pro |
+The API directly supports the models and settings present in the Gemini Web UI. You can specify them using their slugified names.
+
+### Web UI Models
+
+| Model ID | Web UI Name | Default Thinking Level | Supported Suffixes |
+|----------|-------------|------------------------|--------------------|
+| `gemini-3.5-flash` | **3.5 Flash** | `Standard` | `-extended`, `-standard`, `-high`, `-medium`, `-low`, `-minimal` |
+| `gemini-3.1-pro` | **3.1 Pro** | *N/A* | *None* |
+| `gemini-3.1-flash-lite` | **3.1 Flash-Lite** | *N/A* | *None* |
+
+### Legacy & Simplified Aliases (Supported for Backwards Compatibility)
+
+| Alias | Resolves To Model | Default Thinking Level |
+|-------|-------------------|------------------------|
+| `thinking` | `gemini-3.5-flash` | `Extended` |
+| `flash` | `gemini-3.5-flash` | `Standard` |
+| `pro` | `gemini-3.1-pro` | *N/A* |
+| `fast` | `gemini-3.1-flash-lite` | *N/A* |
+
+### Controlling Thinking Levels
+Only the **3.5 Flash** model supports thinking level configuration. You can select a thinking level by appending a suffix or infix to the model name:
+* **Extended Thinking**: `gemini-3.5-flash-extended` (or suffixing `-high`, `-extended`, `:extended`). This will enable the detailed reasoning view in the Web UI.
+* **Standard Thinking**: `gemini-3.5-flash-standard` (or suffixing `-standard`, `:standard`). This runs in the normal fast-answer mode.
 
 ---
 
@@ -139,7 +156,7 @@ curl -X POST http://localhost:8000/v1/chat/completions \
   -H "X-Client-Name: backend-api" \
   -H "X-Request-ID: req-12345" \
   -d '{
-    "model": "thinking",
+    "model": "gemini-3.5-flash-extended",
     "messages": [
       {"role": "user", "content": "Hello, how are you?"}
     ]
@@ -161,7 +178,7 @@ client = OpenAI(
 )
 
 response = client.chat.completions.create(
-    model="thinking",
+    model="gemini-3.5-flash",
     messages=[{"role": "user", "content": "Write a poem about coding"}]
 )
 print(response.choices[0].message.content)
@@ -194,7 +211,7 @@ with open("image.png", "rb") as f:
     image_b64 = base64.b64encode(f.read()).decode()
 
 response = client.chat.completions.create(
-    model="thinking",
+    model="gemini-3.5-flash",
     messages=[{
         "role": "user",
         "content": [

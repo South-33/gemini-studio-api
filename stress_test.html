@@ -257,9 +257,16 @@
         <div class="config-item">
             <label>Model</label>
             <select id="model">
-                <option value="fast">Fast</option>
-                <option value="thinking" selected>Thinking</option>
-                <option value="pro">Pro</option>
+                <option value="gemini-3.5-flash" selected>3.5 Flash</option>
+                <option value="gemini-3.1-pro">3.1 Pro</option>
+                <option value="gemini-3.1-flash-lite">3.1 Flash-Lite</option>
+            </select>
+        </div>
+        <div class="config-item">
+            <label>Thinking Level</label>
+            <select id="thinking-level">
+                <option value="Standard" selected>Standard</option>
+                <option value="Extended">Extended</option>
             </select>
         </div>
         <div class="config-item">
@@ -320,6 +327,7 @@
             const apiUrl = document.getElementById('api-url').value.trim();
             const count = parseInt(document.getElementById('request-count').value);
             const model = document.getElementById('model').value;
+            const thinkingLevel = document.getElementById('thinking-level').value;
             const promptSize = document.getElementById('prompt-size').value;
             const runBtn = document.getElementById('run-btn');
 
@@ -371,7 +379,7 @@
             });
 
             // Fire all requests in PARALLEL
-            const requests = prompts.map(p => sendRequest(apiUrl, model, p));
+            const requests = prompts.map(p => sendRequest(apiUrl, model, thinkingLevel, p));
             await Promise.all(requests);
 
             // Calculate summary
@@ -398,7 +406,7 @@
             runBtn.textContent = '🚀 Run Stress Test';
         }
 
-        async function sendRequest(apiUrl, model, promptData) {
+        async function sendRequest(apiUrl, model, thinkingLevel, promptData) {
             const card = document.getElementById(`result-${promptData.id}`);
             const statusSpan = card.querySelector('.result-status');
             const contentDiv = card.querySelector('.result-content');
@@ -412,7 +420,8 @@
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         model: model,
-                        messages: [{ role: 'user', content: promptData.prompt }]
+                        messages: [{ role: 'user', content: promptData.prompt }],
+                        thinking_level: thinkingLevel
                     })
                 });
 

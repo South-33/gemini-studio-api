@@ -399,13 +399,13 @@
             <label>Model</label>
             <select id="model-select">
                 <optgroup label="Gemini Web">
-                    <option value="thinking">Gemini Thinking (2.0)</option>
-                    <option value="pro">Gemini Pro</option>
-                    <option value="fast">Gemini Fast</option>
+                    <option value="gemini-3.5-flash" selected>Gemini 3.5 Flash</option>
+                    <option value="gemini-3.1-pro">Gemini 3.1 Pro</option>
+                    <option value="gemini-3.1-flash-lite">Gemini 3.1 Flash-Lite</option>
                 </optgroup>
                 <optgroup label="AI Studio">
                     <option value="gemini-3-pro-preview">Gemini 3.0 Pro</option>
-                    <option value="gemini-3-flash-preview" selected>Gemini 3.0 Flash</option>
+                    <option value="gemini-3-flash-preview">Gemini 3.0 Flash</option>
                     <option value="gemini-2.5-flash">2.5 Flash</option>
                 </optgroup>
             </select>
@@ -414,10 +414,8 @@
         <div class="config-group">
             <label>Thinking Level</label>
             <select id="thinking-select">
-                <option value="Minimal">Minimal</option>
-                <option value="Low">Low</option>
-                <option value="Medium">Medium</option>
-                <option value="High" selected>High</option>
+                <option value="Standard" selected>Standard</option>
+                <option value="Extended">Extended</option>
             </select>
         </div>
 
