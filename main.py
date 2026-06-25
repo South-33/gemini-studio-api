@@ -109,17 +109,22 @@ class OpenAIChatRequest(BaseModel):
 def parse_model_and_thinking(model_name: str) -> tuple:
     """
     Parse model and thinking level from model name.
-    Supported model formats:
-    - gemini-3.1-flash-lite, 3.1-flash-lite, flash-lite, fast
-    - gemini-3.5-flash, 3.5-flash, flash
-    - gemini-3.1-pro, 3.1-pro, pro
-    - thinking (alias for gemini-3.5-flash with Extended thinking)
-    
-    Suffixes supported:
-    - -extended, -standard, -high, -medium, -low, -minimal
+    Canonical model IDs (preferred):
+    - gemini-3.1-flash-lite
+    - gemini-3.5-flash
+    - gemini-3.1-pro
+
+    Thinking suffixes: -extended, :extended, -standard, -high, -medium, -low, -minimal
+
+    Legacy aliases (deprecated, still supported):
+    - fast / lite / flash-lite  → gemini-3.1-flash-lite
+    - flash                     → gemini-3.5-flash
+    - thinking                  → gemini-3.5-flash + Extended
+    - pro                       → gemini-3.1-pro
     """
     model_lower = model_name.lower().strip()
-    
+    legacy_alias: Optional[str] = None  # Track for deprecation warning
+
     # 1. Parse thinking level suffix first
     thinking_level = None
     thinking_suffixes = ["extended", "standard", "high", "medium", "low", "minimal"]
@@ -133,21 +138,43 @@ def parse_model_and_thinking(model_name: str) -> tuple:
             model_lower = model_lower[:-(len(suffix) + 1)].strip()
             break
 
-    # 2. Map normalized model names to standard Web UI slugs
+    # 2. Map to canonical Web UI model slugs
     if model_lower in {"gemini-3.1-flash-lite", "3.1-flash-lite"}:
         base_model = "gemini-3.1-flash-lite"
     elif model_lower in {"gemini-3.5-flash", "3.5-flash"}:
         base_model = "gemini-3.5-flash"
     elif model_lower in {"gemini-3.1-pro", "3.1-pro"}:
         base_model = "gemini-3.1-pro"
+    # --- Legacy aliases (log deprecation warning) ---
+    elif model_lower in {"fast", "lite", "flash-lite"}:
+        base_model = "gemini-3.1-flash-lite"
+        legacy_alias = model_lower
+    elif model_lower == "flash":
+        base_model = "gemini-3.5-flash"
+        legacy_alias = model_lower
+    elif model_lower == "thinking":
+        base_model = "gemini-3.5-flash"
+        if not thinking_level:
+            thinking_level = "Extended"
+        legacy_alias = model_lower
+    elif model_lower == "pro":
+        base_model = "gemini-3.1-pro"
+        legacy_alias = model_lower
     else:
-        # Fallback or unknown model
-        base_model = model_name
-        
-    # Default thinking level for all models is Standard if not explicitly specified
+        base_model = model_name  # Unknown — pass through, let worker handle it
+
+    if legacy_alias:
+        log(
+            f"DEPRECATED model alias '{legacy_alias}' → '{base_model}' "
+            f"(thinking={thinking_level or 'Standard'}). "
+            f"Update client to use the canonical model ID.",
+            "API",
+        )
+
+    # Default thinking level to Standard if not specified
     if not thinking_level:
         thinking_level = "Standard"
-        
+
     return base_model, thinking_level
 
 
@@ -197,17 +224,31 @@ ERROR_LOG_DIR = pathlib.Path(__file__).parent / "logs" / "errors"
 ERROR_LOG_MAX_FILES = 200
 
 
+def _classify_error(error_str: str) -> str:
+    """Return a short error class label for the failure summary header."""
+    text = (error_str or "").lower()
+    if any(k in text for k in ("target page", "page has been closed", "browser has been closed",
+                               "context has been closed", "target closed")):
+        return "DEAD_PAGE"
+    if any(k in text for k in ("err_name_not_resolved", "err_internet_disconnected",
+                               "getaddrinfo failed", "network outage",
+                               "err_network_changed", "err_address_unreachable")):
+        return "NETWORK_OUTAGE"
+    if any(k in text for k in ("stalled generation", "unsent stuck", "copy timeout",
+                               "clipboard extraction failed", "waiting for response")):
+        return "STALL"
+    if any(k in text for k in ("selector", "timeout", "locator", "element", "not found",
+                               "not visible")):
+        return "SELECTOR"
+    return "UNKNOWN"
+
+
 def write_error_transaction_log(
     trace: Dict,
     result: Dict,
     recent_req_snapshot: List[Dict],
 ) -> None:
-    """Write a self-contained error report for a failed request to disk.
-
-    Each file captures:
-    - Request metadata (model, prompt size, source, timestamps)
-    - Per-attempt worker log lines from all retry attempts
-    - The last few recent requests for context (did subsequent requests succeed?)
+    """Write a structured error report for a failed request to disk.
 
     Files are named:  {timestamp}_{request_id}.log
     Capped at ERROR_LOG_MAX_FILES; oldest files are deleted when the cap is hit.
@@ -232,6 +273,16 @@ def write_error_transaction_log(
         req_id = trace.get("request_id", "unknown")
         filename = ERROR_LOG_DIR / f"{ts}_{req_id}.log"
 
+        raw_error = result.get('error', 'unknown')
+        error_class = _classify_error(raw_error)
+        raw_model = trace.get('model', '')
+        resolved_model = trace.get('resolved_model', '') or raw_model
+        thinking_level = trace.get('thinking_level', '')
+        model_note = (
+            f"{resolved_model} ({thinking_level})"
+            + (f"  [raw: {raw_model}]" if raw_model != resolved_model else "")
+        )
+
         lines = []
         sep = "=" * 72
         thin = "-" * 72
@@ -243,10 +294,15 @@ def write_error_transaction_log(
         lines.append(f"Started     : {trace.get('started_at', '')}")
         lines.append(f"Finished    : {trace.get('finished_at', '')}")
         lines.append(f"Source      : project={trace.get('project','')} client={trace.get('client','')} ip={trace.get('ip','')}")
-        lines.append(f"Model       : {trace.get('model', '')}")
+        lines.append(f"Model       : {model_note}")
         lines.append(f"Prompt      : chars={trace.get('prompt_chars', 0)} tokens_est={trace.get('prompt_tokens_est', 0)} images={trace.get('image_count', 0)}")
-        lines.append(f"Error       : {result.get('error', 'unknown')}")
         lines.append("")
+        lines.append(thin)
+        lines.append("FAILURE SUMMARY")
+        lines.append(thin)
+        lines.append(f"  Class  : {error_class}")
+        lines.append(f"  Error  : {raw_error[:300]}")
+        lines.append(sep)
 
         # Prompt preview (first 3000 chars) — enough to identify what failed
         prompt_preview = trace.get("prompt_preview", "")
@@ -333,7 +389,9 @@ async def openai_chat(request: Request):
         "project": source["project"],
         "client": source["client"],
         "ip": source["ip"],
-        "model": body.get("model", ""),
+        "model": body.get("model", ""),       # Raw value from client
+        "resolved_model": "",                  # Set after parse_model_and_thinking
+        "thinking_level": "",                  # Set after parse_model_and_thinking
         "status": "started",
         "started_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -350,8 +408,12 @@ async def openai_chat(request: Request):
     if thinking_level_explicit:
         thinking_level = thinking_level_explicit
 
+    # Record resolved model in trace (raw model already stored above)
+    trace["resolved_model"] = base_model
+    trace["thinking_level"] = thinking_level
+
     log(f"[{trace_id}] Source: project={source['project']} client={source['client']} ip={source['ip']}", "API")
-    log(f"Model: {base_model} | Thinking: {thinking_level} | Messages: {len(messages)}", "API")
+    log(f"Model: {base_model} | Thinking: {thinking_level} | Messages: {len(messages)} | Raw: {model}", "API")
 
     # Combine messages and extract images
     prompt = ""

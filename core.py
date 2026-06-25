@@ -3544,6 +3544,23 @@ class WorkerPool:
         return False
 
     @staticmethod
+    def _is_dead_page_error(error: str) -> bool:
+        """True when the Playwright page/context/browser has been destroyed.
+        These errors are unrecoverable on the current worker — recreation is the only fix.
+        """
+        text = (error or "").strip().lower()
+        if not text:
+            return False
+        keywords = (
+            "target page, context or browser has been closed",
+            "page has been closed",
+            "browser has been closed",
+            "context has been closed",
+            "target closed",
+        )
+        return any(k in text for k in keywords)
+
+    @staticmethod
     def _is_stall_class_error(error: str) -> bool:
         text = (error or "").strip().lower()
         if not text:
@@ -3556,6 +3573,12 @@ class WorkerPool:
             "copy timeout",
             "waiting for response",
             "clipboard extraction failed",
+            # Dead-page errors count as stalls too (for threshold tracking)
+            "target page, context or browser has been closed",
+            "page has been closed",
+            "browser has been closed",
+            "context has been closed",
+            "target closed",
         )
         return any(k in text for k in keywords)
 
@@ -4195,13 +4218,24 @@ class WorkerPool:
                         last_error = result.get('error', 'unknown')
                         attempt_error = last_error
                         last_failure_worker_index = worker_index
-                        should_recreate_worker = self._record_worker_failure(worker_index, last_error)
+                        is_dead_page = self._is_dead_page_error(last_error)
+                        # Dead-page: force immediate recreation regardless of stall threshold.
+                        # The page is gone — retrying it is pointless and instant-fails.
+                        if is_dead_page:
+                            should_recreate_worker = True
+                            allow_same_worker_retry = False  # Don't re-use until recreated
+                            log(
+                                f"Worker {worker_index+1} dead page detected — forcing recreation. Error: {last_error}",
+                                "WorkerPool",
+                            )
+                        else:
+                            should_recreate_worker = self._record_worker_failure(worker_index, last_error)
+                            allow_same_worker_retry = not self._is_network_outage_error(last_error)
+                            log(
+                                f"Worker {worker_index+1} failed: {last_error}, retrying... (recreate={should_recreate_worker})",
+                                "WorkerPool",
+                            )
                         recreate_reason = last_error
-                        allow_same_worker_retry = not self._is_network_outage_error(last_error)
-                        log(
-                            f"Worker {worker_index+1} failed: {last_error}, retrying... (recreate={should_recreate_worker})",
-                            "WorkerPool",
-                        )
                         if self._is_network_outage_error(last_error):
                             log("Network outage detected; skipping cross-worker retry", "WorkerPool")
                             break
@@ -4210,13 +4244,22 @@ class WorkerPool:
                     last_error = str(e)
                     attempt_error = last_error
                     last_failure_worker_index = worker_index
-                    should_recreate_worker = self._record_worker_failure(worker_index, last_error)
+                    is_dead_page = self._is_dead_page_error(last_error)
+                    if is_dead_page:
+                        should_recreate_worker = True
+                        allow_same_worker_retry = False
+                        log(
+                            f"Worker {worker_index+1} dead page exception — forcing recreation. Error: {e}",
+                            "WorkerPool",
+                        )
+                    else:
+                        should_recreate_worker = self._record_worker_failure(worker_index, last_error)
+                        allow_same_worker_retry = not self._is_network_outage_error(last_error)
+                        log(
+                            f"Worker {worker_index+1} exception: {e}, retrying... (recreate={should_recreate_worker})",
+                            "WorkerPool",
+                        )
                     recreate_reason = last_error
-                    allow_same_worker_retry = not self._is_network_outage_error(last_error)
-                    log(
-                        f"Worker {worker_index+1} exception: {e}, retrying... (recreate={should_recreate_worker})",
-                        "WorkerPool",
-                    )
                     if self._is_network_outage_error(last_error):
                         log("Network outage detected; skipping cross-worker retry", "WorkerPool")
                         break
