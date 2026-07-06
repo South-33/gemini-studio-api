@@ -54,6 +54,8 @@ STALL_NO_PROGRESS_SECONDS_WITH_ACTIVITY = 180
 STALL_SMALL_LEN_THRESHOLD = 200
 STALL_THINKING_NO_PROGRESS_SECONDS = 30
 STALL_THINKING_NO_PROGRESS_SECONDS_WITH_ACTIVITY = 45
+STALL_STATIC_THINKING_SECONDS = 180
+STALL_STATIC_THINKING_SECONDS_WITH_ACTIVITY = 300
 FINALIZE_STABLE_RESPONSE_SECONDS = 45
 FINALIZE_STABLE_RESPONSE_LEN = 800
 RECENT_NETWORK_ACTIVITY_SECONDS = 75
@@ -79,6 +81,7 @@ def _read_headed_page_zoom() -> float:
 
 
 HEADED_PAGE_ZOOM = _read_headed_page_zoom()
+HEADED_KEEP_FROZEN_STALL_PAGES = os.getenv("HEADED_KEEP_FROZEN_STALL_PAGES", "false").lower() == "true"
 
 class BaseAutomation:
     """Base class for browser-based AI automation."""
@@ -1065,6 +1068,20 @@ class GeminiWebAutomation(BaseAutomation):
             diag_dir = pathlib.Path(__file__).parent / "logs" / "errors"
             diag_dir.mkdir(parents=True, exist_ok=True)
 
+            snapshot = await self._capture_state_snapshot()
+            has_useful_final_state = any([
+                bool(snapshot.get("stop_visible")),
+                bool(snapshot.get("send_visible")),
+                int(snapshot.get("input_text_len") or 0) > 0,
+                int(snapshot.get("user_query_count") or 0) > 0,
+                int(snapshot.get("response_count") or 0) > 0,
+                bool(snapshot.get("error_page_500")),
+                bool(snapshot.get("network_outage")),
+            ])
+            if str(reason) == "failed" and not has_useful_final_state:
+                log("Skipped empty final diagnostic capture after recovery/refresh", f"Worker {self.worker_id}")
+                return
+
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             req_id = self._request_id
             w_id = self.worker_id
@@ -1131,8 +1148,17 @@ class GeminiWebAutomation(BaseAutomation):
                         }
 
                         // Stop/Send button states
-                        const stopVisible = !!(document.querySelector('button[aria-label*="Stop"]'));
-                        const sendVisible = !!(document.querySelector('button[aria-label*="Send"]'));
+                        const visibleButtons = Array.from(document.querySelectorAll('button')).filter(isVisible);
+                        const stopVisible = !!visibleButtons.find((b) => {
+                            const label = (b.getAttribute('aria-label') || '').toLowerCase();
+                            const text = (b.innerText || '').toLowerCase();
+                            return label.includes('stop') || text.includes('stop');
+                        });
+                        const sendVisible = !!visibleButtons.find((b) => {
+                            const label = (b.getAttribute('aria-label') || '').toLowerCase();
+                            const text = (b.innerText || '').toLowerCase();
+                            return label.includes('send') || text.includes('send');
+                        });
 
                         return { url, title, errors: [...new Set(errors)].slice(0, 10),
                                  responseTail, userPromptPreview, stopVisible, sendVisible };
@@ -1142,6 +1168,11 @@ class GeminiWebAutomation(BaseAutomation):
                     f"URL        : {dom_info.get('url', '')}",
                     f"Title      : {dom_info.get('title', '')}",
                     f"Stop btn   : {dom_info.get('stopVisible')}  Send btn: {dom_info.get('sendVisible')}",
+                    f"Phase      : {snapshot.get('phase')}  Visibility: {snapshot.get('visibility')}",
+                    f"Counts     : users={snapshot.get('user_query_count')} responses={snapshot.get('response_count')} copy={snapshot.get('copy_count')} response_copy={snapshot.get('response_copy_count')} input_copy={snapshot.get('input_copy_count')}",
+                    f"Input      : visible={snapshot.get('input_visible')} len={snapshot.get('input_text_len')} head={snapshot.get('input_text_head')}",
+                    f"Thinking   : visible={snapshot.get('thinking_visible')} active={snapshot.get('thinking_active')} len={snapshot.get('thinking_len')} label={snapshot.get('thinking_label')}",
+                    f"Response   : body_len={snapshot.get('response_body_len')} tail={snapshot.get('last_response_tail')}",
                     "",
                     "=== ERROR / TOAST MESSAGES ===",
                 ]
@@ -1157,6 +1188,20 @@ class GeminiWebAutomation(BaseAutomation):
                     "=== MODEL RESPONSE TAIL (last 800 chars) ===",
                     dom_info.get("responseTail") or "  (empty)",
                 ]
+                if snapshot.get("network_outage"):
+                    lines += [
+                        "",
+                        "=== NETWORK OUTAGE ===",
+                        str(snapshot.get("network_outage")),
+                    ]
+                net_events = snapshot.get("network_events") or []
+                if net_events:
+                    lines += [
+                        "",
+                        "=== NETWORK EVENTS TAIL ===",
+                    ]
+                    for evt in net_events[-8:]:
+                        lines.append(str(evt))
                 txt_path.write_text("\n".join(lines), encoding="utf-8")
                 log(f"Saved diagnostic text extract: {txt_path.name}", f"Worker {w_id}")
             except Exception as e:
@@ -1485,7 +1530,7 @@ class GeminiWebAutomation(BaseAutomation):
                     const legacyThinkingText = legacyThoughtContainer ? (legacyThoughtContainer.innerText || legacyThoughtContainer.textContent || '') : '';
 
                     // Check for new 2026 thinking overlay
-                    const thinkingOverlay = last ? last.querySelector('thinking-overlay') : document.querySelector('thinking-overlay');
+                    const thinkingOverlay = (last && last.querySelector('thinking-overlay')) || document.querySelector('thinking-overlay');
                     const newThinkingVisible = !!(thinkingOverlay && isVisible(thinkingOverlay));
                     const newThinkingActive = newThinkingVisible && !!(
                         thinkingOverlay.querySelector('thinking-dots-animation, .thinking-dots-animation, .thinking-container')
@@ -1515,7 +1560,7 @@ class GeminiWebAutomation(BaseAutomation):
                     if (responseCopyButtons.length > 0) {
                         phase = 'response_copyable_postprocessing';
                     } else if (stopBtn) {
-                        phase = thinkingActive && responseBodyLen < 120 ? 'thinking_only' : 'response_streaming';
+                        phase = thinkingVisible && responseBodyLen < 120 ? 'thinking_only' : 'response_streaming';
                     } else if (responseVisible) {
                         phase = 'response_complete_postprocessing';
                     }
@@ -2475,11 +2520,40 @@ class GeminiWebAutomation(BaseAutomation):
             await input_area.fill(prompt)
             await self._human_delay(300, 600)
 
-            # Capture button count BEFORE sending (to ensure we wait for a NEW one)
+            # Capture state BEFORE sending. These baselines drive all later
+            # "did generation start?" checks; taking them after a send attempt
+            # can make a real in-flight request look unsent.
+            pre_send_snapshot = await self._capture_state_snapshot()
             pre_send_count = await self.page.locator(copy_selector).count()
+            pre_send_resp_count = int(pre_send_snapshot.get("response_count") or 0)
+            pre_send_resp_len = int(pre_send_snapshot.get("last_response_len") or 0)
+            pre_send_resp_sig = str(pre_send_snapshot.get("last_response_signature") or "")
+            pre_send_user_query_count = int(pre_send_snapshot.get("user_query_count") or 0)
+            prompt_len = len((prompt or "").strip())
 
             # 4. Click Send - VERIFIED
             worker_id = self.worker_id  # Capture for closure
+
+            def start_signal_from_snapshot(snap: Dict[str, Any], input_text_len: Optional[int] = None) -> str:
+                stop_now = bool(snap.get("stop_visible"))
+                send_now = bool(snap.get("send_visible"))
+                resp_now = int(snap.get("response_count") or 0)
+                copy_now = int(snap.get("copy_count") or 0)
+                user_now = int(snap.get("user_query_count") or 0)
+
+                if copy_now > pre_send_count:
+                    return "copy_increased"
+                if resp_now > pre_send_resp_count:
+                    return "response_increased"
+                if user_now > pre_send_user_query_count:
+                    return "user_query_increased"
+                if stop_now and not send_now:
+                    return "stop_visible"
+                if input_text_len is not None:
+                    input_cleared = prompt_len == 0 or input_text_len < max(1, prompt_len // 2)
+                    if input_cleared and not send_now:
+                        return "input_cleared"
+                return ""
             
             async def get_input_text():
                 try:
@@ -2510,6 +2584,14 @@ class GeminiWebAutomation(BaseAutomation):
                     elif after_len < before_len / 2:
                         return True  # Input cleared = send worked
                     else:
+                        snap = await self._capture_state_snapshot()
+                        signal = start_signal_from_snapshot(snap, after_len)
+                        if signal:
+                            log(
+                                f"Send accepted despite composer retaining text (signal={signal}, input_len={after_len})",
+                                f"Worker {worker_id}",
+                            )
+                            return True
                         log(f"⚠️ Send failed: input not cleared ({after_len} chars remain)", f"Worker {worker_id}")
                         return False
                 except Exception as e:
@@ -2553,6 +2635,11 @@ class GeminiWebAutomation(BaseAutomation):
                 return False
 
             async def attempt_same_page_resend(reason: str) -> bool:
+                snap = await self._capture_state_snapshot()
+                signal = start_signal_from_snapshot(snap, int(snap.get("input_text_len") or 0))
+                if signal:
+                    log(f"Skipping resend because generation already started (reason={reason}, signal={signal})", f"Worker {self.worker_id}")
+                    return True
                 before_text = await get_input_text()
                 return await attempt_send_submission(reason, before_text)
             
@@ -2571,13 +2658,9 @@ class GeminiWebAutomation(BaseAutomation):
                 self._track_error("Send button click failed", "send_btn", "send_message", snapshot)
                 return {"success": False, "error": "Send button click failed"}
             
-            # 4.5 Verify generation started using a short observation loop
-            # This avoids false negatives for very fast responses.
-            pre_send_snap = await self._capture_state_snapshot()
-            pre_send_resp_count = int(pre_send_snap.get("response_count") or 0)
-            pre_send_resp_len = int(pre_send_snap.get("last_response_len") or 0)
-            pre_send_resp_sig = str(pre_send_snap.get("last_response_signature") or "")
-            prompt_len = len((prompt or "").strip())
+            # 4.5 Verify generation started using a short observation loop.
+            # This avoids false negatives for very fast responses and avoids
+            # resubmitting when Gemini starts thinking but leaves text in the editor.
             start_observe_seconds = 6.0
             start_poll_seconds = 0.2
             generation_started = False
@@ -2596,23 +2679,9 @@ class GeminiWebAutomation(BaseAutomation):
                         snap.update(outage_diag)
                         self._track_error(outage_error, "send_btn", "verify_generation_started", snap)
                         return {"success": False, "error": outage_error}
-                    stop_now = bool(snap.get("stop_visible"))
-                    send_now = bool(snap.get("send_visible"))
-                    resp_now = int(snap.get("response_count") or 0)
-                    copy_now = int(snap.get("copy_count") or 0)
-
                     input_now = await get_input_text()
                     input_now_len = len((input_now or "").strip())
-                    input_cleared = prompt_len == 0 or input_now_len < max(1, prompt_len // 2)
-
-                    if copy_now > pre_send_count:
-                        start_signal = "copy_increased"
-                    elif resp_now > pre_send_resp_count:
-                        start_signal = "response_increased"
-                    elif stop_now and not send_now:
-                        start_signal = "stop_visible"
-                    elif input_cleared and not send_now:
-                        start_signal = "input_cleared"
+                    start_signal = start_signal_from_snapshot(snap, input_now_len)
 
                     if start_signal:
                         break
@@ -2670,22 +2739,21 @@ class GeminiWebAutomation(BaseAutomation):
                     # Re-send the prompt
                     log(f"🔄 Retrying send after recovery", f"Worker {self.worker_id}")
                     input_selector = await self._resolve_selector("input", require_visible=True, timeout_ms=2000)
+                    recovery_send_ok = False
                     if input_selector:
                         input_area = self.page.locator(input_selector)
                         await input_area.click()
                         await self._human_delay()
                         await input_area.fill(prompt)
                         await self._human_delay(300, 600)
-                        
-                        # Click send again
-                        for selector in self._selector_candidates("send_btn"):
-                            try:
-                                send_btn = self.page.locator(selector).first
-                                if await send_btn.is_visible():
-                                    await send_btn.click()
-                                    break
-                            except:
-                                continue
+                        recovery_send_ok = await attempt_send_submission(
+                            "hard_refresh_recovery",
+                            await get_input_text(),
+                        )
+                    if not recovery_send_ok:
+                        snapshot = await self._capture_state_snapshot()
+                        self._track_error("Recovery resend failed", "send_btn", "verify_generation_started", snapshot)
+                        return {"success": False, "error": "Generation failed to start after hard refresh recovery"}
                     
                     # Wait and check if it worked
                     await self._human_delay(2000, 3000)
@@ -2721,6 +2789,8 @@ class GeminiWebAutomation(BaseAutomation):
             copy_btn = None
             last_wait_log = start_time
             last_thinking_len = -1
+            last_thinking_label = ""
+            last_thinking_label_change_at = start_time
             last_response_body_len = -1
             last_thinking_progress_at = start_time
             last_response_progress_at = start_time
@@ -2765,6 +2835,7 @@ class GeminiWebAutomation(BaseAutomation):
                     resp_sig = str(snap.get("last_response_signature") or "")
                     response_body_len = int(snap.get("response_body_len") or 0)
                     thinking_len = int(snap.get("thinking_len") or 0)
+                    thinking_label = str(snap.get("thinking_label") or "").strip()
                     response_copy_count = int(snap.get("response_copy_count") or 0)
                     input_copy_count = int(snap.get("input_copy_count") or 0)
                     phase = str(snap.get("phase") or "idle_or_unknown")
@@ -2798,6 +2869,11 @@ class GeminiWebAutomation(BaseAutomation):
 
                     if thinking_len > last_thinking_len:
                         last_thinking_len = thinking_len
+                        last_thinking_progress_at = now
+
+                    if thinking_label and thinking_label != last_thinking_label:
+                        last_thinking_label = thinking_label
+                        last_thinking_label_change_at = now
                         last_thinking_progress_at = now
 
                     if response_body_len > last_response_body_len:
@@ -2965,8 +3041,18 @@ class GeminiWebAutomation(BaseAutomation):
                         and can_track_thinking_progress
                     ):
                         if is_new_thinking:
-                            # Skip legacy thinking progress stall for the static 2026 status labels
-                            pass
+                            static_thinking_age = int(now - last_thinking_label_change_at)
+                            static_thinking_threshold = STALL_STATIC_THINKING_SECONDS
+                            if backend_activity_live:
+                                static_thinking_threshold = max(
+                                    static_thinking_threshold,
+                                    STALL_STATIC_THINKING_SECONDS_WITH_ACTIVITY,
+                                )
+                            if response_body_len == 0 and static_thinking_age >= static_thinking_threshold:
+                                stall_reason = (
+                                    f"Stalled generation: static thinking label unchanged for "
+                                    f"{static_thinking_threshold}s (label={thinking_label or '-'})"
+                                )
                         else:
                             thinking_threshold = STALL_THINKING_NO_PROGRESS_SECONDS
                             if backend_activity_live:
@@ -3652,12 +3738,11 @@ class WorkerPool:
             self._worker_stall_failures[index] = 0
 
             try:
-                # If in headed mode, freeze the tab rather than closing it
                 is_headless = os.getenv("HEADLESS", "false").lower() == "true"
-                if not is_headless and old_worker.page:
+                if (not is_headless) and HEADED_KEEP_FROZEN_STALL_PAGES and old_worker.page:
                     try:
                         await old_worker.page.evaluate("document.title = '[FROZEN STALL] - ' + document.title")
-                        log(f"Worker {index + 1} page frozen for user inspection", "WorkerPool")
+                        log(f"Worker {index + 1} page frozen for user inspection (HEADED_KEEP_FROZEN_STALL_PAGES=true)", "WorkerPool")
                     except Exception as e:
                         log(f"Failed to set frozen page title: {e}", "WorkerPool")
                     
@@ -3672,7 +3757,8 @@ class WorkerPool:
                         except:
                             pass
                 else:
-                    # In headless mode, close the page normally
+                    if (not is_headless) and old_worker.page:
+                        log(f"Closing old headed worker page after recreation", "WorkerPool")
                     await old_worker.close()
             except Exception as e:
                 log(f"Error handling old worker closure/freezing: {e}", "WorkerPool")
