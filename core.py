@@ -1733,12 +1733,33 @@ class GeminiWebAutomation(BaseAutomation):
         """Refresh away from transient Google 500 pages before giving up on the worker."""
         try:
             log(f"Detected Google 500 page ({reason}), refreshing", f"Worker {self.worker_id}")
-            await self.page.reload(wait_until="domcontentloaded", timeout=30000)
+            await self._force_reload(timeout_ms=30000)
             await self._human_delay(1000, 1500)
             return True
         except Exception as e:
             log(f"Google 500 recovery failed: {e}", f"Worker {self.worker_id}")
             return False
+
+    async def _force_reload(self, timeout_ms: int = 30000) -> None:
+        """Perform a true hard reload bypassing browser cache (CDP ignoreCache / Control+Shift+R)."""
+        try:
+            log("Attempting CDP hard refresh (ignoreCache=True)...", f"Worker {self.worker_id}")
+            cdp = await self.page.context.new_cdp_session(self.page)
+            await cdp.send("Page.reload", {"ignoreCache": True})
+            await self.page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
+            return
+        except Exception as cdp_err:
+            log(f"CDP hard refresh failed: {cdp_err}, trying Control+Shift+R keyboard shortcut...", f"Worker {self.worker_id}")
+
+        try:
+            await self.page.bring_to_front()
+            await self.page.keyboard.press("Control+Shift+R")
+            await self.page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
+            return
+        except Exception as kbd_err:
+            log(f"Keyboard hard refresh failed: {kbd_err}, falling back to standard page.reload...", f"Worker {self.worker_id}")
+
+        await self.page.reload(wait_until="domcontentloaded", timeout=timeout_ms)
 
     async def _hard_refresh_and_reinit(self, reason: str, save_diag: bool = False) -> bool:
         """Hard refresh page and re-run worker init path.
@@ -1751,7 +1772,7 @@ class GeminiWebAutomation(BaseAutomation):
                 await self._save_diagnostic_artifacts(reason)
                 self._diag_saved_pre_refresh = True
             log(f"Hard refresh recovery ({reason})", f"Worker {self.worker_id}")
-            await self.page.reload(wait_until="domcontentloaded", timeout=30000)
+            await self._force_reload(timeout_ms=30000)
             await self._human_delay(1000, 1500)
             self._request_count = 0
 
@@ -2471,7 +2492,7 @@ class GeminiWebAutomation(BaseAutomation):
             # 0.5 Periodic hard refresh to clear browser cache/memory
             if self._request_count >= self.REFRESH_EVERY_N_REQUESTS:
                 log(f"Hard refresh (request #{self._request_count})", f"Worker {self.worker_id}")
-                await self.page.reload(wait_until="domcontentloaded", timeout=30000)
+                await self._force_reload(timeout_ms=30000)
                 self._reset_model_tracking()
                 await self._human_delay(1000, 1500)
                 self._request_count = 0
@@ -2816,26 +2837,45 @@ class GeminiWebAutomation(BaseAutomation):
                     self._track_error(outage_error, "copy_btn", "wait_for_response_network_outage", snapshot)
                     return {"success": False, "error": outage_error}
 
-                page_snapshot = await self._capture_state_snapshot()
+                try:
+                    # Capture page state and check copy buttons with a strict timeout to prevent indefinite hangs
+                    async def gather_page_state():
+                        shot = await self._capture_state_snapshot()
+                        c_btns = self.page.locator(copy_selector)
+                        c_count = await c_btns.count()
+                        is_done = False
+                        if c_count > pre_send_count:
+                            last_btn = c_btns.nth(c_count - 1)
+                            if await last_btn.is_visible():
+                                is_done = True
+                        return shot, c_count, is_done
+
+                    page_snapshot, current_count, done_signaled = await asyncio.wait_for(
+                        gather_page_state(),
+                        timeout=15.0
+                    )
+                except asyncio.TimeoutError:
+                    log("⚠️ Page evaluation hung/timed out inside wait loop - triggering hard refresh recovery", f"Worker {self.worker_id}")
+                    self._track_error("Page evaluation hung in wait loop", "copy_btn", "wait_for_response_hung")
+                    await self._hard_refresh_and_reinit("wait_loop_hung", save_diag=False)
+                    return {"success": False, "error": "Page evaluation hung in wait loop"}
+                except Exception as eval_err:
+                    log(f"⚠️ Page evaluation error in wait loop: {eval_err}", f"Worker {self.worker_id}")
+                    await asyncio.sleep(0.5)
+                    continue
+
                 if page_snapshot.get("error_page_500"):
                     log("⚠️ Google 500 error page detected during response wait", f"Worker {self.worker_id}")
                     self._track_error("Google 500 error page", "input", "wait_for_response_500_page", page_snapshot)
                     await self._hard_refresh_and_reinit("google_500_page")
                     return {"success": False, "error": "Google 500 error page"}
 
-                btns = self.page.locator(copy_selector)
-                current_count = await btns.count()
-                
-                # We need to find a new button (more than we started with)
-                if current_count > pre_send_count:
-                    # Get the LAST button (the new one)
-                    copy_btn = btns.nth(current_count - 1)
-                    if await copy_btn.is_visible():
-                        break
+                if done_signaled:
+                    break
 
                 now = time.time()
                 if (now - last_wait_log) >= self._wait_log_interval_seconds:
-                    snap = await self._capture_state_snapshot()
+                    snap = page_snapshot
                     elapsed = int(now - start_time)
                     resp_count_total = int(snap.get("response_count") or 0)
                     resp_len_total = int(snap.get("last_response_len") or 0)
@@ -3207,7 +3247,7 @@ class GeminiWebAutomation(BaseAutomation):
             
             # Force refresh to reset page state for next request
             try:
-                await self.page.reload(wait_until="domcontentloaded", timeout=15000)
+                await self._force_reload(timeout_ms=15000)
                 self._request_count = 0
             except:
                 pass
