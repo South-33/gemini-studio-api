@@ -325,6 +325,39 @@ def write_error_transaction_log(
                 lines.append(f"(Failed to save full prompt: {pe})")
                 lines.append("")
 
+        # Search for related files (screenshots, diagnostic text extracts, etc.) containing the req_id
+        related_files = []
+        if req_id and req_id != "unknown":
+            try:
+                # Find all files with the req_id, excluding the .log file itself
+                related_files = sorted(
+                    [p for p in ERROR_LOG_DIR.glob(f"*{req_id}*") if p.suffix != ".log"],
+                    key=lambda p: p.stat().st_mtime
+                )
+            except Exception as glob_err:
+                log(f"Failed to scan related diagnostic files: {glob_err}", "API")
+
+        if related_files:
+            lines.append(thin)
+            lines.append("DIAGNOSTIC ARTIFACTS")
+            lines.append(thin)
+            for f in related_files:
+                lines.append(f"  Artifact: {f.name} ({f.stat().st_size} bytes)")
+            lines.append("")
+
+            # Find any diagnostic text extracts and embed their contents
+            for f in related_files:
+                if f.name.endswith(".diag.txt"):
+                    lines.append(thin)
+                    lines.append(f"EMBEDDED DIAGNOSTIC EXTRACT ({f.name})")
+                    lines.append(thin)
+                    try:
+                        diag_content = f.read_text(encoding="utf-8")
+                        lines.append(diag_content)
+                    except Exception as diag_read_err:
+                        lines.append(f"(Failed to read diagnostic extract: {diag_read_err})")
+                    lines.append("")
+
         attempt_logs = result.get("attempt_logs") or []
         if attempt_logs:
             lines.append(thin)

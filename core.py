@@ -1110,6 +1110,13 @@ class GeminiWebAutomation(BaseAutomation):
             try:
                 dom_info = await self.page.evaluate("""
                     () => {
+                        const isVisible = (el) => {
+                            if (!el) return false;
+                            const style = window.getComputedStyle(el);
+                            if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+                            return !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                        };
+
                         const url = window.location.href;
                         const title = document.title;
 
@@ -3395,6 +3402,60 @@ class GeminiWebAutomation(BaseAutomation):
             await self.page.locator(model_selector).first.click()
             await self._human_delay(300, 450)
 
+            # Check if new UI style (Extended thinking toggle directly in main dropdown menu) is active
+            extended_thinking_item = self.page.locator(
+                'gem-menu-item:has-text("Extended thinking"), [role="menuitem"]:has-text("Extended thinking")'
+            ).first
+
+            is_new_ui = False
+            try:
+                await extended_thinking_item.wait_for(state="visible", timeout=1200)
+                is_new_ui = True
+            except Exception:
+                pass
+
+            if is_new_ui:
+                # Read selected state of "Extended thinking" toggle
+                class_attr = await extended_thinking_item.get_attribute("class") or ""
+                content_item = extended_thinking_item.locator('gem-menu-item-content, [class*="content"]').first
+                content_class_attr = ""
+                if await content_item.count() > 0:
+                    content_class_attr = await content_item.get_attribute("class") or ""
+                
+                has_checkmark = await extended_thinking_item.locator(
+                    'gem-icon[aria-label="Selected"], mat-icon:has-text("check"), [class*="selected"]'
+                ).count() > 0
+
+                is_currently_extended = (
+                    "selected" in class_attr.lower() or 
+                    "selected" in content_class_attr.lower() or 
+                    has_checkmark
+                )
+
+                log(f"Detected thinking level via toggle state: is_currently_extended={is_currently_extended}", f"Worker {self.worker_id}")
+
+                if target_text == "Extended":
+                    if not is_currently_extended:
+                        log("Extended thinking is currently OFF, clicking to toggle ON", f"Worker {self.worker_id}")
+                        await extended_thinking_item.click()
+                        await self._human_delay(300, 500)
+                    else:
+                        log("Extended thinking is already ON, closing menu", f"Worker {self.worker_id}")
+                        await self.page.keyboard.press("Escape")
+                        await self._human_delay(150, 300)
+                else:  # target_text == "Standard"
+                    if is_currently_extended:
+                        log("Extended thinking is currently ON, clicking to toggle OFF", f"Worker {self.worker_id}")
+                        await extended_thinking_item.click()
+                        await self._human_delay(300, 500)
+                    else:
+                        log("Extended thinking is already OFF (Standard), closing menu", f"Worker {self.worker_id}")
+                        await self.page.keyboard.press("Escape")
+                        await self._human_delay(150, 300)
+                return
+
+            # Legacy sub-menu thinking level selection fallback
+            log("Extended thinking toggle not found in main menu, falling back to legacy sub-menu", f"Worker {self.worker_id}")
             trigger = self.page.locator('gem-menu-item[value="thinking_level"]').first
             await trigger.wait_for(state="visible", timeout=1500)
             await trigger.click(timeout=1500)
@@ -3405,7 +3466,7 @@ class GeminiWebAutomation(BaseAutomation):
             try:
                 await option.wait_for(state="visible", timeout=1500)
                 await option.click(timeout=1500)
-                log(f"Selected thinking level: {target_text}", f"Worker {self.worker_id}")
+                log(f"Selected thinking level (legacy): {target_text}", f"Worker {self.worker_id}")
                 await self._human_delay(250, 400)
                 return
             except Exception as te:
