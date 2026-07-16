@@ -587,7 +587,7 @@ async def diagnostics():
     if not worker_pool:
         return {"status": "not_initialized"}
 
-    pool_diag = worker_pool.get_diagnostics()
+    pool_diag = await worker_pool.get_live_diagnostics()
     return {
         "status": "ok",
         "pool": pool_diag,

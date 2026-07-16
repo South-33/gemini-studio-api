@@ -3,6 +3,8 @@ Discord notification module for Gemini Studio API.
 Sends alerts when errors occur, with deduplication to prevent spam.
 """
 
+from __future__ import annotations
+
 import os
 import time
 import hashlib

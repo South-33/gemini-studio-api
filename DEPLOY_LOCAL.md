@@ -49,6 +49,18 @@ Then set `HEADLESS=true` in your `.env` file for background operation.
 python main.py
 ```
 
+On startup the API closes pages restored from the persistent Chrome profile,
+then creates exactly the configured number of managed workers. This removes old
+`Generating` windows left by an earlier crashed or restarted process.
+
+After startup, verify the live browser/Python state agrees:
+
+```powershell
+Invoke-RestMethod http://localhost:8000/v1/diagnostics | ConvertTo-Json -Depth 8
+```
+
+Each worker should have an empty `invariant_violations` list.
+
 The API runs headlessly using your saved session.
 
 ---

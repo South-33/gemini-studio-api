@@ -81,8 +81,6 @@ def _read_headed_page_zoom() -> float:
 
 
 HEADED_PAGE_ZOOM = _read_headed_page_zoom()
-HEADED_KEEP_FROZEN_STALL_PAGES = os.getenv("HEADED_KEEP_FROZEN_STALL_PAGES", "false").lower() == "true"
-
 class BaseAutomation:
     """Base class for browser-based AI automation."""
     def __init__(self):
@@ -818,6 +816,7 @@ class GeminiWebAutomation(BaseAutomation):
         self._recent_network_events = deque(maxlen=40)
         self._network_failure_counts: Dict[str, int] = {}
         self._last_network_outage: Optional[Dict[str, Any]] = None
+        self._last_recovery: Optional[Dict[str, Any]] = None
         self._zoom_applied = False
         self._browser_zoom_reset = False
         self._current_prompt_tokens_est: int = 0  # Set per-request for stall scaling
@@ -1777,7 +1776,32 @@ class GeminiWebAutomation(BaseAutomation):
             self._request_count = 0
 
             ok = await self.init_with_page(self.page, self.context)
-            return bool(ok)
+            post_snapshot = await self._capture_state_snapshot()
+            clean = bool(
+                ok
+                and not post_snapshot.get("stop_visible")
+                and not post_snapshot.get("error_page_500")
+                and post_snapshot.get("input_visible")
+            )
+            self._last_recovery = {
+                "reason": reason,
+                "ok": clean,
+                "stop_visible": bool(post_snapshot.get("stop_visible")),
+                "input_text_len": int(post_snapshot.get("input_text_len") or 0),
+                "user_query_count": int(post_snapshot.get("user_query_count") or 0),
+                "response_count": int(post_snapshot.get("response_count") or 0),
+                "page_title": str(post_snapshot.get("page_title") or ""),
+                "at_unix": int(time.time()),
+            }
+            log(
+                f"Hard refresh recovery result: ok={clean} init={bool(ok)} "
+                f"stop={post_snapshot.get('stop_visible')} input_len={post_snapshot.get('input_text_len')} "
+                f"users={post_snapshot.get('user_query_count')} responses={post_snapshot.get('response_count')}",
+                f"Worker {self.worker_id}",
+            )
+            if not clean:
+                self._initialized = False
+            return clean
         except Exception as e:
             if self._is_network_outage_error_text(str(e)):
                 current_url = ""
@@ -1786,7 +1810,59 @@ class GeminiWebAutomation(BaseAutomation):
                 except Exception:
                     current_url = ""
                 self._mark_network_outage("page_reload", current_url or self.URL, str(e))
+            self._last_recovery = {
+                "reason": reason,
+                "ok": False,
+                "error": str(e),
+                "at_unix": int(time.time()),
+            }
+            self._initialized = False
             log(f"Hard refresh recovery failed: {e}", f"Worker {self.worker_id}")
+            return False
+
+    async def _clear_retained_prompt_draft(self, prompt_len: int) -> bool:
+        """Clear a sent prompt that Gemini leaves in the composer.
+
+        Only a proven request-start signal permits this cleanup, so an unsent
+        request can never be silently erased.
+        """
+        if prompt_len <= 0:
+            return True
+
+        try:
+            before = await self._capture_state_snapshot()
+            input_len = int(before.get("input_text_len") or 0)
+            request_accepted = bool(
+                before.get("stop_visible")
+                or int(before.get("user_query_count") or 0) > 0
+                or int(before.get("response_count") or 0) > 0
+            )
+            retained = input_len >= max(1, prompt_len // 2)
+            if not request_accepted or not retained:
+                return True
+
+            input_selector = await self._resolve_selector("input", require_visible=True, timeout_ms=1500)
+            if not input_selector:
+                log(
+                    f"Retained composer draft could not be cleared: input selector missing (input_len={input_len})",
+                    f"Worker {self.worker_id}",
+                )
+                return False
+
+            input_area = self.page.locator(input_selector).first
+            await input_area.fill("", timeout=3000)
+            await self._human_delay(100, 200)
+            after = await self._capture_state_snapshot()
+            after_len = int(after.get("input_text_len") or 0)
+            cleared = after_len < max(1, prompt_len // 2)
+            log(
+                f"Retained composer draft clear result: ok={cleared} before={input_len} after={after_len} "
+                f"stop={after.get('stop_visible')} users={after.get('user_query_count')}",
+                f"Worker {self.worker_id}",
+            )
+            return cleared
+        except Exception as e:
+            log(f"Retained composer draft clear failed: {e}", f"Worker {self.worker_id}")
             return False
 
     async def _nudge_scroll_to_bottom(self):
@@ -2807,6 +2883,13 @@ class GeminiWebAutomation(BaseAutomation):
                     self._track_error("Hard refresh recovery failed", "send_btn", "verify_generation_started", snapshot)
                     return {"success": False, "error": f"Generation failed after all recovery attempts: {e}"}
             
+            # Gemini can accept the request (user bubble + Stop state) while
+            # retaining the full prompt as an editable draft. Clear only after
+            # start was proven so retries and diagnostics cannot mistake it for
+            # an unsent request.
+            if generation_started:
+                await self._clear_retained_prompt_draft(prompt_len)
+
             # 5. Wait for Response (Copy button to appear)
             log(f"Waiting for response...", f"Worker {self.worker_id}")
             await self._human_delay(300, 600)  # Reduced initial wait
@@ -3664,6 +3747,10 @@ class WorkerPool:
         self._idle_refresh_lock = asyncio.Lock()
         self._pool_recovery_lock = asyncio.Lock()
         self._last_idle_refresh_at = 0.0
+        self._startup_pages_closed = 0
+        self._startup_page_close_failures = 0
+        self._worker_recreation_count = 0
+        self._last_worker_recreation: Optional[Dict[str, Any]] = None
     
     async def _get_available_worker(self, exclude: set = None) -> Tuple[int, GeminiWebAutomation]:
         """Get available worker via fair round-robin. Waits if all are busy."""
@@ -3760,6 +3847,16 @@ class WorkerPool:
             "copy timeout",
             "waiting for response",
             "clipboard extraction failed",
+            "fresh temp chat reset not confirmed",
+            "temp chat reset not confirmed",
+            "fresh regular chat reset not confirmed",
+            "preflight recovery failed",
+            "re-init failed",
+            "send button click failed",
+            "recovery resend failed",
+            "locator.fill",
+            "timeout 30000ms exceeded",
+            "empty response",
             # Dead-page errors count as stalls too (for threshold tracking)
             "target page, context or browser has been closed",
             "page has been closed",
@@ -3775,6 +3872,19 @@ class WorkerPool:
         if not text:
             return False
         return text.startswith("network outage:")
+
+    async def _quarantine_worker(self, index: int, reason: str) -> None:
+        """Make a failed-to-recreate worker impossible to assign again."""
+        if index < 0 or index >= len(self.workers):
+            return
+
+        worker = self.workers[index]
+        worker._initialized = False
+        try:
+            await asyncio.wait_for(worker.close(), timeout=10.0)
+        except Exception as e:
+            log(f"Quarantine close failed for worker {index + 1}: {e}", "WorkerPool")
+        log(f"Worker {index + 1} quarantined after recreation failure: {reason}", "WorkerPool")
 
     def _record_worker_failure(self, worker_index: int, error: str) -> bool:
         """Track consecutive stall-like failures and request worker recreation when threshold is hit."""
@@ -3839,34 +3949,29 @@ class WorkerPool:
             self._worker_stall_failures[index] = 0
 
             try:
-                is_headless = os.getenv("HEADLESS", "false").lower() == "true"
-                if (not is_headless) and HEADED_KEEP_FROZEN_STALL_PAGES and old_worker.page:
-                    try:
-                        await old_worker.page.evaluate("document.title = '[FROZEN STALL] - ' + document.title")
-                        log(f"Worker {index + 1} page frozen for user inspection (HEADED_KEEP_FROZEN_STALL_PAGES=true)", "WorkerPool")
-                    except Exception as e:
-                        log(f"Failed to set frozen page title: {e}", "WorkerPool")
-                    
-                    if not hasattr(self, "_frozen_pages"):
-                        self._frozen_pages = []
-                    self._frozen_pages.append(old_worker.page)
-                    # Cap at 10 frozen pages to avoid excessive resource leaks
-                    while len(self._frozen_pages) > 10:
-                        oldest_page = self._frozen_pages.pop(0)
-                        try:
-                            await oldest_page.close()
-                        except:
-                            pass
-                else:
-                    if (not is_headless) and old_worker.page:
-                        log(f"Closing old headed worker page after recreation", "WorkerPool")
-                    await old_worker.close()
+                if old_worker.page:
+                    log("Closing poisoned worker page after recreation", "WorkerPool")
+                await asyncio.wait_for(old_worker.close(), timeout=10.0)
             except Exception as e:
-                log(f"Error handling old worker closure/freezing: {e}", "WorkerPool")
+                log(f"Error closing poisoned worker page: {e}", "WorkerPool")
 
+            self._worker_recreation_count += 1
+            self._last_worker_recreation = {
+                "worker_id": index + 1,
+                "reason": reason,
+                "ok": True,
+                "at_unix": int(time.time()),
+            }
             log(f"Worker {index + 1} recreated successfully", "WorkerPool")
             return True
         except Exception as e:
+            self._last_worker_recreation = {
+                "worker_id": index + 1,
+                "reason": reason,
+                "ok": False,
+                "error": str(e),
+                "at_unix": int(time.time()),
+            }
             log(f"Worker {index + 1} recreate failed: {e}", "WorkerPool")
             if new_page:
                 try:
@@ -3997,6 +4102,33 @@ class WorkerPool:
             except:
                 continue
         return reusable
+
+    async def _close_restored_context_pages(self) -> Tuple[int, int]:
+        """Close every page restored by the persistent Chromium profile.
+
+        Restored pages are not registered workers. Leaving them open made old
+        failed requests remain visibly generating after the pool had recovered.
+        Workers are always created from fresh pages immediately afterward.
+        """
+        pages = self._get_reusable_context_pages()
+        if not pages:
+            return 0, 0
+
+        log(f"Closing {len(pages)} restored/unmanaged page(s) before worker startup", "WorkerPool")
+        closed = 0
+        failed = 0
+        for page in pages:
+            try:
+                await asyncio.wait_for(page.close(), timeout=8.0)
+                closed += 1
+            except Exception as e:
+                failed += 1
+                log(f"Failed to close restored page: {e}", "WorkerPool")
+
+        self._startup_pages_closed += closed
+        self._startup_page_close_failures += failed
+        log(f"Restored page cleanup result: closed={closed} failed={failed}", "WorkerPool")
+        return closed, failed
 
     def _window_bounds_for_index(self, index: int) -> Dict[str, int]:
         """Compute deterministic window bounds for headed split windows."""
@@ -4220,11 +4352,10 @@ class WorkerPool:
             if LOW_MEMORY_MODE:
                 await self.shared_context.route("**/*", self._block_resources)
 
-            reusable_pages: List[Page] = []
-            if use_split_windows:
-                reusable_pages = self._get_reusable_context_pages()
-                if reusable_pages:
-                    log(f"Reusing {len(reusable_pages)} existing window page(s)", "WorkerPool")
+            # Persistent Chromium may restore pages from an earlier process.
+            # None of those pages are registered workers in this pool, so close
+            # them deterministically instead of leaving stale generations visible.
+            await self._close_restored_context_pages()
 
             # Create N Gemini Web workers (1 worker = 1 tab)
             print(f"[WorkerPool] Creating {self.worker_count} Gemini Web worker(s)...")
@@ -4235,11 +4366,7 @@ class WorkerPool:
 
                 page: Optional[Page] = None
                 if use_split_windows:
-                    if reusable_pages:
-                        page = reusable_pages.pop(0)
-                        await self._position_page_window(page, i)
-                    else:
-                        page = await self._open_split_window_page(i)
+                    page = await self._open_split_window_page(i)
 
                 if page is None:
                     page = await self.shared_context.new_page()
@@ -4462,13 +4589,21 @@ class WorkerPool:
                     recreated_ok = False
                     if should_recreate_worker:
                         recreated_ok = await self._recreate_worker(worker_index, recreate_reason)
+                        if not recreated_ok:
+                            await self._quarantine_worker(worker_index, recreate_reason)
                     self._active_requests = max(0, self._active_requests - 1)
                     await self._release_worker(worker_index)
                     self._has_processed_request = True
                     self._last_activity = time.time()
 
-                    if attempt_error and allow_same_worker_retry:
-                        tried_workers.discard(worker_index)
+                    if attempt_error and (allow_same_worker_retry or recreated_ok):
+                        if should_recreate_worker and not recreated_ok:
+                            log(
+                                f"Worker {worker_index+1} retry blocked because recreation failed; worker is quarantined",
+                                "WorkerPool",
+                            )
+                        else:
+                            tried_workers.discard(worker_index)
                         if recreated_ok:
                             if extra_recovery_attempts_remaining > 0:
                                 max_attempts += 1
@@ -4481,7 +4616,7 @@ class WorkerPool:
                                 f"Worker {worker_index+1} retry reopened after recreation",
                                 "WorkerPool",
                             )
-                        else:
+                        elif not should_recreate_worker:
                             log(
                                 f"Worker {worker_index+1} retry reopened after recoverable failure",
                                 "WorkerPool",
@@ -4524,25 +4659,57 @@ class WorkerPool:
             },
             "stall_recreate_threshold": STALL_RECREATE_THRESHOLD,
             "worker_stall_failures": {str(k + 1): v for k, v in self._worker_stall_failures.items()},
+            "startup_pages_closed": self._startup_pages_closed,
+            "startup_page_close_failures": self._startup_page_close_failures,
+            "worker_recreation_count": self._worker_recreation_count,
+            "last_worker_recreation": self._last_worker_recreation,
+            "context_page_count": len(self.shared_context.pages) if self.shared_context else 0,
             "workers": workers,
             "errors": errors,
             "last_activity_unix": int(self._last_activity),
         }
+
+    async def get_live_diagnostics(self) -> Dict[str, Any]:
+        """Return pool diagnostics plus bounded live DOM state per managed worker."""
+        result = self.get_diagnostics()
+        for idx, worker_info in enumerate(result["workers"]):
+            worker = self.workers[idx]
+            try:
+                snapshot = await asyncio.wait_for(worker._capture_state_snapshot(), timeout=5.0)
+                current_state = {
+                    "page_title": snapshot.get("page_title"),
+                    "url": snapshot.get("url"),
+                    "phase": snapshot.get("phase"),
+                    "stop_visible": bool(snapshot.get("stop_visible")),
+                    "send_visible": bool(snapshot.get("send_visible")),
+                    "input_text_len": int(snapshot.get("input_text_len") or 0),
+                    "user_query_count": int(snapshot.get("user_query_count") or 0),
+                    "response_count": int(snapshot.get("response_count") or 0),
+                    "thinking_label": snapshot.get("thinking_label"),
+                    "thinking_active": bool(snapshot.get("thinking_active")),
+                    "error_page_500": bool(snapshot.get("error_page_500")),
+                }
+                invariant_violations = []
+                if current_state["stop_visible"] and not worker_info["generation_in_progress"]:
+                    invariant_violations.append("stop_visible_while_worker_idle")
+                if (
+                    current_state["input_text_len"] > 0
+                    and current_state["user_query_count"] > 0
+                    and not worker_info["generation_in_progress"]
+                ):
+                    invariant_violations.append("retained_prompt_while_worker_idle")
+                worker_info["current_state"] = current_state
+                worker_info["invariant_violations"] = invariant_violations
+                worker_info["last_recovery"] = worker._last_recovery
+            except Exception as e:
+                worker_info["current_state_error"] = str(e)
+        return result
 
 
     async def close(self):
         # Close all workers
         for w in self.workers:
             await w.close()
-        
-        # Close all frozen pages
-        if hasattr(self, "_frozen_pages"):
-            for page in self._frozen_pages:
-                try:
-                    await page.close()
-                except:
-                    pass
-            self._frozen_pages.clear()
         
         if self.shared_context: await self.shared_context.close()
         if self.playwright: await self.playwright.stop()

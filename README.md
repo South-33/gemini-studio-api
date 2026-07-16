@@ -259,12 +259,24 @@ Returns:
 ```json
 {
   "status": "ok",
-  "workers": [
-    {"worker_id": 1, "initialized": true, "busy": false, "last_error": null}
-  ],
-  "errors": {}
+  "pool": {
+    "context_page_count": 1,
+    "startup_pages_closed": 2,
+    "worker_recreation_count": 1,
+    "workers": [{
+      "worker_id": 1,
+      "initialized": true,
+      "busy": false,
+      "generation_in_progress": false,
+      "current_state": {"stop_visible": false, "input_text_len": 0},
+      "invariant_violations": []
+    }]
+  }
 }
 ```
+
+`invariant_violations` is non-empty when the Python worker state disagrees with
+the live Gemini page, such as an idle worker whose page still shows **Stop**.
 
 ---
 
@@ -276,9 +288,20 @@ Returns:
 - **Overlay Dismissal** - Clears stuck overlays before each request
 - **Wait-State Telemetry** - Periodic wait logs include stop/send/response/visibility state
 - **Stall Watchdog Recovery** - Detects no-output/no-progress generations and recovers before full timeout
+- **Verified Recovery** - A refreshed worker is reusable only after the live page proves Stop is gone and input is ready
+- **Restored-Page Cleanup** - Closes unmanaged pages restored by the persistent Chrome profile before creating workers
+- **Retained-Draft Cleanup** - Clears a prompt left in the composer only after a sent user bubble/start signal is confirmed
 - **Headed Window Placement** - Optional CDP-based overlap/tile windows for multi-worker runs
-- **Diagnostics Endpoint** - Exposes worker state, last errors, and recent request traces
+- **Diagnostics Endpoint** - Exposes worker state, live page state, recovery outcomes, invariant violations, and recent request traces
 - **Discord Alerts** - Cooldown-based error notifications with compact diagnostics payload
+
+### Verification
+
+Run the recovery regression suite without launching Chromium:
+
+```powershell
+python -m unittest discover -s tests -v
+```
 
 ---
 
