@@ -20,6 +20,11 @@ class FakeContext:
     def __init__(self, pages):
         self.pages = pages
 
+    async def new_page(self):
+        page = FakePage("about:blank")
+        self.pages.append(page)
+        return page
+
 
 class FakeLocator:
     def __init__(self):
@@ -50,7 +55,8 @@ class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
         closed, failed = await pool._close_restored_context_pages()
 
         self.assertEqual((closed, failed), (2, 0))
-        self.assertTrue(all(page.closed for page in pages))
+        self.assertTrue(all(page.closed for page in pages[:2]))
+        self.assertFalse(pool._startup_guard_page.closed)
         self.assertEqual(pool._startup_pages_closed, 2)
 
     async def test_hard_refresh_rejects_page_that_is_still_generating(self):

@@ -61,6 +61,10 @@ Invoke-RestMethod http://localhost:8000/v1/diagnostics | ConvertTo-Json -Depth 8
 
 Each worker should have an empty `invariant_violations` list.
 
+When using `autostart.bat`, the launcher waits for the API health check before
+starting the tunnel or reporting success. Python startup output is retained in
+`logs\server.log`; a failed startup prints the last 40 lines and stays open.
+
 The API runs headlessly using your saved session.
 
 ---

@@ -3751,6 +3751,7 @@ class WorkerPool:
         self._startup_page_close_failures = 0
         self._worker_recreation_count = 0
         self._last_worker_recreation: Optional[Dict[str, Any]] = None
+        self._startup_guard_page: Optional[Page] = None
     
     async def _get_available_worker(self, exclude: set = None) -> Tuple[int, GeminiWebAutomation]:
         """Get available worker via fair round-robin. Waits if all are busy."""
@@ -4115,6 +4116,16 @@ class WorkerPool:
             return 0, 0
 
         log(f"Closing {len(pages)} restored/unmanaged page(s) before worker startup", "WorkerPool")
+        # A headed persistent context can exit when its last native window is
+        # closed. Create the replacement first, then close restored pages. The
+        # guard becomes worker 1 in single-window mode.
+        try:
+            self._startup_guard_page = await self.shared_context.new_page()
+        except Exception as e:
+            self._startup_page_close_failures += len(pages)
+            log(f"Could not create startup guard page; restored pages left open: {e}", "WorkerPool")
+            return 0, len(pages)
+
         closed = 0
         failed = 0
         for page in pages:
@@ -4367,6 +4378,16 @@ class WorkerPool:
                 page: Optional[Page] = None
                 if use_split_windows:
                     page = await self._open_split_window_page(i)
+                    if page is not None and self._startup_guard_page is not None:
+                        try:
+                            await self._startup_guard_page.close()
+                        except:
+                            pass
+                        self._startup_guard_page = None
+
+                if page is None and i == 0 and self._startup_guard_page is not None:
+                    page = self._startup_guard_page
+                    self._startup_guard_page = None
 
                 if page is None:
                     page = await self.shared_context.new_page()
@@ -4392,6 +4413,13 @@ class WorkerPool:
             
             print(f"[WorkerPool] ✅ {workers_ok}/{self.worker_count} workers ready")
             
+            if self._startup_guard_page is not None:
+                try:
+                    await self._startup_guard_page.close()
+                except:
+                    pass
+                self._startup_guard_page = None
+
             self._initialized = True
             return workers_ok > 0  # Success if at least one works
         except Exception as e:

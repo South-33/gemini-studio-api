@@ -6,6 +6,8 @@ echo ==========================================
 
 :: Navigate to script directory
 cd /d "%~dp0"
+if not exist "logs" mkdir "logs"
+set "API_LOG=logs\server.log"
 
 :: Load PORT and NGROK_DOMAIN from .env file
 set PORT=8000
@@ -41,14 +43,22 @@ timeout /t 3 /nobreak >nul
 
 :: Start the API minimized (prevents Windows Quick Edit mode freezing)
 echo [2/3] Starting API server on port %PORT%...
-start "GeminiAPI" /min cmd /c "set PYTHONUNBUFFERED=1 && python -u main.py"
+call :start_api
+call :verify_api_startup
+if errorlevel 1 (
+    call :notify_discord "Gemini API Startup Failure" "Python exited or failed to listen on the configured port. Check logs\server.log on the server."
+    echo [FATAL] API failed to start. Recent output:
+    powershell -NoProfile -Command "if (Test-Path $env:API_LOG) { Get-Content $env:API_LOG -Tail 40 }"
+    pause
+    exit /b 1
+)
 
 :: Start ngrok in a visible window so tunnel errors are easy to inspect
 echo [3/3] Starting ngrok tunnel on port %PORT%...
 echo Using domain: %NGROK_DOMAIN%
 call :start_ngrok
 call :verify_ngrok_startup
-if %errorlevel% neq 0 exit /b 1
+if errorlevel 1 exit /b 1
 
 echo.
 echo ==========================================
@@ -64,22 +74,40 @@ timeout /t 60 /nobreak >nul
 
 :: Check if ngrok is still running
 tasklist /FI "IMAGENAME eq ngrok.exe" 2>nul | find /I "ngrok.exe" >nul
-if %errorlevel% neq 0 (
+if errorlevel 1 (
     echo [%time%] ⚠️ Tunnel died! Restarting...
     call :start_ngrok
     call :verify_ngrok_startup
-    if %errorlevel% neq 0 exit /b 1
+    if errorlevel 1 exit /b 1
 )
 
 :: Check if API port is still listening (more reliable than checking python.exe)
 netstat -ano | findstr ":%PORT% " | findstr "LISTENING" >nul
-if %errorlevel% neq 0 (
+if errorlevel 1 (
     echo [%time%] ⚠️ API port not listening! Restarting...
-    start "GeminiAPI" /min cmd /c "set PYTHONUNBUFFERED=1 && python -u main.py"
-    timeout /t 5 /nobreak >nul
+    call :start_api
+    call :verify_api_startup
+    if errorlevel 1 (
+        echo [%time%] API restart failed. See %API_LOG%.
+    )
 )
 
 goto monitor
+
+:start_api
+echo.>>"%API_LOG%"
+echo ============================================================>>"%API_LOG%"
+echo API launch %date% %time%>>"%API_LOG%"
+start "GeminiAPI" /min cmd /c "set PYTHONUNBUFFERED=1&& python -u main.py 1>>logs\server.log 2>&1"
+exit /b 0
+
+:verify_api_startup
+for /l %%i in (1,1,90) do (
+    powershell -NoProfile -Command "try { $r = Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:%PORT%/health' -TimeoutSec 2; if ($r.StatusCode -eq 200) { exit 0 } } catch {}; exit 1" >nul 2>nul
+    if not errorlevel 1 exit /b 0
+    timeout /t 1 /nobreak >nul
+)
+exit /b 1
 
 :start_ngrok
 start "NgrokTunnel" cmd /k "%NGROK_CMD%"
@@ -88,7 +116,7 @@ exit /b 0
 :verify_ngrok_startup
 timeout /t 5 /nobreak >nul
 tasklist /FI "IMAGENAME eq ngrok.exe" 2>nul | find /I "ngrok.exe" >nul
-if %errorlevel% neq 0 (
+if errorlevel 1 (
     call :notify_discord "Gemini API Tunnel Failure" "ngrok exited immediately. Check the visible NgrokTunnel window. Common causes are missing auth token, unverified ngrok account, or a claimed domain from a different account."
     echo [FATAL] ngrok exited immediately.
     echo [FATAL] Check the visible NgrokTunnel window for the real error.

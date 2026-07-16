@@ -293,6 +293,7 @@ the live Gemini page, such as an idle worker whose page still shows **Stop**.
 - **Retained-Draft Cleanup** - Clears a prompt left in the composer only after a sent user bubble/start signal is confirmed
 - **Headed Window Placement** - Optional CDP-based overlap/tile windows for multi-worker runs
 - **Diagnostics Endpoint** - Exposes worker state, live page state, recovery outcomes, invariant violations, and recent request traces
+- **Verified Launcher** - `autostart.bat` waits for `/health` and records Python output in `logs/server.log` before reporting success
 - **Discord Alerts** - Cooldown-based error notifications with compact diagnostics payload
 
 ### Verification
