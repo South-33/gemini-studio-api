@@ -2988,6 +2988,9 @@ class GeminiWebAutomation(BaseAutomation):
                     return {"success": False, "error": "Google 500 error page"}
 
                 if done_signaled:
+                    c_btns = self.page.locator(copy_selector)
+                    if await c_btns.count() > 0:
+                        copy_btn = c_btns.nth(await c_btns.count() - 1)
                     break
 
                 now = time.time()
