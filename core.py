@@ -2962,11 +2962,21 @@ class GeminiWebAutomation(BaseAutomation):
                         c_count = await c_btns.count()
                         is_done = False
                         btn = None
+
                         if c_count > pre_send_count:
                             last_btn = c_btns.nth(c_count - 1)
                             if await last_btn.is_visible():
                                 is_done = True
                                 btn = last_btn
+
+                        # Completion fallback: stop button gone, send button returned, and response present
+                        if not is_done and not shot.get("stop_btn_visible") and shot.get("send_btn_visible") and shot.get("response_count", 0) > 0:
+                            if c_count > 0:
+                                last_btn = c_btns.nth(c_count - 1)
+                                if await last_btn.is_visible():
+                                    is_done = True
+                                    btn = last_btn
+
                         return shot, c_count, is_done, btn
 
                     page_snapshot, current_count, done_signaled, found_btn = await asyncio.wait_for(
