@@ -3184,11 +3184,8 @@ class GeminiWebAutomation(BaseAutomation):
                     is_new_thinking = snap.get("thinking_visible", False) and not snap.get("thinking_label", "").lower().startswith("show thinking")
 
                     # Cooked check for thinking models:
-                    # If thinking was requested, we expect thinking_active to become True.
-                    # If it doesn't start reasoning within 15 seconds (and has no response body), the request is cooked.
-                    # For large prompts, we extend this cooked check threshold to STALL_EMPTY_SECONDS_LARGE_PROMPT (360s)
-                    # to allow time for the massive context prefill.
-                    cooked_threshold = 15
+                    # Extended thinking models (Gemini 3.1 Flash-Lite / 3.5 Flash) take up to 120s to complete prefill/reasoning.
+                    cooked_threshold = 120
                     if self._current_prompt_tokens_est and self._current_prompt_tokens_est >= LARGE_PROMPT_TOKEN_THRESHOLD:
                         cooked_threshold = STALL_EMPTY_SECONDS_LARGE_PROMPT
 
