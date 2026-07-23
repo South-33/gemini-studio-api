@@ -743,56 +743,80 @@ class GeminiWebAutomation(BaseAutomation):
             cls._clipboard_lock = asyncio.Lock()
         return cls._clipboard_lock
     
-    # Stable selectors first; bounded fallbacks second
+    # Stable selectors first; bounded fallbacks second with fuzzy/partial matching
     SELECTORS = {
         "input": [
-            'div[role="textbox"][aria-label="Enter a prompt for Gemini"]',
-            'div[role="textbox"][aria-label="Enter a prompt here"]',
+            'div[role="textbox"][aria-label*="prompt" i]',
+            'div[role="textbox"][aria-label*="Enter" i]',
             'div[role="textbox"][contenteditable="true"]',
+            'div[role="textbox"]',
+            'textarea[placeholder*="Ask" i]',
         ],
         "send_btn": [
             'button[aria-label="Send message"]',
             'button[aria-label*="Send" i]',
+            'button[aria-label*="Submit" i]',
+            'button[data-test-id*="send" i]',
         ],
         "model_btn": [
+            '[data-test-id*="mode" i]',
             'button[data-test-id="bard-mode-menu-button"]',
-            'button[aria-label^="Open mode picker"]',
+            'button[aria-label*="mode" i]',
+            'button[aria-label*="model" i]',
+            'button[aria-label*="picker" i]',
             '.input-area-switch',
         ],
         "thinking_level": [
             'gem-menu-item[value="thinking_level"]',
+            'gem-menu-item[value*="thinking" i]',
+            '[role="menuitem"][value*="thinking" i]',
         ],
         "new_chat": [
+            '[aria-label*="New chat" i]',
+            '[aria-label*="New" i]',
+            '[data-test-id*="new-chat" i]',
+            '[data-test-id="side-nav-sparkle-button"][aria-label*="New" i]',
             'a[aria-label="New chat"]',
             'button[aria-label="New chat"]',
             '[data-test-id="new-chat-button"] a',
             '[data-test-id="new-chat-button"]',
             'a[href="/app"]',
+            'a[href="/"]',
         ],
         "temp_chat": [
+            '[data-test-id*="temp" i]',
+            '[aria-label*="temporary" i]',
+            '[aria-label*="temp chat" i]',
+            'button[aria-label*="temp" i]',
             '[data-test-id="temp-chat-button"]',
             'button[aria-label="Temporary chat"]',
             '[aria-label="Temporary chat"]',
         ],
         "temp_chat_active": [
+            '[data-test-id*="temp" i].temp-chat-on',
+            '[aria-label*="temporary" i].temp-chat-on',
             '[data-test-id="temp-chat-button"].temp-chat-on',
             '[aria-label="Temporary chat"].temp-chat-on',
         ],
         "sidebar_toggle": [
+            '[data-test-id="side-nav-sparkle-button"][aria-label*="sidebar" i]',
+            '[data-test-id="side-nav-sparkle-button"]',
+            'button[aria-label*="sidebar" i]',
             'button[aria-label="Open sidebar"]',
-            'button[data-test-id="side-nav-sparkle-button"]',
             'button[aria-label="Close sidebar"]',
             'button.close-sidenav-button',
-            'button[aria-label*="sidebar" i]',
             'button[aria-label="Main menu"]',
             '[aria-label="Main menu"]',
         ],
         "copy_btn": [
             'button[aria-label="Copy"]',
             '[aria-label="Copy"]',
+            'button[aria-label*="Copy" i]',
+            '[aria-label*="Copy" i]',
         ],
         "menu_panel": [
             '.mat-mdc-menu-panel',
+            '[role="menu"]',
         ],
         "menu_item": [
             'gem-menu-item[role="menuitem"]',
@@ -2206,12 +2230,22 @@ class GeminiWebAutomation(BaseAutomation):
 
         temp_btn = await self._get_temp_chat_button()
         if temp_btn is None:
+            log("Temp chat button not found on current Gemini UI layout - checking clean chat fallback", f"Worker {self.worker_id}")
+            snap = await self._capture_state_snapshot()
+            if snap.get("input_visible") and snap.get("response_count", 0) == 0:
+                log("Temp reset path: clean regular chat ready as fallback", f"Worker {self.worker_id}")
+                return True
+            if await self._ensure_fresh_chat():
+                return True
             final_snapshot = await self._capture_state_snapshot()
-            self._track_error("Temp chat button not visible on fresh regular chat", "temp_chat", "ensure_fresh_temp_chat", final_snapshot)
+            self._track_error("Clean chat fallback failed", "new_chat", "ensure_fresh_temp_chat", final_snapshot)
             return False
 
         if not await self._click_temp_chat_toggle():
-            log("⚠️ Temp Chat toggle on click failed", f"Worker {self.worker_id}")
+            log("⚠️ Temp Chat toggle click failed - proceeding with fresh chat session", f"Worker {self.worker_id}")
+            snap = await self._capture_state_snapshot()
+            if snap.get("input_visible"):
+                return True
             return False
 
         deadline = time.time() + 8.0
@@ -4248,46 +4282,12 @@ class WorkerPool:
                     "WorkerPool",
                 )
             
-            # Use GeminiWebAutomation constants (AI Studio code removed)
             browser_args = [
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
-                # Anti-throttling: prevent Chrome from suspending background tabs
-                "--disable-background-timer-throttling",
-                "--disable-backgrounding-occluded-windows",
-                "--disable-renderer-backgrounding",
-                "--disable-background-media-suspend",
-                "--disable-back-forward-cache",
+                "--disable-setuid-sandbox",
             ]
-
-            # Add feature-level anti-throttling controls (Windows + desktop perf).
-            disable_features = [
-                # ui/base/ui_base_features.cc: enabled by default on Windows.
-                "CalculateNativeWinOcclusion",
-                # components/performance_manager/public/features.h
-                "BatterySaverModeAvailable",
-                # content/public/common/content_features.cc
-                "BatterySaverModeAlignWakeUps",
-            ]
-            enable_features = [
-                # components/performance_manager/public/features.h
-                "DisableTabDiscarding",
-            ]
-
-            def _merge_feature_switch(arg_prefix: str, feature_names: List[str]):
-                existing: List[str] = []
-                for arg in list(browser_args):
-                    if arg.startswith(arg_prefix):
-                        browser_args.remove(arg)
-                        existing.extend([f.strip() for f in arg[len(arg_prefix):].split(",") if f.strip()])
-
-                merged = sorted(set(existing + feature_names))
-                if merged:
-                    browser_args.append(f"{arg_prefix}{','.join(merged)}")
-
-            _merge_feature_switch("--disable-features=", disable_features)
-            _merge_feature_switch("--enable-features=", enable_features)
 
             log("Applied anti-throttle Chromium switches for backgrounding/occlusion", "WorkerPool")
             anti_throttle_args = [
