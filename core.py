@@ -2961,13 +2961,15 @@ class GeminiWebAutomation(BaseAutomation):
                         c_btns = self.page.locator(copy_selector)
                         c_count = await c_btns.count()
                         is_done = False
+                        btn = None
                         if c_count > pre_send_count:
                             last_btn = c_btns.nth(c_count - 1)
                             if await last_btn.is_visible():
                                 is_done = True
-                        return shot, c_count, is_done
+                                btn = last_btn
+                        return shot, c_count, is_done, btn
 
-                    page_snapshot, current_count, done_signaled = await asyncio.wait_for(
+                    page_snapshot, current_count, done_signaled, found_btn = await asyncio.wait_for(
                         gather_page_state(),
                         timeout=15.0
                     )
@@ -2988,9 +2990,7 @@ class GeminiWebAutomation(BaseAutomation):
                     return {"success": False, "error": "Google 500 error page"}
 
                 if done_signaled:
-                    c_btns = self.page.locator(copy_selector)
-                    if await c_btns.count() > 0:
-                        copy_btn = c_btns.nth(await c_btns.count() - 1)
+                    copy_btn = found_btn
                     break
 
                 now = time.time()
