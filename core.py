@@ -41,8 +41,8 @@ SLOW_VM_MODE = os.getenv("SLOW_VM_MODE", "true").lower() == "true"
 DEBUG_SCREENSHOTS = os.getenv("DEBUG_SCREENSHOTS", "false").lower() == "true"
 DEBUG_SCREENSHOT_DIR = os.path.join(os.path.dirname(__file__), "debug_screenshots")
 
-# Prompt file upload optimization for long prompts (disabled by default so google_search works reliably)
-ENABLE_PROMPT_FILE_UPLOAD = os.getenv("ENABLE_PROMPT_FILE_UPLOAD", "false").lower() in ("true", "1", "yes")
+# Prompt file upload optimization for long prompts
+ENABLE_PROMPT_FILE_UPLOAD = os.getenv("ENABLE_PROMPT_FILE_UPLOAD", "true").lower() in ("true", "1", "yes")
 PROMPT_FILE_UPLOAD_THRESHOLD = int(os.getenv("PROMPT_FILE_UPLOAD_THRESHOLD", "1500"))
 
 # Reliability constants (intentionally hardcoded)
