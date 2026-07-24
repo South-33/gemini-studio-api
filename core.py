@@ -3948,12 +3948,22 @@ class GeminiWebAutomation(BaseAutomation):
 
                 if uploaded:
                     log(f"✅ Prompt .txt file attached cleanly & ready to send.", f"Worker {self.worker_id}")
-                    try:
-                        await input_area.fill("")
-                    except Exception:
-                        pass
+                    short_input_text = ""
+                    prompt_lower = prompt_str.lower()
+                    if "google" in prompt_lower or "search" in prompt_lower:
+                        short_input_text = "Use google_search right now."
+                        try:
+                            await input_area.fill(short_input_text)
+                            log(f"Typed search command into input box: '{short_input_text}'", f"Worker {self.worker_id}")
+                        except Exception as fe:
+                            log(f"Failed to fill search command: {fe}", f"Worker {self.worker_id}")
+                    else:
+                        try:
+                            await input_area.fill("")
+                        except Exception:
+                            pass
                     await self._human_delay(200, 400)
-                    return "", temp_file_path
+                    return short_input_text, temp_file_path
                 else:
                     log(f"⚠️ File upload failed, falling back to direct text fill...", f"Worker {self.worker_id}")
                     if os.path.exists(temp_file_path):
