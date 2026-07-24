@@ -109,21 +109,22 @@ class OpenAIChatRequest(BaseModel):
 def parse_model_and_thinking(model_name: str) -> tuple:
     """
     Parse model and thinking level from model name.
-    Canonical model IDs (preferred):
-    - gemini-3.1-flash-lite
-    - gemini-3.5-flash
+    Canonical Web UI model IDs:
+    - gemini-3.6-flash
+    - gemini-3.5-flash-lite
     - gemini-3.1-pro
 
     Thinking suffixes: -extended, :extended, -standard, -high, -medium, -low, -minimal
 
-    Legacy aliases (deprecated, still supported):
-    - fast / lite / flash-lite  → gemini-3.1-flash-lite
-    - flash                     → gemini-3.5-flash
-    - thinking                  → gemini-3.5-flash + Extended
-    - pro                       → gemini-3.1-pro
+    Clean Aliases (recommended for version-agnostic client configuration):
+    - flash, gemini-flash                     → gemini-3.6-flash
+    - flash-lite, flash lite, fast, lite      → gemini-3.5-flash-lite
+    - pro, gemini-pro                          → gemini-3.1-pro
+    - thinking                                 → gemini-3.6-flash + Extended
+    - gemini-3.5-flash, 3.5-flash              → gemini-3.6-flash
+    - gemini-3.1-flash-lite, 3.1-flash-lite    → gemini-3.5-flash-lite
     """
     model_lower = model_name.lower().strip()
-    legacy_alias: Optional[str] = None  # Track for deprecation warning
 
     # 1. Parse thinking level suffix first
     thinking_level = None
@@ -138,38 +139,19 @@ def parse_model_and_thinking(model_name: str) -> tuple:
             model_lower = model_lower[:-(len(suffix) + 1)].strip()
             break
 
-    # 2. Map to canonical Web UI model slugs
-    if model_lower in {"gemini-3.1-flash-lite", "3.1-flash-lite"}:
-        base_model = "gemini-3.1-flash-lite"
-    elif model_lower in {"gemini-3.5-flash", "3.5-flash"}:
-        base_model = "gemini-3.5-flash"
-    elif model_lower in {"gemini-3.1-pro", "3.1-pro"}:
+    # 2. Map to canonical Web UI model slugs and aliases
+    if model_lower in {"gemini-3.6-flash", "3.6-flash", "gemini-3.5-flash", "3.5-flash", "flash", "gemini-flash"}:
+        base_model = "gemini-3.6-flash"
+    elif model_lower in {"gemini-3.5-flash-lite", "3.5-flash-lite", "gemini-3.1-flash-lite", "3.1-flash-lite", "flash-lite", "flash lite", "fast", "lite", "gemini-flash-lite"}:
+        base_model = "gemini-3.5-flash-lite"
+    elif model_lower in {"gemini-3.1-pro", "3.1-pro", "pro", "gemini-pro"}:
         base_model = "gemini-3.1-pro"
-    # --- Legacy aliases (log deprecation warning) ---
-    elif model_lower in {"fast", "lite", "flash-lite"}:
-        base_model = "gemini-3.1-flash-lite"
-        legacy_alias = model_lower
-    elif model_lower == "flash":
-        base_model = "gemini-3.5-flash"
-        legacy_alias = model_lower
     elif model_lower == "thinking":
-        base_model = "gemini-3.5-flash"
+        base_model = "gemini-3.6-flash"
         if not thinking_level:
             thinking_level = "Extended"
-        legacy_alias = model_lower
-    elif model_lower == "pro":
-        base_model = "gemini-3.1-pro"
-        legacy_alias = model_lower
     else:
         base_model = model_name  # Unknown — pass through, let worker handle it
-
-    if legacy_alias:
-        log(
-            f"DEPRECATED model alias '{legacy_alias}' → '{base_model}' "
-            f"(thinking={thinking_level or 'Standard'}). "
-            f"Update client to use the canonical model ID.",
-            "API",
-        )
 
     # Default thinking level to Standard if not specified
     if not thinking_level:
@@ -401,9 +383,12 @@ async def list_models():
     """List available Gemini Web models."""
     return {
         "data": [
-            {"id": "gemini-3.1-flash-lite", "object": "model", "provider": "gemini-web"},
-            {"id": "gemini-3.5-flash", "object": "model", "provider": "gemini-web"},
+            {"id": "gemini-3.6-flash", "object": "model", "provider": "gemini-web"},
+            {"id": "gemini-3.5-flash-lite", "object": "model", "provider": "gemini-web"},
             {"id": "gemini-3.1-pro", "object": "model", "provider": "gemini-web"},
+            {"id": "flash", "object": "model", "provider": "gemini-web"},
+            {"id": "flash-lite", "object": "model", "provider": "gemini-web"},
+            {"id": "pro", "object": "model", "provider": "gemini-web"},
         ]
     }
 
@@ -431,7 +416,7 @@ async def openai_chat(request: Request):
     recent_requests.append(trace)
 
     # Extract fields
-    model = body.get("model", "gemini-3-flash-preview")
+    model = body.get("model", "gemini-3.6-flash")
     messages = body.get("messages", [])
     thinking_level_explicit = body.get("thinking_level")
     use_search = body.get("use_search", False)

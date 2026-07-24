@@ -1,9 +1,9 @@
 # Gemini Studio API
 
-A lightweight API that automates Gemini Web to provide OpenAI-compatible endpoints. Use Gemini's actual Web UI models (3.5 Flash, 3.1 Pro, 3.1 Flash-Lite) directly from Roo Code, Cline, or any OpenAI-compatible tool.
+A lightweight API that automates Gemini Web to provide OpenAI-compatible endpoints. Use Gemini's actual Web UI models (3.6 Flash, 3.1 Pro, 3.5 Flash-Lite) directly from Roo Code, Cline, or any OpenAI-compatible tool.
 
 - **OpenAI Compatible** - Works with Roo Code, Cline, Continue, etc.
-- **Web-Aligned Models** - Use exact actual web UI model slugs (e.g. `gemini-3.5-flash`, `gemini-3.1-pro`, `gemini-3.1-flash-lite`) or legacy simplified aliases (`thinking`, `pro`, `flash`, `fast`).
+- **Web-Aligned Models** - Use exact actual web UI model slugs (e.g. `gemini-3.6-flash`, `gemini-3.1-pro`, `gemini-3.5-flash-lite`) or version-agnostic aliases (`flash`, `flash-lite`, `pro`, `thinking`, `fast`).
 - **Image Upload** - Send images via OpenAI Vision API format
 - **Session Persistence** - Login once via Chrome, stays authenticated forever
 - **ngrok Tunnel** - Expose your local API to the internet with a static domain
@@ -12,6 +12,7 @@ A lightweight API that automates Gemini Web to provide OpenAI-compatible endpoin
 - **Discord Alerts** - Error notifications with cooldown and diagnostics payload
 - **Diagnostics Endpoint** - Worker status, error context, and recent request traces
 - **Request Source Tracing** - Track project/client/request-id across logs and diagnostics
+- **Prompt File Upload Optimization** - Converts large text prompts into clipboard text file attachments (`TXT prompt.txt`) to eliminate browser DOM freezing
 
 ---
 
@@ -62,35 +63,35 @@ ngrok http 8000 --domain=your-subdomain.ngrok-free.app
 | **Provider** | OpenAI Compatible |
 | **Base URL** | `https://your-subdomain.ngrok-free.app/v1` |
 | **API Key** | `anything` (ignored) |
-| **Model** | `gemini-3.5-flash`, `gemini-3.1-pro`, `gemini-3.1-flash-lite`, `thinking`, `pro`, `flash`, or `fast` |
+| **Model** | `flash`, `flash-lite`, `pro`, `gemini-3.6-flash`, `gemini-3.5-flash-lite`, `gemini-3.1-pro` |
 
 ---
 
 ## Available Models
 
-The API directly supports the models and settings present in the Gemini Web UI. You can specify them using their slugified names.
+The API directly supports the models and settings present in the Gemini Web UI. You can specify them using their slugified names or clean aliases.
 
 ### Web UI Models
 
 | Model ID | Web UI Name | Default Thinking Level | Supported Suffixes |
 |----------|-------------|------------------------|--------------------|
-| `gemini-3.5-flash` | **3.5 Flash** | `Standard` | `-extended`, `-standard`, `-high`, `-medium`, `-low`, `-minimal` |
+| `gemini-3.6-flash` | **3.6 Flash** | `Standard` | `-extended`, `-standard`, `-high`, `-medium`, `-low`, `-minimal` |
 | `gemini-3.1-pro` | **3.1 Pro** | *N/A* | *None* |
-| `gemini-3.1-flash-lite` | **3.1 Flash-Lite** | *N/A* | *None* |
+| `gemini-3.5-flash-lite` | **3.5 Flash-Lite** | *N/A* | *None* |
 
-### Legacy & Simplified Aliases (Supported for Backwards Compatibility)
+### Version-Agnostic Clean Aliases (Recommended)
 
 | Alias | Resolves To Model | Default Thinking Level |
 |-------|-------------------|------------------------|
-| `thinking` | `gemini-3.5-flash` | `Extended` |
-| `flash` | `gemini-3.5-flash` | `Standard` |
+| `flash` | `gemini-3.6-flash` | `Standard` |
+| `flash-lite` / `fast` | `gemini-3.5-flash-lite` | *N/A* |
 | `pro` | `gemini-3.1-pro` | *N/A* |
-| `fast` | `gemini-3.1-flash-lite` | *N/A* |
+| `thinking` | `gemini-3.6-flash` | `Extended` |
 
 ### Controlling Thinking Levels
-Only the **3.5 Flash** model supports thinking level configuration. You can select a thinking level by appending a suffix or infix to the model name:
-* **Extended Thinking**: `gemini-3.5-flash-extended` (or suffixing `-high`, `-extended`, `:extended`). This will enable the detailed reasoning view in the Web UI.
-* **Standard Thinking**: `gemini-3.5-flash-standard` (or suffixing `-standard`, `:standard`). This runs in the normal fast-answer mode.
+Only the **Flash** model supports thinking level configuration. You can select a thinking level by appending a suffix or infix to the model name:
+* **Extended Thinking**: `flash-extended` / `gemini-3.6-flash-extended` (or suffixing `-high`, `-extended`, `:extended`). This will enable the detailed reasoning view in the Web UI.
+* **Standard Thinking**: `flash-standard` / `gemini-3.6-flash-standard` (or suffixing `-standard`, `:standard`). This runs in the normal fast-answer mode.
 
 ---
 

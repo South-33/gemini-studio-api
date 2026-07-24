@@ -16,4 +16,5 @@ This is the project's AGENTS.md
 - Idle maintenance is pre-request and marks all workers busy; keep it bounded and clear stale busy flags or Playwright transport failures can poison the pool with assignment timeouts.
 - Persistent Chromium restores old pages that are not registered workers -> close all restored pages before pool creation, and never preserve poisoned stall pages after recreation.
 - Gemini 2026 UI uses `Open/Close sidebar`, `bard-sidenav.collapsed`, `gem-menu-item`, and temp active via inner `mat-icon=close`; prefer these attributes over old label-only sidebar detection.
-- API strictly aligns with Web UI model slugs: gemini-3.5-flash, gemini-3.1-pro, gemini-3.1-flash-lite. All models default to Standard thinking level; append suffix/infix (e.g. -extended) to configure.
+- API strictly aligns with Web UI model slugs: gemini-3.6-flash, gemini-3.1-pro, gemini-3.5-flash-lite. Clean version-agnostic aliases (flash, flash-lite, pro) resolve dynamically. All models default to Standard thinking level; append suffix/infix (e.g. -extended) to configure.
+- Prompts >= 1500 chars (configurable via PROMPT_FILE_UPLOAD_THRESHOLD) are automatically converted into text file attachments in clipboard/uploader to prevent DOM contenteditable freezing.

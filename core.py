@@ -5,6 +5,7 @@ import os
 import sys
 import random
 import socket
+import tempfile
 import time
 import uuid
 from collections import deque
@@ -39,6 +40,10 @@ SLOW_VM_MODE = os.getenv("SLOW_VM_MODE", "true").lower() == "true"
 # Debug screenshots on failure (disabled by default for performance)
 DEBUG_SCREENSHOTS = os.getenv("DEBUG_SCREENSHOTS", "false").lower() == "true"
 DEBUG_SCREENSHOT_DIR = os.path.join(os.path.dirname(__file__), "debug_screenshots")
+
+# Prompt file upload optimization for long prompts
+ENABLE_PROMPT_FILE_UPLOAD = os.getenv("ENABLE_PROMPT_FILE_UPLOAD", "true").lower() in ("true", "1", "yes")
+PROMPT_FILE_UPLOAD_THRESHOLD = int(os.getenv("PROMPT_FILE_UPLOAD_THRESHOLD", "1500"))
 
 # Reliability constants (intentionally hardcoded)
 WAIT_LOG_INTERVAL_SECONDS = 10
@@ -1355,14 +1360,14 @@ class GeminiWebAutomation(BaseAutomation):
         tokens = set(re.findall(r"[a-z0-9]+", item_lower))
         
         # Define clean aliases/mapping for validation
-        if model_lower in {"gemini-3.1-flash-lite", "3.1-flash-lite", "flash-lite", "fast", "lite"}:
-            return "3" in tokens and "1" in tokens and "flash" in tokens and "lite" in tokens
+        if model_lower in {"gemini-3.5-flash-lite", "3.5-flash-lite", "gemini-3.1-flash-lite", "3.1-flash-lite", "flash-lite", "flash lite", "fast", "lite", "gemini-flash-lite"}:
+            return "flash" in tokens and "lite" in tokens
         
-        if model_lower in {"gemini-3.5-flash", "3.5-flash", "flash", "thinking"}:
-            return "3" in tokens and "5" in tokens and "flash" in tokens
+        if model_lower in {"gemini-3.6-flash", "3.6-flash", "gemini-3.5-flash", "3.5-flash", "flash", "thinking", "gemini-flash"}:
+            return "flash" in tokens and "lite" not in tokens
             
-        if model_lower in {"gemini-3.1-pro", "3.1-pro", "pro"}:
-            return "3" in tokens and "1" in tokens and "pro" in tokens
+        if model_lower in {"gemini-3.1-pro", "3.1-pro", "pro", "gemini-pro"}:
+            return "pro" in tokens
 
         # Generic token-based fallback
         model_tokens = re.findall(r"[a-z0-9]+", model_lower)
@@ -1370,9 +1375,13 @@ class GeminiWebAutomation(BaseAutomation):
 
     def _model_target_selector(self, model_name: str) -> Optional[str]:
         mapping = {
+            "gemini-3.5-flash-lite": 'gem-menu-item[data-test-id="bard-mode-option-cf41b0e0dd7d53e5"]',
+            "3.5-flash-lite": 'gem-menu-item[data-test-id="bard-mode-option-cf41b0e0dd7d53e5"]',
             "gemini-3.1-flash-lite": 'gem-menu-item[data-test-id="bard-mode-option-cf41b0e0dd7d53e5"]',
             "3.1-flash-lite": 'gem-menu-item[data-test-id="bard-mode-option-cf41b0e0dd7d53e5"]',
             
+            "gemini-3.6-flash": 'gem-menu-item[data-test-id="bard-mode-option-fbb127bbb056c959"]',
+            "3.6-flash": 'gem-menu-item[data-test-id="bard-mode-option-fbb127bbb056c959"]',
             "gemini-3.5-flash": 'gem-menu-item[data-test-id="bard-mode-option-fbb127bbb056c959"]',
             "3.5-flash": 'gem-menu-item[data-test-id="bard-mode-option-fbb127bbb056c959"]',
             
@@ -1398,11 +1407,11 @@ class GeminiWebAutomation(BaseAutomation):
 
             # Detect model
             if "lite" in text:
-                ui_model = "gemini-3.1-flash-lite"
+                ui_model = "gemini-3.5-flash-lite"
             elif "pro" in text:
                 ui_model = "gemini-3.1-pro"
             elif "flash" in text:
-                ui_model = "gemini-3.5-flash"
+                ui_model = "gemini-3.6-flash"
             else:
                 ui_model = None
 
@@ -2044,17 +2053,15 @@ class GeminiWebAutomation(BaseAutomation):
         except:
             pass
 
-        try:
-            await self.page.keyboard.press("Control+Shift+KeyO")
-            await self._human_delay(250, 400)
-            return True
-        except Exception:
+        shortcuts = ["Control+Shift+KeyO", "Control+Shift+O", "Control+Shift+o", "Control+Shift+0"]
+        for sc in shortcuts:
             try:
-                await self.page.keyboard.press("Control+Shift+O")
+                await self.page.keyboard.press(sc)
                 await self._human_delay(250, 400)
                 return True
-            except:
-                return False
+            except Exception:
+                continue
+        return False
 
     async def _ensure_fresh_chat(self) -> bool:
         """Ensure the worker is on a genuinely fresh Gemini chat before sending."""
@@ -2649,15 +2656,10 @@ class GeminiWebAutomation(BaseAutomation):
             await input_area.click()
             await self._human_delay()
             
-            # 3.5 Paste Images (if provided)
-            if images:
-                for img_path in images:
-                    await self._paste_image(img_path)
-                    await self._human_delay(200, 500)
+            # 3.5 Prepare and Enter Prompt (converts long prompts to .txt file in clipboard/attachment if >= THRESHOLD)
+            temp_prompt_file = None
+            filled_text, temp_prompt_file = await self._prepare_and_enter_prompt(input_area, prompt, images)
             
-            await input_area.fill(prompt)
-            await self._human_delay(300, 600)
-
             # Capture state BEFORE sending. These baselines drive all later
             # "did generation start?" checks; taking them after a send attempt
             # can make a real in-flight request look unsent.
@@ -2882,12 +2884,18 @@ class GeminiWebAutomation(BaseAutomation):
                         input_area = self.page.locator(input_selector)
                         await input_area.click()
                         await self._human_delay()
-                        await input_area.fill(prompt)
-                        await self._human_delay(300, 600)
-                        recovery_send_ok = await attempt_send_submission(
-                            "hard_refresh_recovery",
-                            await get_input_text(),
-                        )
+                        rec_filled_text, rec_temp_file = await self._prepare_and_enter_prompt(input_area, prompt, None)
+                        try:
+                            recovery_send_ok = await attempt_send_submission(
+                                "hard_refresh_recovery",
+                                rec_filled_text,
+                            )
+                        finally:
+                            if rec_temp_file and os.path.exists(rec_temp_file):
+                                try:
+                                    os.remove(rec_temp_file)
+                                except Exception:
+                                    pass
                     if not recovery_send_ok:
                         snapshot = await self._capture_state_snapshot()
                         self._track_error("Recovery resend failed", "send_btn", "verify_generation_started", snapshot)
@@ -3381,6 +3389,11 @@ class GeminiWebAutomation(BaseAutomation):
             
             return {"success": False, "error": str(e)}
         finally:
+            if temp_prompt_file and os.path.exists(temp_prompt_file):
+                try:
+                    os.remove(temp_prompt_file)
+                except Exception:
+                    pass
             # Only save diagnostics here if we didn't already save pre-refresh above.
             # If we saved pre-refresh, the page is now the greeting screen and saving
             # again would just overwrite with useless data.
@@ -3466,9 +3479,22 @@ class GeminiWebAutomation(BaseAutomation):
 
             # Wording change fallback (Index-based selection: lite = 0, flash = 1, pro = 2)
             index_map = {
+                "gemini-3.5-flash-lite": 0,
+                "3.5-flash-lite": 0,
                 "gemini-3.1-flash-lite": 0,
+                "3.1-flash-lite": 0,
+                "flash-lite": 0,
+                "fast": 0,
+                "lite": 0,
+                "gemini-3.6-flash": 1,
+                "3.6-flash": 1,
                 "gemini-3.5-flash": 1,
+                "3.5-flash": 1,
+                "flash": 1,
+                "thinking": 1,
                 "gemini-3.1-pro": 2,
+                "3.1-pro": 2,
+                "pro": 2,
             }
             target_index = index_map.get(model_name.strip().lower())
             
@@ -3747,6 +3773,200 @@ class GeminiWebAutomation(BaseAutomation):
             print(f"[Worker {self.worker_id}] ✅ Image pasted")
         except Exception as e:
             print(f"[Worker {self.worker_id}] ⚠️ Image paste warning: {e}")
+
+    async def _upload_file_attachment(self, file_paths: List[str]) -> bool:
+        """Upload file attachments (.txt prompt files, images) via Playwright input file or file chooser."""
+        if not file_paths:
+            return True
+        try:
+            log(f"Uploading {len(file_paths)} file attachment(s): {file_paths}", f"Worker {self.worker_id}")
+            
+            file_inputs = self.page.locator('input[type="file"]')
+            input_count = await file_inputs.count()
+            
+            success = False
+            if input_count > 0:
+                try:
+                    await file_inputs.first.set_input_files(file_paths)
+                    log(f"Attached files via existing input[type='file']", f"Worker {self.worker_id}")
+                    success = True
+                except Exception as e:
+                    log(f"Direct set_input_files error ({e}), trying button trigger...", f"Worker {self.worker_id}")
+            
+            if not success:
+                plus_selectors = [
+                    'button[aria-label*="Upload" i]',
+                    'button[aria-label*="Add" i]',
+                    'button[aria-label*="file" i]',
+                    '[data-test-id*="uploader" i]',
+                    'button[aria-label*="plus" i]',
+                    '.uploader-button',
+                ]
+                plus_btn = None
+                for sel in plus_selectors:
+                    loc = self.page.locator(sel).first
+                    if await loc.count() > 0 and await loc.is_visible():
+                        plus_btn = loc
+                        break
+
+                if plus_btn:
+                    try:
+                        async with self.page.expect_file_chooser(timeout=3000) as fc_info:
+                            await plus_btn.click()
+                        file_chooser = await fc_info.value
+                        await file_chooser.set_files(file_paths)
+                        log(f"Attached files via file chooser trigger", f"Worker {self.worker_id}")
+                        success = True
+                    except Exception as fc_err:
+                        log(f"File chooser trigger failed ({fc_err})", f"Worker {self.worker_id}")
+
+            if not success:
+                try:
+                    await self.page.locator('input[type="file"]').first.set_input_files(file_paths)
+                    success = True
+                except Exception as e:
+                    log(f"Fallback set_input_files failed: {e}", f"Worker {self.worker_id}")
+
+            if not success:
+                return False
+
+            # Wait for upload spinner to disappear and send button / file card to become active
+            deadline = time.time() + 30.0
+            while time.time() < deadline:
+                spinner = self.page.locator('mat-progress-spinner, [role="progressbar"], .upload-spinner, .loading-spinner').first
+                has_spinner = await spinner.count() > 0 and await spinner.is_visible()
+
+                send_selector = await self._resolve_selector("send_btn", require_visible=True, timeout_ms=500)
+                send_enabled = False
+                if send_selector:
+                    send_btn = self.page.locator(send_selector).first
+                    if await send_btn.count() > 0 and await send_btn.is_visible():
+                        if not await send_btn.is_disabled():
+                            send_enabled = True
+
+                if not has_spinner and send_enabled:
+                    log(f"✅ Attachment upload complete & send button ready", f"Worker {self.worker_id}")
+                    return True
+
+                await asyncio.sleep(0.3)
+
+            log(f"⚠️ Upload wait timeout reached, proceeding to send attempt...", f"Worker {self.worker_id}")
+            return True
+        except Exception as e:
+            log(f"⚠️ Error uploading file attachments: {e}", f"Worker {self.worker_id}")
+            return False
+
+    async def _prepare_and_enter_prompt(
+        self, input_area, prompt: str, images: Optional[List[str]] = None
+    ) -> Tuple[str, Optional[str]]:
+        """
+        Enter prompt into Gemini Web UI.
+        If len(prompt) >= PROMPT_FILE_UPLOAD_THRESHOLD and ENABLE_PROMPT_FILE_UPLOAD is True,
+        converts the prompt to a .txt file in clipboard / attachment to prevent DOM contenteditable freezing.
+        Returns tuple of (entered_text_or_empty, created_temp_file_path).
+        """
+        prompt_str = (prompt or "").strip()
+        should_file_upload = (
+            ENABLE_PROMPT_FILE_UPLOAD
+            and len(prompt_str) >= PROMPT_FILE_UPLOAD_THRESHOLD
+        )
+
+        if should_file_upload:
+            temp_file_path = None
+            try:
+                log(
+                    f"Prompt length ({len(prompt_str)} chars) >= threshold ({PROMPT_FILE_UPLOAD_THRESHOLD}). "
+                    f"Converting prompt to text file in clipboard/attachment to prevent UI freeze...",
+                    f"Worker {self.worker_id}"
+                )
+                temp_dir = os.path.join(tempfile.gettempdir(), "gemini_prompt_files")
+                os.makedirs(temp_dir, exist_ok=True)
+                temp_file_path = os.path.join(
+                    temp_dir, f"prompt_{self.worker_id}_{int(time.time()*1000)}.txt"
+                )
+                with open(temp_file_path, "w", encoding="utf-8") as f:
+                    f.write(prompt_str)
+
+                # Try clipboard paste event first
+                pasted_via_clipboard = False
+                try:
+                    prompt_b64 = base64.b64encode(prompt_str.encode('utf-8')).decode('utf-8')
+                    await self.page.evaluate(f'''
+                        async () => {{
+                            const b64 = "{prompt_b64}";
+                            const binary = atob(b64);
+                            const bytes = new Uint8Array(binary.length);
+                            for (let i = 0; i < binary.length; i++) {{
+                                bytes[i] = binary.charCodeAt(i);
+                            }}
+                            const blob = new Blob([bytes], {{ type: 'text/plain' }});
+                            const file = new File([blob], 'prompt.txt', {{ type: 'text/plain' }});
+                            const dt = new DataTransfer();
+                            dt.items.add(file);
+                            const pasteEvent = new ClipboardEvent('paste', {{
+                                clipboardData: dt,
+                                bubbles: true,
+                                cancelable: true
+                            }});
+                            const activeEl = document.activeElement || document.querySelector('div[contenteditable="true"]');
+                            if (activeEl) activeEl.dispatchEvent(pasteEvent);
+                        }}
+                    ''')
+                    await self._human_delay(300, 600)
+                    
+                    spinner = self.page.locator('mat-progress-spinner, [role="progressbar"], .upload-spinner, .loading-spinner, file-card').first
+                    if await spinner.count() > 0:
+                        pasted_via_clipboard = True
+                        log(f"Attached prompt file via clipboard event", f"Worker {self.worker_id}")
+                except Exception as cb_err:
+                    log(f"Clipboard paste event skipped ({cb_err}), using file uploader...", f"Worker {self.worker_id}")
+
+                file_paths = [temp_file_path]
+                if images:
+                    file_paths.extend(images)
+
+                uploaded = False
+                if not pasted_via_clipboard:
+                    uploaded = await self._upload_file_attachment(file_paths)
+                else:
+                    if images:
+                        await self._upload_file_attachment(images)
+                    uploaded = True
+
+                if uploaded:
+                    log(f"✅ Prompt .txt file attached cleanly.", f"Worker {self.worker_id}")
+                    try:
+                        await input_area.fill("")
+                    except Exception:
+                        pass
+                    await self._human_delay(200, 400)
+                    return "", temp_file_path
+                else:
+                    log(f"⚠️ File upload failed, falling back to direct text fill...", f"Worker {self.worker_id}")
+                    if os.path.exists(temp_file_path):
+                        try:
+                            os.remove(temp_file_path)
+                        except Exception:
+                            pass
+                    temp_file_path = None
+            except Exception as e:
+                log(f"⚠️ Prompt file attachment failed ({e}), falling back to direct text fill...", f"Worker {self.worker_id}")
+                if temp_file_path and os.path.exists(temp_file_path):
+                    try:
+                        os.remove(temp_file_path)
+                    except Exception:
+                        pass
+                temp_file_path = None
+
+        # Standard paste path (for short prompts or fallback)
+        if images:
+            for img_path in images:
+                await self._paste_image(img_path)
+                await self._human_delay(200, 500)
+
+        await input_area.fill(prompt_str)
+        await self._human_delay(300, 600)
+        return prompt_str, None
 
     async def close(self):
         await super().close()
