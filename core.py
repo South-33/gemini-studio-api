@@ -2745,6 +2745,9 @@ class GeminiWebAutomation(BaseAutomation):
                 except:
                     pass
 
+                # Ensure any pending attachment upload spinner has cleared and Send button is active
+                await self._wait_for_attachment_upload_complete(15.0)
+
                 try:
                     await input_area.click()
                     await self._human_delay(80, 160)
@@ -3774,6 +3777,60 @@ class GeminiWebAutomation(BaseAutomation):
         except Exception as e:
             print(f"[Worker {self.worker_id}] ⚠️ Image paste warning: {e}")
 
+    async def _wait_for_attachment_upload_complete(self, max_timeout_seconds: float = 30.0) -> bool:
+        """Wait until any file card upload spinner disappears AND the Send button becomes active/enabled."""
+        log(f"Waiting for attachment upload completion...", f"Worker {self.worker_id}")
+        start = time.time()
+        deadline = start + max_timeout_seconds
+
+        # Brief delay for DOM spinner mounting
+        await asyncio.sleep(0.5)
+
+        while time.time() < deadline:
+            # 1. Check for active upload spinners inside file card or prompt area
+            spinner_selectors = [
+                'file-card mat-progress-spinner',
+                'file-card [role="progressbar"]',
+                'file-card .upload-spinner',
+                'file-card .loading-spinner',
+                'mat-progress-spinner',
+                '[role="progressbar"]',
+                '.upload-spinner',
+                '.loading-spinner',
+            ]
+            has_active_spinner = False
+            for sel in spinner_selectors:
+                loc = self.page.locator(sel).first
+                if await loc.count() > 0 and await loc.is_visible():
+                    has_active_spinner = True
+                    break
+
+            # 2. Check if Send button exists and is ENABLED
+            send_selector = await self._resolve_selector("send_btn", require_visible=True, timeout_ms=500)
+            send_ready = False
+            if send_selector:
+                send_btn = self.page.locator(send_selector).first
+                if await send_btn.count() > 0 and await send_btn.is_visible():
+                    try:
+                        disabled_attr = await send_btn.get_attribute("disabled")
+                        aria_disabled = await send_btn.get_attribute("aria-disabled")
+                        is_disabled = await send_btn.is_disabled()
+                        if disabled_attr is None and aria_disabled != "true" and not is_disabled:
+                            send_ready = True
+                    except Exception:
+                        pass
+
+            if not has_active_spinner and send_ready:
+                elapsed = round(time.time() - start, 2)
+                log(f"✅ Attachment upload complete & Send button ready ({elapsed}s)", f"Worker {self.worker_id}")
+                return True
+
+            await asyncio.sleep(0.3)
+
+        elapsed = round(time.time() - start, 2)
+        log(f"⚠️ Attachment upload wait timeout ({elapsed}s), proceeding to send attempt", f"Worker {self.worker_id}")
+        return False
+
     async def _upload_file_attachment(self, file_paths: List[str]) -> bool:
         """Upload file attachments (.txt prompt files, images) via Playwright input file or file chooser."""
         if not file_paths:
@@ -3830,28 +3887,7 @@ class GeminiWebAutomation(BaseAutomation):
             if not success:
                 return False
 
-            # Wait for upload spinner to disappear and send button / file card to become active
-            deadline = time.time() + 30.0
-            while time.time() < deadline:
-                spinner = self.page.locator('mat-progress-spinner, [role="progressbar"], .upload-spinner, .loading-spinner').first
-                has_spinner = await spinner.count() > 0 and await spinner.is_visible()
-
-                send_selector = await self._resolve_selector("send_btn", require_visible=True, timeout_ms=500)
-                send_enabled = False
-                if send_selector:
-                    send_btn = self.page.locator(send_selector).first
-                    if await send_btn.count() > 0 and await send_btn.is_visible():
-                        if not await send_btn.is_disabled():
-                            send_enabled = True
-
-                if not has_spinner and send_enabled:
-                    log(f"✅ Attachment upload complete & send button ready", f"Worker {self.worker_id}")
-                    return True
-
-                await asyncio.sleep(0.3)
-
-            log(f"⚠️ Upload wait timeout reached, proceeding to send attempt...", f"Worker {self.worker_id}")
-            return True
+            return await self._wait_for_attachment_upload_complete(30.0)
         except Exception as e:
             log(f"⚠️ Error uploading file attachments: {e}", f"Worker {self.worker_id}")
             return False
@@ -3931,10 +3967,11 @@ class GeminiWebAutomation(BaseAutomation):
                 else:
                     if images:
                         await self._upload_file_attachment(images)
-                    uploaded = True
+                    else:
+                        uploaded = await self._wait_for_attachment_upload_complete(30.0)
 
                 if uploaded:
-                    log(f"✅ Prompt .txt file attached cleanly.", f"Worker {self.worker_id}")
+                    log(f"✅ Prompt .txt file attached cleanly & ready to send.", f"Worker {self.worker_id}")
                     try:
                         await input_area.fill("")
                     except Exception:
