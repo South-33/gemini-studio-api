@@ -37,7 +37,7 @@ cd path\to\gemini-studio-api
 python main.py
 ```
 
-A Chrome window will open on the remote desktop (HEADLESS defaults to false). Log into Google and go to `gemini.google.com`. Once logged in, stop the script (Ctrl+C).
+A Chrome window will open on the remote desktop (HEADLESS defaults to false). Log into Google and go to `gemini.google.com`. The API selects the **Chat** tab (`app-tab-chat`) automatically before it initializes; **Spark** is not supported. Once logged in, stop the script (Ctrl+C).
 
 Then set `HEADLESS=true` in your `.env` file for background operation.
 

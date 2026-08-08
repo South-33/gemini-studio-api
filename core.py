@@ -699,7 +699,11 @@ class AIStudioAutomation(BaseAutomation):
         await super().close()
 
 class GeminiWebAutomation(BaseAutomation):
-    URL = "https://gemini.google.com/"
+    # Gemini remembers the last side-bar mode (Chat or Spark).  Always start on
+    # the Chat surface because the automation selectors and generation flow are
+    # implemented for Chat, not Spark.
+    CHAT_URL = "https://gemini.google.com/app"
+    URL = CHAT_URL
     
     # Hard refresh every N requests to clear browser cache/memory
     REFRESH_EVERY_N_REQUESTS = 10
@@ -812,6 +816,15 @@ class GeminiWebAutomation(BaseAutomation):
             'button.close-sidenav-button',
             'button[aria-label="Main menu"]',
             '[aria-label="Main menu"]',
+        ],
+        # These test ids are present on the Gemini mode switcher and are more
+        # reliable than the Ctrl+Shift+S shortcut, which merely toggles from
+        # whichever mode happened to be selected last.
+        "chat_tab": [
+            'button[data-test-id="app-tab-chat"]',
+        ],
+        "spark_tab": [
+            'button[data-test-id="app-tab-agent"]',
         ],
         "copy_btn": [
             'button[aria-label="Copy"]',
@@ -1202,6 +1215,7 @@ class GeminiWebAutomation(BaseAutomation):
                 lines = [
                     f"URL        : {dom_info.get('url', '')}",
                     f"Title      : {dom_info.get('title', '')}",
+                    f"Mode       : chat_active={snapshot.get('chat_mode_active')} spark_active={snapshot.get('spark_mode_active')}",
                     f"Stop btn   : {dom_info.get('stopVisible')}  Send btn: {dom_info.get('sendVisible')}",
                     f"Phase      : {snapshot.get('phase')}  Visibility: {snapshot.get('visibility')}",
                     f"Counts     : users={snapshot.get('user_query_count')} responses={snapshot.get('response_count')} copy={snapshot.get('copy_count')} response_copy={snapshot.get('response_copy_count')} input_copy={snapshot.get('input_copy_count')}",
@@ -1477,6 +1491,9 @@ class GeminiWebAutomation(BaseAutomation):
             "visibility": "unknown",
             "network_events": [],
             "network_outage": None,
+            "chat_tab_visible": False,
+            "chat_mode_active": False,
+            "spark_mode_active": False,
         }
 
         if not self.page:
@@ -1505,6 +1522,13 @@ class GeminiWebAutomation(BaseAutomation):
                         bodyText.includes("500. that's an error") ||
                         bodyText.includes("there was an error. please try again later. that's all we know.");
                     const tempBtn = document.querySelector('[data-test-id="temp-chat-button"], button[aria-label="Temporary chat"]');
+                    const chatTab = document.querySelector('button[data-test-id="app-tab-chat"]');
+                    const sparkTab = document.querySelector('button[data-test-id="app-tab-agent"]');
+                    const isActiveModeTab = (el) => !!(el && (
+                        el.classList.contains('app-tab--active') ||
+                        el.getAttribute('aria-selected') === 'true' ||
+                        el.getAttribute('aria-current') === 'page'
+                    ));
                     const transitionSpinner = document.querySelector('.loading-content-spinner-container');
 
                     const buttons = Array.from(document.querySelectorAll('button')).filter(isVisible);
@@ -1647,6 +1671,9 @@ class GeminiWebAutomation(BaseAutomation):
                         phase,
                         error_page_500: isGoogle500,
                         visibility: document.visibilityState || 'unknown',
+                        chat_tab_visible: !!(chatTab && isVisible(chatTab)),
+                        chat_mode_active: isActiveModeTab(chatTab),
+                        spark_mode_active: isActiveModeTab(sparkTab),
                     };
                 }
                 """
@@ -2012,6 +2039,78 @@ class GeminiWebAutomation(BaseAutomation):
                     return True
 
             await asyncio.sleep(0.2)
+        return False
+
+    @staticmethod
+    def _is_chat_mode(snapshot: Optional[Dict[str, Any]]) -> bool:
+        """Return true only when Gemini's Chat tab is the active mode."""
+        snap = snapshot or {}
+        return bool(snap.get("chat_mode_active") and not snap.get("spark_mode_active"))
+
+    async def _ensure_chat_mode(self, timeout_seconds: float = 8.0) -> bool:
+        """Select Gemini Chat explicitly before using Chat-only selectors.
+
+        Gemini persists the Chat/Spark choice and Ctrl+Shift+S is a toggle, so
+        sending the shortcut is not idempotent.  The mode switcher exposes
+        stable test ids; click the Chat button only when it is not already
+        active, then verify the active class and Chat input before continuing.
+        """
+        snapshot = await self._capture_state_snapshot()
+        if self._is_chat_mode(snapshot):
+            return True
+
+        # The mode switcher lives in the side navigation in the current UI.
+        # Opening it is harmless when it is already visible.
+        await self._ensure_sidebar_open()
+        chat_tab = await self._resolve_locator("chat_tab", require_visible=True, timeout_ms=2000)
+        if chat_tab is None:
+            log("Chat mode tab was not found", f"Worker {self.worker_id}")
+            self._track_error("Chat mode tab not found", "chat_tab", "ensure_chat_mode", snapshot)
+            return False
+
+        clicked = False
+        try:
+            await chat_tab.click(timeout=2500)
+            clicked = True
+        except Exception as click_error:
+            # Keep a DOM click fallback for transient overlay/focus issues.
+            try:
+                await self.page.evaluate(
+                    """
+                    () => {
+                        const button = document.querySelector('button[data-test-id="app-tab-chat"]');
+                        if (!button) throw new Error('Chat mode tab not found');
+                        button.click();
+                    }
+                    """
+                )
+                clicked = True
+            except Exception as dom_error:
+                log(
+                    f"Chat mode click failed: {click_error}; DOM fallback failed: {dom_error}",
+                    f"Worker {self.worker_id}",
+                )
+
+        if not clicked:
+            self._track_error("Chat mode click failed", "chat_tab", "ensure_chat_mode", snapshot)
+            return False
+
+        deadline = time.time() + timeout_seconds
+        while time.time() < deadline:
+            current = await self._capture_state_snapshot()
+            if self._is_chat_mode(current) and current.get("input_visible"):
+                log("Gemini Chat mode confirmed", f"Worker {self.worker_id}")
+                return True
+            await asyncio.sleep(0.2)
+
+        final_snapshot = await self._capture_state_snapshot()
+        log(
+            f"Chat mode confirmation timed out: chat_active={final_snapshot.get('chat_mode_active')} "
+            f"spark_active={final_snapshot.get('spark_mode_active')} input={final_snapshot.get('input_visible')} "
+            f"url={final_snapshot.get('url')}",
+            f"Worker {self.worker_id}",
+        )
+        self._track_error("Chat mode confirmation timed out", "chat_tab", "ensure_chat_mode", final_snapshot)
         return False
 
     async def _ensure_sidebar_open(self) -> bool:
@@ -2473,6 +2572,12 @@ class GeminiWebAutomation(BaseAutomation):
                             continue
                     raise Exception(f"Google 500 error page during init: {snapshot.get('page_title') or self.page.url}")
 
+                # Do this before resolving the prompt selector: Spark has a
+                # different composer and can look superficially healthy while
+                # all Chat generation/reset selectors are unavailable.
+                if not await self._ensure_chat_mode():
+                    raise Exception("Gemini Chat mode could not be selected")
+
                 # Wait for input to be ready (login check)
                 input_selector = await self._resolve_selector("input", require_visible=True, timeout_ms=12000)
                 if not input_selector:
@@ -2546,6 +2651,13 @@ class GeminiWebAutomation(BaseAutomation):
             self._log(
                 f"[{self._request_id}] Request: model={model}, prompt_chars={prompt_chars}, prompt_tokens_est={prompt_tokens_est}"
             )
+
+            # A user/browser session can switch modes after worker init.  Make
+            # the Chat requirement idempotent at the request boundary too.
+            if not await self._ensure_chat_mode():
+                err = "Gemini Chat mode is not active"
+                self._track_error(err, "chat_tab", "send_message")
+                return {"success": False, "error": err}
 
             copy_selector = await self._resolve_selector("copy_btn")
             if not copy_selector:

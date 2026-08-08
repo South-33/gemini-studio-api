@@ -29,6 +29,7 @@ class FakeContext:
 class FakeLocator:
     def __init__(self):
         self.filled = []
+        self.clicked = 0
 
     @property
     def first(self):
@@ -36,6 +37,9 @@ class FakeLocator:
 
     async def fill(self, value, timeout=None):
         self.filled.append((value, timeout))
+
+    async def click(self, timeout=None):
+        self.clicked += 1
 
 
 class FakeLocatorPage:
@@ -47,6 +51,35 @@ class FakeLocatorPage:
 
 
 class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    def test_chat_mode_requires_chat_active_and_spark_inactive(self):
+        self.assertTrue(GeminiWebAutomation._is_chat_mode({
+            "chat_mode_active": True,
+            "spark_mode_active": False,
+        }))
+        self.assertFalse(GeminiWebAutomation._is_chat_mode({
+            "chat_mode_active": False,
+            "spark_mode_active": True,
+        }))
+        self.assertFalse(GeminiWebAutomation._is_chat_mode({
+            "chat_mode_active": True,
+            "spark_mode_active": True,
+        }))
+
+    async def test_chat_mode_clicks_chat_tab_when_spark_is_active(self):
+        worker = GeminiWebAutomation(worker_id=1)
+        chat_tab = FakeLocator()
+        worker._ensure_sidebar_open = AsyncMock(return_value=True)
+        worker._resolve_locator = AsyncMock(return_value=chat_tab)
+        worker._capture_state_snapshot = AsyncMock(side_effect=[
+            {"chat_mode_active": False, "spark_mode_active": True},
+            {"chat_mode_active": True, "spark_mode_active": False, "input_visible": True},
+        ])
+
+        selected = await worker._ensure_chat_mode(timeout_seconds=0.5)
+
+        self.assertTrue(selected)
+        self.assertEqual(chat_tab.clicked, 1)
+
     async def test_startup_closes_all_restored_pages(self):
         pages = [FakePage(), FakePage("about:blank")]
         pool = WorkerPool(worker_count=1)
