@@ -768,8 +768,11 @@ class GeminiWebAutomation(BaseAutomation):
             'button[data-test-id*="send" i]',
         ],
         "model_btn": [
-            '[data-test-id*="mode" i]',
+            # Exact picker first: the broad mode substring also matches the
+            # mode-switcher container and causes strict-locator failures.
             'button[data-test-id="bard-mode-menu-button"]',
+            'button[aria-label^="Open mode picker" i]',
+            '[data-test-id*="mode" i]',
             'button[aria-label*="mode" i]',
             'button[aria-label*="model" i]',
             'button[aria-label*="picker" i]',
@@ -1494,6 +1497,9 @@ class GeminiWebAutomation(BaseAutomation):
             "chat_tab_visible": False,
             "chat_mode_active": False,
             "spark_mode_active": False,
+            "model_button_text": "",
+            "model_button_aria_label": "",
+            "model_picker_count": 0,
         }
 
         if not self.page:
@@ -1524,6 +1530,10 @@ class GeminiWebAutomation(BaseAutomation):
                     const tempBtn = document.querySelector('[data-test-id="temp-chat-button"], button[aria-label="Temporary chat"]');
                     const chatTab = document.querySelector('button[data-test-id="app-tab-chat"]');
                     const sparkTab = document.querySelector('button[data-test-id="app-tab-agent"]');
+                    const modelPickers = Array.from(document.querySelectorAll(
+                        'button[data-test-id="bard-mode-menu-button"], button[aria-label^="Open mode picker" i]'
+                    )).filter(isVisible);
+                    const modelPicker = modelPickers[0] || null;
                     const isActiveModeTab = (el) => !!(el && (
                         el.classList.contains('app-tab--active') ||
                         el.getAttribute('aria-selected') === 'true' ||
@@ -1674,6 +1684,9 @@ class GeminiWebAutomation(BaseAutomation):
                         chat_tab_visible: !!(chatTab && isVisible(chatTab)),
                         chat_mode_active: isActiveModeTab(chatTab),
                         spark_mode_active: isActiveModeTab(sparkTab),
+                        model_button_text: (modelPicker?.innerText || modelPicker?.textContent || '').trim().slice(0, 160),
+                        model_button_aria_label: (modelPicker?.getAttribute('aria-label') || '').trim().slice(0, 160),
+                        model_picker_count: modelPickers.length,
                     };
                 }
                 """
@@ -2063,9 +2076,38 @@ class GeminiWebAutomation(BaseAutomation):
         # Opening it is harmless when it is already visible.
         await self._ensure_sidebar_open()
         chat_tab = await self._resolve_locator("chat_tab", require_visible=True, timeout_ms=2000)
+
+        async def toggle_chat_with_shortcut() -> bool:
+            # Ctrl+Shift+S is a toggle, not an idempotent selector. Only use it
+            # as a last-resort fallback when the snapshot already proves Spark
+            # is active, and always verify the resulting mode below.
+            if not snapshot.get("spark_mode_active"):
+                return False
+            try:
+                await self.page.bring_to_front()
+                await self.page.keyboard.press("Control+Shift+S")
+                await self._human_delay(250, 400)
+                return True
+            except Exception as shortcut_error:
+                log(f"Chat mode shortcut failed: {shortcut_error}", f"Worker {self.worker_id}")
+                return False
+
         if chat_tab is None:
-            log("Chat mode tab was not found", f"Worker {self.worker_id}")
-            self._track_error("Chat mode tab not found", "chat_tab", "ensure_chat_mode", snapshot)
+            if not await toggle_chat_with_shortcut():
+                log("Chat mode tab was not found", f"Worker {self.worker_id}")
+                self._track_error("Chat mode tab not found", "chat_tab", "ensure_chat_mode", snapshot)
+                return False
+
+            deadline = time.time() + timeout_seconds
+            while time.time() < deadline:
+                current = await self._capture_state_snapshot()
+                if self._is_chat_mode(current) and current.get("input_visible"):
+                    log("Gemini Chat mode confirmed via shortcut", f"Worker {self.worker_id}")
+                    return True
+                await asyncio.sleep(0.2)
+
+            final_snapshot = await self._capture_state_snapshot()
+            self._track_error("Chat mode shortcut confirmation timed out", "chat_tab", "ensure_chat_mode", final_snapshot)
             return False
 
         clicked = False
@@ -2091,7 +2133,7 @@ class GeminiWebAutomation(BaseAutomation):
                     f"Worker {self.worker_id}",
                 )
 
-        if not clicked:
+        if not clicked and not await toggle_chat_with_shortcut():
             self._track_error("Chat mode click failed", "chat_tab", "ensure_chat_mode", snapshot)
             return False
 
@@ -2146,6 +2188,17 @@ class GeminiWebAutomation(BaseAutomation):
             await asyncio.sleep(0.2)
         return False
 
+    async def _trigger_new_chat_shortcut(self) -> bool:
+        """Use Gemini's Chat-only new-conversation shortcut after mode guard."""
+        try:
+            await self.page.bring_to_front()
+            await self.page.keyboard.press("Control+Shift+O")
+            await self._human_delay(250, 400)
+            return True
+        except Exception as e:
+            log(f"New Chat shortcut failed: {e}", f"Worker {self.worker_id}")
+            return False
+
     async def _ensure_fresh_chat(self) -> bool:
         """Ensure the worker is on a fresh Chat conversation before sending."""
         if not await self._ensure_chat_mode():
@@ -2155,6 +2208,31 @@ class GeminiWebAutomation(BaseAutomation):
         baseline_state = self._classify_new_chat_state(baseline)
         if baseline_state == "confirmed_cleared":
             return True
+
+        # Ctrl+Shift+O is Gemini's new-chat shortcut. It is safe only after the
+        # explicit Chat-mode guard because Ctrl+Shift+S is a separate mode toggle.
+        for attempt in range(2):
+            if not await self._trigger_new_chat_shortcut():
+                break
+
+            # Re-assert Chat after navigation before trusting the reset state.
+            if not await self._ensure_chat_mode():
+                break
+
+            deadline = time.time() + 4.0
+            last_state = baseline_state
+            while time.time() < deadline:
+                snap = await self._capture_state_snapshot()
+                state = self._classify_new_chat_state(snap)
+                last_state = state
+                if state == "confirmed_cleared":
+                    return True
+                await asyncio.sleep(0.2)
+
+            log(
+                f"New Chat shortcut attempt {attempt + 1}: state remained {last_state}",
+                f"Worker {self.worker_id}",
+            )
 
         new_chat_selectors = self._selector_candidates("new_chat")
         if not new_chat_selectors:
@@ -2606,6 +2684,9 @@ class GeminiWebAutomation(BaseAutomation):
         self._request_log_lines = log_buffer
         token = current_request_log_buffer.set(log_buffer)
         self._last_request_success = False
+        # The finally block always cleans up an attachment path, including
+        # failures during Chat reset or model selection.
+        temp_prompt_file = None
 
         try:
             self._thinking_requested = bool(thinking_level and thinking_level.lower() in {"extended", "high", "deep"})
@@ -2715,10 +2796,19 @@ class GeminiWebAutomation(BaseAutomation):
 
                 # Select model if it differs
                 if model and self._current_selected_model != model:
-                    await self._select_model(model)
-                    self._current_selected_model = model
+                    selected = await self._select_model(model)
                     # Re-read UI state since selecting a model changes the layout / resets defaults
                     ui_model, ui_thinking = await self._get_current_ui_model_and_thinking()
+                    if not selected or not ui_model or not self._matches_model(ui_model, model):
+                        err = f"Requested model {model!r} but Gemini UI is {ui_model or 'unknown'!r}"
+                        self._track_error(
+                            err,
+                            "model_btn",
+                            "send_message",
+                            {"requested_model": model, "ui_model": ui_model, "selection_ok": bool(selected)},
+                        )
+                        return {"success": False, "error": err}
+                    self._current_selected_model = ui_model
                     if ui_thinking:
                         self._current_selected_thinking_level = ui_thinking
 
@@ -3509,12 +3599,12 @@ class GeminiWebAutomation(BaseAutomation):
                     )
                 except Exception as ne:
                     log(f"Failed to send model picker missing notification: {ne}", f"Worker {self.worker_id}")
-                return
+                return False
 
-            btn = self.page.locator(model_selector)
+            btn = self.page.locator(model_selector).first
             current = await btn.inner_text()
             if self._matches_model(current, model_name):
-                return
+                return True
             
             await btn.click()
             await self._human_delay(300, 450)
@@ -3527,7 +3617,7 @@ class GeminiWebAutomation(BaseAutomation):
                     await target.click(timeout=1500)
                     print(f"[Worker {self.worker_id}] ✅ Selected model: {model_name}")
                     await self._human_delay(300, 500)
-                    return
+                    return True
                 except Exception:
                     pass
             
@@ -3547,7 +3637,7 @@ class GeminiWebAutomation(BaseAutomation):
                     log(f"Failed to send model menu item missing notification: {ne}", f"Worker {self.worker_id}")
                 # Close the picker
                 await self.page.keyboard.press("Escape")
-                return
+                return False
 
             items = self.page.locator(menu_item_selector)
             item_count = await items.count()
@@ -3560,7 +3650,7 @@ class GeminiWebAutomation(BaseAutomation):
                     await item.click()
                     print(f"[Worker {self.worker_id}] ✅ Selected model: {model_name}")
                     await self._human_delay(300, 600)
-                    return
+                    return True
 
             # Wording change fallback (Index-based selection: lite = 0, flash = 1, pro = 2)
             index_map = {
@@ -3607,7 +3697,7 @@ class GeminiWebAutomation(BaseAutomation):
                     log(f"Failed to send model name change notification: {ne}", f"Worker {self.worker_id}")
                 
                 await self._human_delay(300, 600)
-                return
+                return True
 
             # If not found at all, close menu
             await self.page.keyboard.press("Escape")
@@ -3628,6 +3718,7 @@ class GeminiWebAutomation(BaseAutomation):
                 )
             except Exception as ne:
                 log(f"Failed to send critical model selection failure notification: {ne}", f"Worker {self.worker_id}")
+            return False
 
         except Exception as e:
             print(f"[Worker {self.worker_id}] ⚠️ Model selection failed: {e}")
@@ -3648,6 +3739,7 @@ class GeminiWebAutomation(BaseAutomation):
                 await self._human_delay(100, 200)
             except:
                 pass
+            return False
 
     async def _set_thinking_level(self, level: str):
         """Set Gemini Web thinking level when explicitly requested."""
@@ -5011,6 +5103,11 @@ class WorkerPool:
             "initialized": self._initialized,
             "provider": self.provider,
             "worker_count": self.worker_count,
+            "parallel_capacity": self.worker_count,
+            "capacity_warning": (
+                "WORKER_COUNT=1 queues concurrent requests; set WORKER_COUNT>=2 to process two requests in parallel"
+                if self.worker_count < 2 else None
+            ),
             "active_requests": self._active_requests,
             "browser_channel": self.browser_channel or "default",
             "next_worker_index": self._next_worker_index + 1,
@@ -5051,8 +5148,15 @@ class WorkerPool:
                     "thinking_label": snapshot.get("thinking_label"),
                     "thinking_active": bool(snapshot.get("thinking_active")),
                     "error_page_500": bool(snapshot.get("error_page_500")),
+                    "chat_mode_active": bool(snapshot.get("chat_mode_active")),
+                    "spark_mode_active": bool(snapshot.get("spark_mode_active")),
+                    "model_button_text": snapshot.get("model_button_text"),
+                    "model_button_aria_label": snapshot.get("model_button_aria_label"),
+                    "model_picker_count": int(snapshot.get("model_picker_count") or 0),
                 }
                 invariant_violations = []
+                if current_state["spark_mode_active"]:
+                    invariant_violations.append("spark_mode_active")
                 if current_state["stop_visible"] and not worker_info["generation_in_progress"]:
                     invariant_violations.append("stop_visible_while_worker_idle")
                 if (
@@ -5064,6 +5168,8 @@ class WorkerPool:
                 worker_info["current_state"] = current_state
                 worker_info["invariant_violations"] = invariant_violations
                 worker_info["last_recovery"] = worker._last_recovery
+                worker_info["selected_model"] = worker._current_selected_model
+                worker_info["selected_thinking_level"] = worker._current_selected_thinking_level
             except Exception as e:
                 worker_info["current_state_error"] = str(e)
         return result

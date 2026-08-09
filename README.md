@@ -12,7 +12,7 @@ A lightweight API that automates Gemini Web to provide OpenAI-compatible endpoin
 - **Discord Alerts** - Error notifications with cooldown and diagnostics payload
 - **Diagnostics Endpoint** - Worker status, error context, and recent request traces
 - **Request Source Tracing** - Track project/client/request-id across logs and diagnostics
-- **Chat Mode Guard** - Selects the Gemini Chat tab explicitly before each request and clicks the visible New chat control (Spark is not supported)
+- **Chat Mode Guard** - Selects and verifies the Gemini Chat tab before each request, then uses Chat's `Ctrl+Shift+O` new-chat shortcut with a visible-button fallback (Spark is not supported)
 - **Prompt File Upload Optimization** - Converts large text prompts into clipboard text file attachments (`TXT prompt.txt`) to eliminate browser DOM freezing
 
 ---
@@ -107,7 +107,7 @@ PORT=8000
 # Browser
 HEADLESS=true             # false to run headed
 BROWSER_CHANNEL=chromium  # optional: new Chromium headless mode
-WORKER_COUNT=2            # Number of worker tabs
+WORKER_COUNT=2            # Number of worker tabs; use >=2 for parallel requests
 BROWSER_TIMEOUT=480       # Worker timeout seconds
 API_TIMEOUT_HEADROOM=30   # API timeout buffer; total API timeout includes retry budget
 RECENT_REQUEST_LIMIT=200  # Recent traces stored for /v1/diagnostics
@@ -247,6 +247,7 @@ print(response.choices[0].message.content)
 | Session expired | Set `HEADLESS=false`, restart, login again |
 | 502 Bad Gateway | Make sure API is running (`python main.py`) |
 | Selector errors | Check `/v1/diagnostics` for details |
+| Second concurrent request waits | Set `WORKER_COUNT=2` (or higher) in `.env`, then restart the API; each request needs its own Gemini tab |
 | No Discord alerts | Run `python test_discord.py` to verify webhook |
 
 ### Diagnostics Endpoint
@@ -270,7 +271,14 @@ Returns:
       "initialized": true,
       "busy": false,
       "generation_in_progress": false,
-      "current_state": {"stop_visible": false, "input_text_len": 0},
+      "current_state": {
+        "stop_visible": false,
+        "input_text_len": 0,
+        "chat_mode_active": true,
+        "spark_mode_active": false,
+        "model_button_text": "Flash",
+        "model_picker_count": 1
+      },
       "invariant_violations": []
     }]
   }

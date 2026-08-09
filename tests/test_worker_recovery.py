@@ -51,6 +51,11 @@ class FakeLocatorPage:
 
 
 class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    def test_model_picker_prefers_exact_gemini_button(self):
+        selectors = GeminiWebAutomation.SELECTORS["model_btn"]
+        self.assertEqual(selectors[0], 'button[data-test-id="bard-mode-menu-button"]')
+        self.assertEqual(selectors[1], 'button[aria-label^="Open mode picker" i]')
+
     def test_chat_mode_requires_chat_active_and_spark_inactive(self):
         self.assertTrue(GeminiWebAutomation._is_chat_mode({
             "chat_mode_active": True,

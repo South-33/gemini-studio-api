@@ -74,6 +74,12 @@ async def lifespan(app: FastAPI):
     success = await init_browser_thread()
     if success:
         log(f"✅ Multi-Worker Pool Ready ({WORKER_COUNT} workers)")
+        if WORKER_COUNT < 2:
+            log(
+                "WORKER_COUNT=1: concurrent requests will queue behind one Gemini tab; "
+                "set WORKER_COUNT=2 or higher for parallel processing",
+                "API",
+            )
     else:
         raise RuntimeError("Worker pool failed to initialize")
     
