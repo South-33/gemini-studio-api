@@ -12,7 +12,7 @@ A lightweight API that automates Gemini Web to provide OpenAI-compatible endpoin
 - **Discord Alerts** - Error notifications with cooldown and diagnostics payload
 - **Diagnostics Endpoint** - Worker status, error context, and recent request traces
 - **Request Source Tracing** - Track project/client/request-id across logs and diagnostics
-- **Chat Mode Guard** - Selects the Gemini Chat tab explicitly before each request (Spark is not supported)
+- **Chat Mode Guard** - Selects the Gemini Chat tab explicitly before each request and clicks the visible New chat control (Spark is not supported)
 - **Prompt File Upload Optimization** - Converts large text prompts into clipboard text file attachments (`TXT prompt.txt`) to eliminate browser DOM freezing
 
 ---

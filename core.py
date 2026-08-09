@@ -2146,49 +2146,15 @@ class GeminiWebAutomation(BaseAutomation):
             await asyncio.sleep(0.2)
         return False
 
-    async def _trigger_new_chat_shortcut(self) -> bool:
-        try:
-            await self.page.bring_to_front()
-        except:
-            pass
-
-        shortcuts = ["Control+Shift+KeyO", "Control+Shift+O", "Control+Shift+o", "Control+Shift+0"]
-        for sc in shortcuts:
-            try:
-                await self.page.keyboard.press(sc)
-                await self._human_delay(250, 400)
-                return True
-            except Exception:
-                continue
-        return False
-
     async def _ensure_fresh_chat(self) -> bool:
-        """Ensure the worker is on a genuinely fresh Gemini chat before sending."""
+        """Ensure the worker is on a fresh Chat conversation before sending."""
+        if not await self._ensure_chat_mode():
+            return False
+
         baseline = await self._capture_state_snapshot()
         baseline_state = self._classify_new_chat_state(baseline)
         if baseline_state == "confirmed_cleared":
             return True
-
-        for attempt in range(2):
-            if not await self._trigger_new_chat_shortcut():
-                break
-
-            deadline = time.time() + 4.0
-            last_state = baseline_state
-            while time.time() < deadline:
-                snap = await self._capture_state_snapshot()
-                state = self._classify_new_chat_state(snap)
-                last_state = state
-                if state == "confirmed_cleared":
-                    if attempt > 0:
-                        log(f"New Chat confirmed after shortcut attempt {attempt + 1}", f"Worker {self.worker_id}")
-                    return True
-                await asyncio.sleep(0.2)
-
-            log(
-                f"⚠️ New Chat shortcut attempt {attempt + 1}: state remained {last_state}",
-                f"Worker {self.worker_id}",
-            )
 
         new_chat_selectors = self._selector_candidates("new_chat")
         if not new_chat_selectors:
@@ -2304,6 +2270,10 @@ class GeminiWebAutomation(BaseAutomation):
 
     async def _ensure_fresh_temp_chat(self) -> bool:
         """Ensure each request starts from a fresh regular page, then enters temp chat."""
+        if not await self._ensure_chat_mode():
+            self._track_error("Chat mode is not active", "chat_tab", "ensure_fresh_temp_chat")
+            return False
+
         if not await self._ensure_sidebar_open():
             self._track_error("Sidebar did not open", "sidebar_toggle", "ensure_fresh_temp_chat")
             return False
