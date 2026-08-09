@@ -1361,7 +1361,7 @@ class GeminiWebAutomation(BaseAutomation):
         return self.page.locator(selector).first
 
     def _matches_model(self, item_text: str, model_name: str) -> bool:
-        """Token-safe model matching to avoid accidental partial collisions."""
+        """Match a model by family first, tolerating UI version/wording drift."""
         if not item_text or not model_name:
             return False
 
@@ -1372,23 +1372,34 @@ class GeminiWebAutomation(BaseAutomation):
         if model_lower in item_lower:
             return True
 
-        # Group equivalents
         import re
-        tokens = set(re.findall(r"[a-z0-9]+", item_lower))
-        
-        # Define clean aliases/mapping for validation
-        if model_lower in {"gemini-3.5-flash-lite", "3.5-flash-lite", "gemini-3.1-flash-lite", "3.1-flash-lite", "flash-lite", "flash lite", "fast", "lite", "gemini-flash-lite"}:
-            return "flash" in tokens and "lite" in tokens
-        
-        if model_lower in {"gemini-3.6-flash", "3.6-flash", "gemini-3.5-flash", "3.5-flash", "flash", "thinking", "gemini-flash"}:
-            return "flash" in tokens and "lite" not in tokens
-            
-        if model_lower in {"gemini-3.1-pro", "3.1-pro", "pro", "gemini-pro"}:
-            return "pro" in tokens
+        item_tokens = set(re.findall(r"[a-z0-9]+", item_lower))
+
+        def family(value: str, value_tokens: set) -> Optional[str]:
+            # Aliases are intentionally version-independent. Gemini may rename
+            # 3.6/3.7/etc. while keeping the visible family name stable.
+            if value in {"fast", "lite", "flash-lite", "flash lite"}:
+                return "flash-lite"
+            if value in {"thinking", "flash", "gemini-flash"}:
+                return "flash"
+            if value in {"pro", "gemini-pro"}:
+                return "pro"
+            if "pro" in value_tokens:
+                return "pro"
+            if "flash" in value_tokens and "lite" in value_tokens:
+                return "flash-lite"
+            if "flash" in value_tokens:
+                return "flash"
+            return None
+
+        requested_family = family(model_lower, set(re.findall(r"[a-z0-9]+", model_lower)))
+        item_family = family(item_lower, item_tokens)
+        if requested_family and item_family:
+            return requested_family == item_family
 
         # Generic token-based fallback
         model_tokens = re.findall(r"[a-z0-9]+", model_lower)
-        return all(t in tokens for t in model_tokens if t not in {"gemini"})
+        return all(t in item_tokens for t in model_tokens if t not in {"gemini"})
 
     def _model_target_selector(self, model_name: str) -> Optional[str]:
         mapping = {

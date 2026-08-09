@@ -56,6 +56,13 @@ class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(selectors[0], 'button[data-test-id="bard-mode-menu-button"]')
         self.assertEqual(selectors[1], 'button[aria-label^="Open mode picker" i]')
 
+    def test_model_matching_tolerates_version_and_label_changes(self):
+        matcher = GeminiWebAutomation(worker_id=1)._matches_model
+        self.assertTrue(matcher("Gemini 3.7 Flash", "gemini-3.6-flash"))
+        self.assertTrue(matcher("Flash Lite", "flash-lite"))
+        self.assertTrue(matcher("Gemini 4 Pro", "pro"))
+        self.assertFalse(matcher("Gemini 3.7 Flash", "flash-lite"))
+
     def test_chat_mode_requires_chat_active_and_spark_inactive(self):
         self.assertTrue(GeminiWebAutomation._is_chat_mode({
             "chat_mode_active": True,
