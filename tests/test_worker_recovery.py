@@ -51,6 +51,19 @@ class FakeLocatorPage:
 
 
 class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_uninitialized_pool_fails_assignment_immediately(self):
+        pool = WorkerPool(worker_count=1)
+        worker = GeminiWebAutomation(worker_id=1)
+        worker._initialized = False
+        pool.workers = [worker]
+        pool._worker_busy = [False]
+        pool._worker_busy_since = [None]
+
+        index, selected = await pool._get_available_worker()
+
+        self.assertIsNone(index)
+        self.assertIsNone(selected)
+
     def test_model_picker_prefers_exact_gemini_button(self):
         selectors = GeminiWebAutomation.SELECTORS["model_btn"]
         self.assertEqual(selectors[0], 'button[data-test-id="bard-mode-menu-button"]')

@@ -65,8 +65,6 @@ FINALIZE_STABLE_RESPONSE_SECONDS = 45
 FINALIZE_STABLE_RESPONSE_LEN = 800
 RECENT_NETWORK_ACTIVITY_SECONDS = 75
 MAX_SEND_RETRIES = 3
-IDLE_REFRESH_AFTER_SECONDS = 600
-IDLE_REFRESH_WORKER_TIMEOUT_SECONDS = 45
 POOL_RECOVERY_WORKER_TIMEOUT_SECONDS = 75
 STALE_BUSY_WITHOUT_ACTIVE_SECONDS = 90
 SCROLL_NUDGE_AFTER_NO_PROGRESS_SECONDS = 8
@@ -149,13 +147,6 @@ class AIStudioAutomation(BaseAutomation):
         "--disable-extensions",
         "--disable-component-extensions-with-background-pages",
     ]
-
-    # Hard refresh every N requests to clear browser cache/memory
-    REFRESH_EVERY_N_REQUESTS = 10
-    
-    def __init__(self):
-        super().__init__()
-        self._request_count = 0
 
     async def init_with_page(self, page: Page, context: BrowserContext) -> bool:
         """Initialize with externally provided page (multi-tab mode)."""
@@ -247,15 +238,6 @@ class AIStudioAutomation(BaseAutomation):
 
         try:
             self._generation_in_progress = True
-            self._request_count += 1
-            
-            # 0. Periodic hard refresh to clear browser cache/memory
-            if self._request_count >= self.REFRESH_EVERY_N_REQUESTS:
-                print(f"[AIStudio] 🔄 Hard refresh (clearing cache after {self._request_count} requests)...")
-                await self.page.reload(wait_until="domcontentloaded", timeout=30000)
-                await self._human_delay(1000, 1500)
-                self._request_count = 0
-            
             # 1. Dismiss any popups/tooltips
             await self.page.keyboard.press("Escape")
             await self._human_delay(400, 800)
@@ -333,7 +315,6 @@ class AIStudioAutomation(BaseAutomation):
             try:
                 print("[AIStudio] 🔄 Error recovery: refreshing page...")
                 await self.page.reload(wait_until="domcontentloaded", timeout=15000)
-                self._request_count = 0  # Reset counter since we just refreshed
             except:
                 pass
             
@@ -705,9 +686,6 @@ class GeminiWebAutomation(BaseAutomation):
     CHAT_URL = "https://gemini.google.com/app"
     URL = CHAT_URL
     
-    # Hard refresh every N requests to clear browser cache/memory
-    REFRESH_EVERY_N_REQUESTS = 10
-    
     # Shared lock for clipboard operations (clipboard is shared across all tabs)
     # Note: Using class-level lock - all workers share this across tabs
     _clipboard_lock: asyncio.Lock = None  # Lazy init to ensure correct event loop
@@ -852,7 +830,6 @@ class GeminiWebAutomation(BaseAutomation):
     def __init__(self, worker_id: int = 0):
         super().__init__()
         self.worker_id = worker_id  # For logging
-        self._request_count = 0
         self._request_id = None  # Set per-request for log tracing
         self._wait_log_interval_seconds = WAIT_LOG_INTERVAL_SECONDS
         self._stall_empty_seconds = STALL_EMPTY_SECONDS
@@ -1511,6 +1488,8 @@ class GeminiWebAutomation(BaseAutomation):
             "model_button_text": "",
             "model_button_aria_label": "",
             "model_picker_count": 0,
+            "sign_in_visible": False,
+            "ui_state_hint": "unknown",
         }
 
         if not self.page:
@@ -1545,6 +1524,12 @@ class GeminiWebAutomation(BaseAutomation):
                         'button[data-test-id="bard-mode-menu-button"], button[aria-label^="Open mode picker" i]'
                     )).filter(isVisible);
                     const modelPicker = modelPickers[0] || null;
+                    const signInVisible = Array.from(document.querySelectorAll('a, button')).some((el) => {
+                        if (!isVisible(el)) return false;
+                        const text = (el.innerText || el.textContent || '').trim().toLowerCase();
+                        const href = (el.getAttribute('href') || '').toLowerCase();
+                        return text === 'sign in' || href.includes('accounts.google.com');
+                    });
                     const isActiveModeTab = (el) => !!(el && (
                         el.classList.contains('app-tab--active') ||
                         el.getAttribute('aria-selected') === 'true' ||
@@ -1640,6 +1625,13 @@ class GeminiWebAutomation(BaseAutomation):
                     }
                     const responseVisible = responseBodyLen > 0;
 
+                    let uiStateHint = 'unknown';
+                    if (isGoogle500) uiStateHint = 'google_500';
+                    else if (signInVisible) uiStateHint = 'sign_in_required';
+                    else if (inputBox) uiStateHint = 'composer_ready';
+                    else if (transitionSpinner && isVisible(transitionSpinner)) uiStateHint = 'loading';
+                    else if (modelPicker) uiStateHint = 'partial_ui_no_composer';
+
                     let phase = 'idle_or_unknown';
                     if (responseCopyButtons.length > 0) {
                         phase = 'response_copyable_postprocessing';
@@ -1698,6 +1690,8 @@ class GeminiWebAutomation(BaseAutomation):
                         model_button_text: (modelPicker?.innerText || modelPicker?.textContent || '').trim().slice(0, 160),
                         model_button_aria_label: (modelPicker?.getAttribute('aria-label') || '').trim().slice(0, 160),
                         model_picker_count: modelPickers.length,
+                        sign_in_visible: signInVisible,
+                        ui_state_hint: uiStateHint,
                     };
                 }
                 """
@@ -1857,8 +1851,6 @@ class GeminiWebAutomation(BaseAutomation):
             log(f"Hard refresh recovery ({reason})", f"Worker {self.worker_id}")
             await self._force_reload(timeout_ms=30000)
             await self._human_delay(1000, 1500)
-            self._request_count = 0
-
             ok = await self.init_with_page(self.page, self.context)
             post_snapshot = await self._capture_state_snapshot()
             clean = bool(
@@ -2666,8 +2658,19 @@ class GeminiWebAutomation(BaseAutomation):
                             continue
                     raise e
         except Exception as e:
-            print(f"[GeminiWeb] ❌ Init failed: {e}")
-            self._track_error(str(e), "input", "init")
+            try:
+                snapshot = await self._capture_state_snapshot()
+            except Exception:
+                snapshot = {}
+            log(
+                f"Init failed: {e}; state={snapshot.get('ui_state_hint', 'unknown')} "
+                f"url={snapshot.get('url', '')} title={snapshot.get('page_title', '')!r} "
+                f"input={snapshot.get('input_visible')} chat={snapshot.get('chat_mode_active')} "
+                f"spark={snapshot.get('spark_mode_active')} sign_in={snapshot.get('sign_in_visible')} "
+                f"model={snapshot.get('model_button_text', '')!r}",
+                f"Worker {self.worker_id}",
+            )
+            self._track_error(str(e), "input", "init", snapshot)
             return False
 
     async def send_message(
@@ -2702,7 +2705,6 @@ class GeminiWebAutomation(BaseAutomation):
         try:
             self._thinking_requested = bool(thinking_level and thinking_level.lower() in {"extended", "high", "deep"})
             self._generation_in_progress = True
-            self._request_count += 1
             self._request_id = (request_id or "").strip() or uuid.uuid4().hex[:8]
             self._recent_network_events.clear()
             self._network_failure_counts.clear()
@@ -2779,14 +2781,6 @@ class GeminiWebAutomation(BaseAutomation):
                     await self._human_delay(200, 400)
             except:
                 pass
-            
-            # 0.5 Periodic hard refresh to clear browser cache/memory
-            if self._request_count >= self.REFRESH_EVERY_N_REQUESTS:
-                log(f"Hard refresh (request #{self._request_count})", f"Worker {self.worker_id}")
-                await self._force_reload(timeout_ms=30000)
-                self._reset_model_tracking()
-                await self._human_delay(1000, 1500)
-                self._request_count = 0
             
             # 1. Fresh temp chat
             if not await self._ensure_fresh_temp_chat():
@@ -3569,7 +3563,6 @@ class GeminiWebAutomation(BaseAutomation):
             # Force refresh to reset page state for next request
             try:
                 await self._force_reload(timeout_ms=15000)
-                self._request_count = 0
             except:
                 pass
             
@@ -4215,10 +4208,7 @@ class WorkerPool:
         self._browser_semaphore = asyncio.Semaphore(worker_count)  # Allow N concurrent requests
         self._last_activity = time.time()
         self._active_requests = 0
-        self._has_processed_request = False
-        self._idle_refresh_lock = asyncio.Lock()
         self._pool_recovery_lock = asyncio.Lock()
-        self._last_idle_refresh_at = 0.0
         self._startup_pages_closed = 0
         self._startup_page_close_failures = 0
         self._worker_recreation_count = 0
@@ -4237,6 +4227,12 @@ class WorkerPool:
             await self._clear_stale_busy_flags_if_safe()
             async with self._worker_lock:
                 count = len(self._worker_busy)
+                if count and not any(
+                    i not in exclude and self.workers[i]._initialized
+                    for i in range(count)
+                ):
+                    log("No initialized workers available", "WorkerPool")
+                    return None, None
                 for offset in range(count):
                     i = (self._next_worker_index + offset) % count
                     if i in exclude:
@@ -4452,61 +4448,6 @@ class WorkerPool:
                 except:
                     pass
             return False
-
-    def _are_workers_idle(self) -> bool:
-        if self._active_requests != 0:
-            return False
-        return not any(self._worker_busy)
-
-    async def _maybe_refresh_workers_after_idle(self):
-        """Refresh all workers once after long idle, right before handling new work."""
-        if not self._has_processed_request:
-            return
-
-        now = time.time()
-        if (now - self._last_activity) < IDLE_REFRESH_AFTER_SECONDS:
-            return
-        if not self._are_workers_idle():
-            return
-        if self._idle_refresh_lock.locked():
-            return
-
-        async with self._idle_refresh_lock:
-            # Re-check after lock acquisition to avoid races.
-            now = time.time()
-            if (now - self._last_activity) < IDLE_REFRESH_AFTER_SECONDS:
-                return
-            if not self._are_workers_idle():
-                return
-
-            idle_for = int(now - self._last_activity)
-            log(f"Idle maintenance: refreshing all workers after {idle_for}s idle", "WorkerPool")
-
-            await self._set_all_workers_busy(True)
-            try:
-                for i, worker in enumerate(self.workers):
-                    if not worker or not worker._initialized:
-                        continue
-                    try:
-                        ok = await asyncio.wait_for(
-                            worker._hard_refresh_and_reinit("idle_maintenance"),
-                            timeout=IDLE_REFRESH_WORKER_TIMEOUT_SECONDS,
-                        )
-                        if not ok:
-                            log(f"Worker {i+1} idle refresh failed", "WorkerPool")
-                    except asyncio.TimeoutError:
-                        log(
-                            f"Worker {i+1} idle refresh timed out after {IDLE_REFRESH_WORKER_TIMEOUT_SECONDS}s",
-                            "WorkerPool",
-                        )
-                        break
-                    except Exception as e:
-                        log(f"Worker {i+1} idle refresh exception: {e}", "WorkerPool")
-            finally:
-                await self._set_all_workers_busy(False)
-
-            self._last_idle_refresh_at = time.time()
-            self._last_activity = self._last_idle_refresh_at
 
     async def _recover_after_assignment_timeout(self) -> bool:
         """Best-effort pool recovery when no worker can be assigned."""
@@ -4922,9 +4863,6 @@ class WorkerPool:
             log("❌ No workers available", "WorkerPool")
             return {"success": False, "error": "No workers available"}
 
-        # Idle maintenance: refresh workers once after long idle periods.
-        await self._maybe_refresh_workers_after_idle()
-
         # Request accepted, update activity timestamp.
         self._last_activity = time.time()
         
@@ -4953,6 +4891,7 @@ class WorkerPool:
                 
                 if worker is None:
                     log(f"⚠️ No available workers left to try", "WorkerPool")
+                    last_error = "No initialized workers available"
                     if await self._recover_after_assignment_timeout():
                         tried_workers.clear()
                         if extra_recovery_attempts_remaining > 0:
@@ -5059,7 +4998,6 @@ class WorkerPool:
                             await self._quarantine_worker(worker_index, recreate_reason)
                     self._active_requests = max(0, self._active_requests - 1)
                     await self._release_worker(worker_index)
-                    self._has_processed_request = True
                     self._last_activity = time.time()
 
                     if attempt_error and (allow_same_worker_retry or recreated_ok):
@@ -5153,6 +5091,7 @@ class WorkerPool:
                     "phase": snapshot.get("phase"),
                     "stop_visible": bool(snapshot.get("stop_visible")),
                     "send_visible": bool(snapshot.get("send_visible")),
+                    "input_visible": bool(snapshot.get("input_visible")),
                     "input_text_len": int(snapshot.get("input_text_len") or 0),
                     "user_query_count": int(snapshot.get("user_query_count") or 0),
                     "response_count": int(snapshot.get("response_count") or 0),
@@ -5164,6 +5103,8 @@ class WorkerPool:
                     "model_button_text": snapshot.get("model_button_text"),
                     "model_button_aria_label": snapshot.get("model_button_aria_label"),
                     "model_picker_count": int(snapshot.get("model_picker_count") or 0),
+                    "sign_in_visible": bool(snapshot.get("sign_in_visible")),
+                    "ui_state_hint": snapshot.get("ui_state_hint"),
                 }
                 invariant_violations = []
                 if current_state["spark_mode_active"]:

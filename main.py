@@ -22,7 +22,7 @@ import pathlib
 from collections import deque
 from datetime import datetime, timezone
 from typing import List, Optional, Dict, Union
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict
 from contextlib import asynccontextmanager
@@ -568,9 +568,40 @@ async def openai_chat(request: Request):
         }
     }
 
+def ready_worker_count() -> int:
+    if not worker_pool or not worker_pool._initialized:
+        return 0
+
+    ready = 0
+    for worker in worker_pool.workers:
+        try:
+            if worker and worker._initialized and worker.page and not worker.page.is_closed():
+                ready += 1
+        except Exception:
+            continue
+    return ready
+
+
+def public_request_trace(trace: Dict) -> Dict:
+    """Return operational metadata without exposing large prompt bodies."""
+    return {
+        key: value
+        for key, value in trace.items()
+        if key not in {"prompt_full", "prompt_preview"}
+    }
+
+
 @app.get("/health")
-async def health():
-    return {"status": "ok", "workers": WORKER_COUNT}
+async def health(response: Response):
+    ready_workers = ready_worker_count()
+    is_ready = ready_workers > 0
+    response.status_code = 200 if is_ready else 503
+    return {
+        "status": "ok" if is_ready else "degraded",
+        "ready": is_ready,
+        "workers": WORKER_COUNT,
+        "ready_workers": ready_workers,
+    }
 
 
 @app.get("/v1/diagnostics")
@@ -582,7 +613,7 @@ async def diagnostics():
     return {
         "status": "ok",
         "pool": pool_diag,
-        "recent_requests": list(recent_requests),
+        "recent_requests": [public_request_trace(trace) for trace in recent_requests],
     }
 
 @app.get("/v1/screenshot")

@@ -245,6 +245,7 @@ print(response.choices[0].message.content)
 | Issue | Solution |
 |-------|----------|
 | Session expired | Set `HEADLESS=false`, restart, login again |
+| Health returns `503 degraded` | The API process is running but no Gemini worker is ready; inspect `/v1/diagnostics` |
 | 502 Bad Gateway | Make sure API is running (`python main.py`) |
 | Selector errors | Check `/v1/diagnostics` for details |
 | Second concurrent request waits | Set `WORKER_COUNT=2` (or higher) in `.env`, then restart the API; each request needs its own Gemini tab |
@@ -273,11 +274,14 @@ Returns:
       "generation_in_progress": false,
       "current_state": {
         "stop_visible": false,
+        "input_visible": true,
         "input_text_len": 0,
         "chat_mode_active": true,
         "spark_mode_active": false,
         "model_button_text": "Flash",
-        "model_picker_count": 1
+        "model_picker_count": 1,
+        "sign_in_visible": false,
+        "ui_state_hint": "composer_ready"
       },
       "invariant_violations": []
     }]
@@ -287,6 +291,8 @@ Returns:
 
 `invariant_violations` is non-empty when the Python worker state disagrees with
 the live Gemini page, such as an idle worker whose page still shows **Stop**.
+Recent request diagnostics contain operational metadata only; full prompts stay
+in the bounded local error reports and are not returned by this endpoint.
 
 ---
 
@@ -294,7 +300,7 @@ the live Gemini page, such as an idle worker whose page still shows **Stop**.
 
 - **Stable-First Selectors** - Uses strict selectors first with bounded fallbacks
 - **Request-Level Retry** - Failed requests retry on different workers
-- **Periodic Refresh** - Hard refresh every 10 requests to clear stale page state
+- **State-Based Recovery** - Leaves healthy pages untouched and refreshes only after a concrete failure signal
 - **Overlay Dismissal** - Clears stuck overlays before each request
 - **Wait-State Telemetry** - Periodic wait logs include stop/send/response/visibility state
 - **Stall Watchdog Recovery** - Detects no-output/no-progress generations and recovers before full timeout
@@ -303,7 +309,7 @@ the live Gemini page, such as an idle worker whose page still shows **Stop**.
 - **Retained-Draft Cleanup** - Clears a prompt left in the composer only after a sent user bubble/start signal is confirmed
 - **Headed Window Placement** - Optional CDP-based overlap/tile windows for multi-worker runs
 - **Diagnostics Endpoint** - Exposes worker state, live page state, recovery outcomes, invariant violations, and recent request traces
-- **Verified Launcher** - `autostart.bat` waits for `/health` and records Python output in `logs/server.log` before reporting success
+- **Verified Launcher** - `autostart.bat` waits for real worker readiness, restarts degraded workers, and records Python output in `logs/server.log`
 - **Discord Alerts** - Cooldown-based error notifications with compact diagnostics payload
 
 ### Verification

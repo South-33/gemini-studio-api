@@ -14,7 +14,7 @@ This is the project's AGENTS.md
 - Gemini 2026 UI uses `<thinking-overlay>` containing static status text (e.g., `Defining the Project Scope`) instead of legacy `button.thoughts-header-button`. Bypass progress-based stalls while it is active because these labels do not stream character-by-character.
 - Thinking models require a fail-fast cooked check: if `thinking_active` is false and `response_body_len == 0` after 15s (or 360s for large prompts) of elapsed wait time, flag the generation as stalled immediately.
 - Retries are total attempts, not unique-worker-only now; after recoverable stall/refresh/recreation, the same worker can be retried if the alternate worker is still busy.
-- Idle maintenance is pre-request and marks all workers busy; keep it bounded and clear stale busy flags or Playwright transport failures can poison the pool with assignment timeouts.
+- Do not refresh workers because time or request count passed; preserve healthy Gemini pages and recover only from a concrete failed state.
 - Persistent Chromium restores old pages that are not registered workers -> close all restored pages before pool creation, and never preserve poisoned stall pages after recreation.
 - Gemini 2026 UI uses `Open/Close sidebar`, `bard-sidenav.collapsed`, `gem-menu-item`, and temp active via inner `mat-icon=close`; prefer these attributes over old label-only sidebar detection.
 - Gemini exposes Chat/Spark as `button[data-test-id="app-tab-chat"]` and `button[data-test-id="app-tab-agent"]`; click Chat and verify its active class instead of toggling Ctrl+Shift+S.
