@@ -74,14 +74,17 @@ Every request must:
 
 After Copy succeeds, prepare a fresh Temporary Chat before releasing the queue
 lock or returning the result. The next queued request must always inherit this
-known-ready state. If reset fails, replace the page once and prepare that page.
+known-ready state. Do not repeat a readiness wait already proved by the reset
+action. If reset fails, replace the page once and prepare that page.
 
 `thinking-overlay` may expose a short changing summary while Extended reasoning
 is active, but Gemini leaves an empty overlay mounted after completion. Count
 only a visible animation or non-empty summary as liveness, and never require
-reasoning text for success. Sample the state once per second. A changed summary
-or growing response resets the progress clock; static reasoning fails after
-120 seconds, or 180 seconds while relevant Gemini network traffic remains live.
+reasoning text for success. Sample local DOM state every 200 ms so completion
+is returned promptly; this does not create Gemini network requests. A changed
+summary or growing response resets the progress clock; static reasoning fails
+after 120 seconds, or 180 seconds while relevant Gemini network traffic remains
+live.
 
 `Ctrl+Shift+S` toggles Chat/Spark and is not idempotent. Use it only when state
 already proves Spark is active and always verify afterward. `Ctrl+Shift+O`

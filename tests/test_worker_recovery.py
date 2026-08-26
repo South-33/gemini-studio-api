@@ -130,6 +130,36 @@ class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(new_chat.clicked, 1)
         worker._trigger_new_chat_shortcut.assert_not_awaited()
 
+    async def test_temp_reset_uses_fresh_chat_confirmation_once(self):
+        worker = GeminiWebAutomation(worker_id=1)
+        temp_button = FakeLocator()
+        worker._ensure_chat_mode = AsyncMock(return_value=True)
+        worker._ensure_sidebar_open = AsyncMock(return_value=True)
+        worker._ensure_fresh_chat = AsyncMock(return_value=True)
+        worker._get_temp_chat_button = AsyncMock(return_value=temp_button)
+        worker._click_temp_chat_toggle = AsyncMock(return_value=True)
+        worker._capture_state_snapshot = AsyncMock(side_effect=[
+            {
+                "input_visible": True,
+                "user_query_count": 1,
+                "response_count": 1,
+                "new_chat_visible": True,
+            },
+            {
+                "input_visible": True,
+                "user_query_count": 0,
+                "response_count": 0,
+                "temp_chat_active": True,
+                "temp_chat_landing_visible": True,
+            },
+        ])
+
+        ready = await worker._ensure_fresh_temp_chat()
+
+        self.assertTrue(ready)
+        worker._ensure_fresh_chat.assert_awaited_once()
+        self.assertEqual(worker._capture_state_snapshot.await_count, 2)
+
     def test_ready_app_without_explicit_mode_state_is_chat(self):
         self.assertTrue(GeminiWebAutomation._is_implicit_chat_mode({
             "url": "https://gemini.google.com/app",

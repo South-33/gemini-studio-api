@@ -37,6 +37,9 @@ PROMPT_FILE_UPLOAD_THRESHOLD = 1500
 BROWSER_TIMEOUT_SECONDS = 480
 
 # Reliability constants (intentionally hardcoded)
+UI_POLL_SECONDS = 0.2
+SEND_VERIFY_POLL_SECONDS = 0.1
+CLIPBOARD_POLL_SECONDS = 0.05
 WAIT_LOG_INTERVAL_SECONDS = 10
 STALL_EMPTY_SECONDS = 45
 STALL_EMPTY_SECONDS_WITH_ACTIVITY = 90
@@ -48,7 +51,7 @@ STALL_NO_PROGRESS_SECONDS_SMALL = 180
 STALL_NO_PROGRESS_SECONDS_SMALL_WITH_ACTIVITY = 300
 STALL_NO_PROGRESS_SECONDS_WITH_ACTIVITY = 180
 STALL_SMALL_LEN_THRESHOLD = 200
-# The DOM is sampled every second. A changing reasoning summary resets this
+# The DOM is sampled locally every 200ms. A changing reasoning summary resets this
 # deadline; recent Gemini network activity earns one additional minute.
 STALL_THINKING_NO_PROGRESS_SECONDS = 120
 STALL_THINKING_NO_PROGRESS_SECONDS_WITH_ACTIVITY = 180
@@ -1362,21 +1365,11 @@ class GeminiWebAutomation:
             await asyncio.sleep(0.2)
         return False
 
-    async def _wait_for_fresh_regular_chat(self, timeout_seconds: float) -> bool:
-        deadline = time.time() + timeout_seconds
-        while time.time() < deadline:
-            snap = await self._capture_state_snapshot()
-            if self._is_fresh_regular_chat_ready(snap):
-                return True
-            await asyncio.sleep(0.2)
-        return False
-
     async def _trigger_new_chat_shortcut(self) -> bool:
         """Use Gemini's Chat-only new-conversation shortcut after mode guard."""
         try:
             await self.page.bring_to_front()
             await self.page.keyboard.press("Control+Shift+O")
-            await self._human_delay(250, 400)
             return True
         except Exception as e:
             log(f"New Chat shortcut failed: {e}", f"Worker {self.worker_id}")
@@ -1397,7 +1390,7 @@ class GeminiWebAutomation:
                 snap = await self._capture_state_snapshot()
                 if self._classify_new_chat_state(snap) == "confirmed_cleared":
                     return True
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(UI_POLL_SECONDS)
             return False
 
         # Prefer the labeled control. It is idempotent and was verified in the
@@ -1449,7 +1442,6 @@ class GeminiWebAutomation:
 
         try:
             await btn.click(timeout=1500)
-            await self._human_delay(250, 400)
             return True
         except Exception:
             try:
@@ -1465,7 +1457,6 @@ class GeminiWebAutomation:
                     }}
                     """
                 )
-                await self._human_delay(250, 400)
                 return True
             except:
                 return False
@@ -1498,10 +1489,6 @@ class GeminiWebAutomation:
                 final_snapshot = await self._capture_state_snapshot()
                 self._track_error("Fresh regular chat reset not confirmed", "new_chat", "ensure_fresh_temp_chat", final_snapshot)
                 return False
-            if not await self._wait_for_fresh_regular_chat(6.0):
-                final_snapshot = await self._capture_state_snapshot()
-                self._track_error("Fresh regular chat wait timed out", "new_chat", "ensure_fresh_temp_chat", final_snapshot)
-                return False
             log("Temp reset path: stale chat -> fresh regular via New Chat", f"Worker {self.worker_id}")
         else:
             log("Temp reset path: fresh regular -> entering temporary chat", f"Worker {self.worker_id}")
@@ -1532,7 +1519,7 @@ class GeminiWebAutomation:
             if self._is_fresh_temp_chat_ready(snap):
                 log("Temp reset path: fresh temporary chat ready", f"Worker {self.worker_id}")
                 return True
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(UI_POLL_SECONDS)
 
         final_snapshot = await self._capture_state_snapshot()
         log(
@@ -1836,29 +1823,25 @@ class GeminiWebAutomation:
                 except:
                     return ""
             
-            async def verify_send_worked(before_text):
-                # Wait a moment then check if input is cleared
-                await self._human_delay(200, 400)  # Reduced for speed
-                try:
-                    # Try multiple methods to get input text (contenteditable vs textarea)
-                    after_text = ""
+            async def verify_send_worked(before_text, timeout_seconds: float = 1.0):
+                deadline = time.time() + timeout_seconds
+                while time.time() < deadline:
                     try:
-                        after_text = await input_area.inner_text()
-                    except:
+                        # Try both contenteditable and textarea access paths.
                         try:
-                            after_text = await input_area.input_value()
+                            after_text = await input_area.inner_text()
                         except:
-                            pass
-                    
-                    # Handle empty prompt case (e.g., image-only messages)
-                    before_len = len(before_text.strip()) if before_text else 0
-                    after_len = len(after_text.strip())
-                    
-                    if before_len == 0:
-                        return True  # Empty prompt - can't verify, assume success
-                    elif after_len < before_len / 2:
-                        return True  # Input cleared = send worked
-                    else:
+                            try:
+                                after_text = await input_area.input_value()
+                            except:
+                                after_text = ""
+
+                        before_len = len(before_text.strip()) if before_text else 0
+                        after_len = len(after_text.strip())
+
+                        if before_len == 0 or after_len < before_len / 2:
+                            return True
+
                         snap = await self._capture_state_snapshot()
                         signal = start_signal_from_snapshot(snap, after_len)
                         if signal:
@@ -1867,11 +1850,14 @@ class GeminiWebAutomation:
                                 f"Worker {worker_id}",
                             )
                             return True
-                        log(f"⚠️ Send failed: input not cleared ({after_len} chars remain)", f"Worker {worker_id}")
+                    except Exception as e:
+                        log(f"⚠️ Send verification error: {e}", f"Worker {worker_id}")
                         return False
-                except Exception as e:
-                    log(f"⚠️ Send verification error: {e}", f"Worker {worker_id}")
-                    return False  # Don't assume success on error
+
+                    await asyncio.sleep(SEND_VERIFY_POLL_SECONDS)
+
+                log("⚠️ Send failed: composer still contains the prompt", f"Worker {worker_id}")
+                return False
 
             async def attempt_send_submission(reason: str, before_text: str) -> bool:
                 log(f"Attempting send submission ({reason})", f"Worker {self.worker_id}")
@@ -1885,13 +1871,11 @@ class GeminiWebAutomation:
 
                 try:
                     await input_area.click()
-                    await self._human_delay(80, 160)
                 except:
                     pass
 
                 try:
                     await self.page.keyboard.press("Control+Enter")
-                    await self._human_delay(250, 400)
                     if await verify_send_worked(before_text):
                         log(f"Send submission worked via Ctrl+Enter ({reason})", f"Worker {self.worker_id}")
                         return True
@@ -1903,7 +1887,6 @@ class GeminiWebAutomation:
                         send_btn = self.page.locator(selector).first
                         if await send_btn.is_visible():
                             await send_btn.click()
-                            await self._human_delay(250, 400)
                             if await verify_send_worked(before_text):
                                 log(f"Send submission worked via button ({reason})", f"Worker {self.worker_id}")
                                 return True
@@ -1940,7 +1923,7 @@ class GeminiWebAutomation:
             # This avoids false negatives for very fast responses and avoids
             # resubmitting when Gemini starts thinking but leaves text in the editor.
             start_observe_seconds = 6.0
-            start_poll_seconds = 0.2
+            start_poll_seconds = UI_POLL_SECONDS
             generation_started = False
 
             for send_attempt in range(MAX_SEND_RETRIES):
@@ -2013,7 +1996,6 @@ class GeminiWebAutomation:
 
             # 5. Wait for Response (Copy button to appear)
             log("Waiting for response...", f"Worker {self.worker_id}")
-            await self._human_delay(300, 600)  # Reduced initial wait
             
             # Polling for copy button (Wait until we have MORE buttons than before)
             start_time = time.time()
@@ -2057,7 +2039,7 @@ class GeminiWebAutomation:
                                 btn = last_btn
 
                         # Completion fallback: stop button gone, send button returned, and response present
-                        if not is_done and not shot.get("stop_btn_visible") and shot.get("send_btn_visible") and shot.get("response_count", 0) > 0:
+                        if not is_done and not shot.get("stop_visible") and shot.get("send_visible") and shot.get("response_count", 0) > 0:
                             if c_count > 0:
                                 last_btn = c_btns.nth(c_count - 1)
                                 if await last_btn.is_visible():
@@ -2382,7 +2364,7 @@ class GeminiWebAutomation:
 
                     last_wait_log = now
                         
-                await asyncio.sleep(1)  # Reduced from 2s
+                await asyncio.sleep(UI_POLL_SECONDS)
             
             if not copy_btn:
                 log(f"❌ Timeout after {max_wait}s waiting for response", f"Worker {self.worker_id}")
@@ -2395,23 +2377,24 @@ class GeminiWebAutomation:
                 )
                 return {"success": False, "error": f"Timeout after {max_wait}s waiting for response"}
 
-            # Auto-scroll to ensure copy button is visible
-            await self.page.evaluate('''
-                (selector) => {
-                    const copyButtons = document.querySelectorAll(selector);
-                    if (copyButtons.length > 0) {
-                        const lastBtn = copyButtons[copyButtons.length - 1];
-                        lastBtn.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                    }
-                }
-            ''', copy_selector)
-            await self._human_delay(150, 300)
-
             # 6. Extraction via Copy Button (with lock to prevent clipboard race condition)
             async with GeminiWebAutomation._get_clipboard_lock():
+                clipboard_cleared = False
+                try:
+                    await self.page.evaluate("navigator.clipboard.writeText('')")
+                    clipboard_cleared = True
+                except Exception:
+                    pass
                 await copy_btn.click()
-                await self._human_delay(100, 200)
-                markdown = await self.page.evaluate("navigator.clipboard.readText()")
+                if not clipboard_cleared:
+                    await asyncio.sleep(SEND_VERIFY_POLL_SECONDS)
+                markdown = ""
+                clipboard_deadline = time.time() + 1.0
+                while time.time() < clipboard_deadline:
+                    markdown = await self.page.evaluate("navigator.clipboard.readText()")
+                    if markdown and markdown.strip():
+                        break
+                    await asyncio.sleep(CLIPBOARD_POLL_SECONDS)
             
             self._generation_in_progress = False
             
@@ -2696,8 +2679,6 @@ class GeminiWebAutomation:
         start = time.time()
         deadline = start + max_timeout_seconds
 
-        await asyncio.sleep(0.3)
-
         while time.time() < deadline:
             send_selector = await self._resolve_selector("send_btn", require_visible=True, timeout_ms=500)
             if send_selector:
@@ -2714,7 +2695,7 @@ class GeminiWebAutomation:
                     except Exception:
                         pass
 
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(UI_POLL_SECONDS)
 
         elapsed = round(time.time() - start, 2)
         log(f"⚠️ Send button ready wait timeout ({elapsed}s), proceeding to send attempt", f"Worker {self.worker_id}")
@@ -2840,7 +2821,7 @@ class GeminiWebAutomation:
         if use_search:
             entered_prompt = f"Use Google Search for this request.\n\n{prompt_str}"
         await input_area.fill(entered_prompt)
-        await self._human_delay(300, 600)
+        await self._human_delay(50, 100)
         return entered_prompt, None
 
     async def close(self):
