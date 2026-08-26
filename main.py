@@ -81,13 +81,17 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        if worker_pool and browser_loop and browser_loop.is_running():
-            future = asyncio.run_coroutine_threadsafe(worker_pool.close(), browser_loop)
-            future.result(timeout=15)
-        if browser_loop and browser_loop.is_running():
-            browser_loop.call_soon_threadsafe(browser_loop.stop)
-        if browser_thread:
-            browser_thread.join(timeout=5)
+        try:
+            if worker_pool and browser_loop and browser_loop.is_running():
+                future = asyncio.run_coroutine_threadsafe(worker_pool.close(), browser_loop)
+                future.result(timeout=15)
+        except Exception as exc:
+            log(f"Browser cleanup warning: {exc}", "API")
+        finally:
+            if browser_loop and browser_loop.is_running():
+                browser_loop.call_soon_threadsafe(browser_loop.stop)
+            if browser_thread:
+                browser_thread.join(timeout=5)
 
 
 app = FastAPI(title="Gemini Studio API", lifespan=lifespan)

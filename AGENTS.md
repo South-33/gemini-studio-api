@@ -5,4 +5,5 @@ This is the project's AGENTS.md
 - Match model families by visible `Flash`, `Lite`, and `Pro` text; never select models/reasoning by hashed IDs or menu position.
 - Return responses only through Gemini's Copy control/clipboard; DOM text is diagnostic state, not response content.
 - Preserve Windows anti-throttle Chromium flags and capture diagnostics before recreating a failed page.
+- `launcher.py` must remain the foreground owner of API/ngrok/Chromium; detached children break close-to-cleanup behavior.
 - `.browser_session`, `.env`, prompts, screenshots, and runtime logs are private local state and must not be committed.

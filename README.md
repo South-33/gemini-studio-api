@@ -16,8 +16,10 @@ created tab after a concrete browser failure.
 2. Run `python main.py` and sign in to Gemini in the opened browser. Copy
    `.env.example` to `.env` only if Discord failure alerts are wanted.
 
-3. On the Windows server, run `autostart.bat`. It starts the API and ngrok in
-   one terminal and writes output to `logs\server.log` and `logs\ngrok.log`.
+3. On the Windows server, run `autostart.bat`. Its foreground supervisor owns
+   the API, Chromium, and ngrok as one process tree. Press Ctrl+C once or close
+   the terminal to stop all of them. Output is written to `logs\server.log`
+   and `logs\ngrok.log`.
 
 The login profile is stored in `.browser_session/` and must never be committed.
 
@@ -78,5 +80,5 @@ Update it and a focused test whenever the site changes.
 
 ```powershell
 python -m unittest discover -s tests -v
-python -m py_compile main.py gemini_web.py worker_pool.py gemini_models.py notifier.py
+python -m py_compile launcher.py main.py gemini_web.py worker_pool.py gemini_models.py notifier.py
 ```
