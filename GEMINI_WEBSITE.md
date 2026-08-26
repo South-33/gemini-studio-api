@@ -72,9 +72,9 @@ Every request must:
 7. wait using Stop, response, thinking, and network state;
 8. copy the latest response through Gemini's Copy control.
 
-After returning a successful response, prepare a fresh Temporary Chat only when
-the queue is idle. This prewarm uses the same request lock, so it cannot race a
-new prompt; already-queued work skips it.
+After Copy succeeds, prepare a fresh Temporary Chat before releasing the queue
+lock or returning the result. The next queued request must always inherit this
+known-ready state. If reset fails, replace the page once and prepare that page.
 
 `thinking-overlay` may expose a short changing summary while Extended reasoning
 is active, but Gemini leaves an empty overlay mounted after completion. Count

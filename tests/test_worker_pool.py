@@ -6,7 +6,7 @@ from worker_pool import WorkerPool
 
 
 class FakeWorker:
-    def __init__(self, results=None):
+    def __init__(self, results=None, prepare_ok=True):
         self._initialized = True
         self._generation_in_progress = False
         self._results = list(results or [])
@@ -14,8 +14,13 @@ class FakeWorker:
         self.max_active = 0
         self.calls = 0
         self.prepare_calls = 0
+        self.ready = True
+        self.started_ready = []
+        self.prepare_ok = prepare_ok
 
     async def send_message(self, *_args, **_kwargs):
+        self.started_ready.append(self.ready)
+        self.ready = False
         self.calls += 1
         self.active += 1
         self.max_active = max(self.max_active, self.active)
@@ -28,9 +33,10 @@ class FakeWorker:
     def get_request_log(self):
         return []
 
-    async def prepare_idle(self):
+    async def prepare_next_request(self):
         self.prepare_calls += 1
-        return True
+        self.ready = self.prepare_ok
+        return self.prepare_ok
 
 
 class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
@@ -48,20 +54,22 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(first["success"])
         self.assertTrue(second["success"])
         self.assertEqual(worker.max_active, 1)
+        self.assertEqual(worker.started_ready, [True, True])
+        self.assertEqual(worker.prepare_calls, 2)
         self.assertEqual(pool._queued_requests, 0)
 
-    async def test_success_prepares_next_temp_chat_while_idle(self):
+    async def test_success_prepares_next_temp_chat_before_returning(self):
         pool = WorkerPool()
         worker = FakeWorker()
         pool.workers = [worker]
         pool._initialized = True
 
         result = await pool.send_message("one", request_id="one")
-        await asyncio.wait_for(pool._prewarm_task, timeout=1)
 
         self.assertTrue(result["success"])
+        self.assertTrue(result["ready_for_next_request"])
         self.assertEqual(worker.prepare_calls, 1)
-        self.assertTrue(pool._last_idle_prewarm["ok"])
+        self.assertTrue(pool._last_ready_reset["ok"])
 
     async def test_failed_request_recreates_once_then_retries(self):
         pool = WorkerPool()
@@ -80,6 +88,19 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(worker.calls, 2)
         pool._recreate_worker.assert_awaited_once()
         pool._notify_final_failure.assert_not_awaited()
+
+    async def test_unrecoverable_ready_reset_marks_pool_unavailable(self):
+        pool = WorkerPool()
+        worker = FakeWorker(prepare_ok=False)
+        pool.workers = [worker]
+        pool._initialized = True
+        pool._recreate_worker = AsyncMock(return_value=False)
+
+        result = await pool.send_message("hello", request_id="reset-failure")
+
+        self.assertTrue(result["success"])
+        self.assertFalse(result["ready_for_next_request"])
+        self.assertFalse(pool._initialized)
 
 
 if __name__ == "__main__":

@@ -1550,12 +1550,12 @@ class GeminiWebAutomation:
 
         return False
 
-    async def prepare_idle(self) -> bool:
-        """Pre-position an idle worker in a clean Temporary Chat."""
+    async def prepare_next_request(self) -> bool:
+        """Leave the worker in a clean Temporary Chat for the next request."""
         if not self._initialized or self._generation_in_progress:
             return False
         previous_request_id = self._request_id
-        self._request_id = "idle-prewarm"
+        self._request_id = "ready-reset"
         try:
             return await self._ensure_fresh_temp_chat()
         finally:
@@ -1754,7 +1754,7 @@ class GeminiWebAutomation:
                     self._current_selected_thinking_level = ui_thinking
 
                 # Select model if it differs
-                if model and self._current_selected_model != model:
+                if model and not self._matches_model(self._current_selected_model or "", model):
                     selected = await self._select_model(model)
                     # Re-read UI state since selecting a model changes the layout / resets defaults
                     ui_model, ui_thinking = await self._get_current_ui_model_and_thinking()

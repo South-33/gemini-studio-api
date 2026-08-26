@@ -29,8 +29,7 @@ class WorkerPool:
         self._startup_pages_closed = 0
         self._worker_recreation_count = 0
         self._last_worker_recreation: Optional[Dict[str, Any]] = None
-        self._prewarm_task: Optional[asyncio.Task] = None
-        self._last_idle_prewarm: Optional[Dict[str, Any]] = None
+        self._last_ready_reset: Optional[Dict[str, Any]] = None
 
     @property
     def worker(self) -> Optional[GeminiWebAutomation]:
@@ -99,7 +98,12 @@ class WorkerPool:
 
         worker = GeminiWebAutomation(worker_id=1)
         if await worker.init_with_page(page, self.context):
-            return worker
+            try:
+                if await asyncio.wait_for(worker.prepare_next_request(), timeout=20):
+                    return worker
+                log("New Gemini page did not reach ready Temporary Chat state", "Worker")
+            except Exception as exc:
+                log(f"New Gemini page readiness failed: {exc}", "Worker")
         try:
             await page.close()
         except Exception:
@@ -190,7 +194,9 @@ class WorkerPool:
                     if result.get("success") and str(result.get("response") or "").strip():
                         result["queue_wait_ms"] = wait_ms
                         result["attempts"] = attempt
-                        self._schedule_idle_prewarm()
+                        result["ready_for_next_request"] = await self._ensure_ready_after_request(
+                            f"request {request_id} completed"
+                        )
                         return result
 
                     last_error = result.get("error") or "Empty response"
@@ -200,6 +206,7 @@ class WorkerPool:
                     if not await self._recreate_worker(last_error):
                         break
 
+                await self._ensure_ready_after_request(f"request {request_id} failed")
                 await self._notify_final_failure(last_error)
                 return {
                     "success": False,
@@ -215,39 +222,39 @@ class WorkerPool:
                 self._active_request = False
             self._last_activity = time.time()
 
-    def _schedule_idle_prewarm(self) -> None:
-        """Prepare the next Temporary Chat only when no request is queued."""
-        if self._queued_requests > 0 or not self._initialized:
-            return
-        if self._prewarm_task and not self._prewarm_task.done():
-            return
-        self._prewarm_task = asyncio.create_task(self._prewarm_when_idle())
-
-    async def _prewarm_when_idle(self) -> None:
-        await asyncio.sleep(0)
+    async def _ensure_ready_after_request(self, reason: str) -> bool:
+        """Leave the serialized worker in a clean state before releasing it."""
         started = time.time()
         ok = False
         error = None
-        attempted = False
         try:
-            async with self._request_lock:
-                if self._queued_requests > 0 or not self._initialized or not self.worker:
-                    return
-                attempted = True
-                ok = await asyncio.wait_for(self.worker.prepare_idle(), timeout=20)
-        except asyncio.CancelledError:
-            raise
+            worker = self.worker
+            if worker and self._initialized:
+                ok = await asyncio.wait_for(worker.prepare_next_request(), timeout=20)
+            else:
+                error = "worker unavailable"
         except Exception as exc:
             error = str(exc)
-            log(f"Idle Temporary Chat preparation failed: {exc}", "Worker")
-        finally:
-            if attempted:
-                self._last_idle_prewarm = {
-                    "ok": ok,
-                    "error": error,
-                    "duration_ms": int((time.time() - started) * 1000),
-                    "at_unix": int(time.time()),
-                }
+            log(f"Ready-state reset failed: {exc}", "Worker")
+
+        if not ok and self._initialized:
+            ok = await self._recreate_worker(f"ready reset: {reason}")
+            if ok:
+                error = None
+
+        if not ok:
+            self._initialized = False
+            error = error or "worker could not be restored to ready state"
+
+        self._last_ready_reset = {
+            "ok": ok,
+            "reason": reason,
+            "error": error,
+            "duration_ms": int((time.time() - started) * 1000),
+            "at_unix": int(time.time()),
+        }
+        log(f"Next-request state {'ready' if ok else 'unavailable'}: {reason}", "Worker")
+        return ok
 
     async def _notify_final_failure(self, error: str) -> None:
         try:
@@ -273,7 +280,7 @@ class WorkerPool:
             "startup_pages_closed": self._startup_pages_closed,
             "worker_recreation_count": self._worker_recreation_count,
             "last_worker_recreation": self._last_worker_recreation,
-            "last_idle_prewarm": self._last_idle_prewarm,
+            "last_ready_reset": self._last_ready_reset,
             "last_activity_unix": int(self._last_activity),
             "workers": [{
                 "worker_id": 1,
@@ -320,13 +327,6 @@ class WorkerPool:
 
     async def close(self) -> None:
         self._initialized = False
-        if self._prewarm_task and not self._prewarm_task.done():
-            self._prewarm_task.cancel()
-            try:
-                await self._prewarm_task
-            except asyncio.CancelledError:
-                pass
-        self._prewarm_task = None
         worker = self.worker
         self.workers.clear()
         if worker:

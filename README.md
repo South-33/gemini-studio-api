@@ -51,10 +51,10 @@ Operational settings are intentionally fixed in code for this deployment:
 port 8000, the production ngrok domain, visible Chromium, one worker, and the
 tested timeout/retry policy. `.env` is optional and contains only Discord alert
 delivery values. Concurrent calls wait in an in-process queue;
-`/v1/diagnostics` exposes `active_request` and `queued_requests`. After a
-successful response is returned, an idle queue prepares the next clean
-Temporary Chat in the background; queued calls skip that extra work and reset
-as part of their normal request.
+`/v1/diagnostics` exposes `active_request`, `queued_requests`, and the last
+ready-state reset. Each serialized request verifies its model, sends, waits,
+copies the response, and resets to a clean Temporary Chat before the next
+queued request can start.
 
 Prompts at or above 1,500 characters are attached as `prompt.txt` to avoid
 freezing Gemini's editor. For those attached prompts, explicit
