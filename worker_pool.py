@@ -7,9 +7,9 @@ import os
 import time
 from typing import Any, Dict, List, Optional
 
-from playwright.async_api import Page, Route, async_playwright
+from playwright.async_api import Page, async_playwright
 
-from gemini_web import GeminiWebAutomation, LOW_MEMORY_MODE, log
+from gemini_web import GeminiWebAutomation, log
 from notifier import notify_error
 
 
@@ -50,16 +50,6 @@ class WorkerPool:
                 "--disable-renderer-backgrounding",
                 "--disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling,BatterySaverModeAvailability",
             ]
-            if LOW_MEMORY_MODE:
-                args.extend([
-                    "--disable-extensions",
-                    "--disable-background-networking",
-                    "--disable-sync",
-                    "--disable-translate",
-                    "--no-first-run",
-                    "--disable-default-apps",
-                ])
-
             log(
                 "Chromium background throttling and native occlusion are disabled",
                 "Worker",
@@ -73,9 +63,6 @@ class WorkerPool:
                 permissions=["clipboard-read", "clipboard-write"],
                 viewport={"width": 1600, "height": 900},
             )
-            if LOW_MEMORY_MODE:
-                await self.context.route("**/*", self._block_resources)
-
             page = await self._replace_restored_pages()
             worker = await self._initialize_page(page)
             if not worker:
@@ -329,12 +316,6 @@ class WorkerPool:
         except Exception as exc:
             info["current_state_error"] = str(exc)
         return result
-
-    async def _block_resources(self, route: Route) -> None:
-        if route.request.resource_type in {"image", "media", "font"}:
-            await route.abort()
-        else:
-            await route.continue_()
 
     async def close(self) -> None:
         self._initialized = False

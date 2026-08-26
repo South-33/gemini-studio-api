@@ -32,8 +32,7 @@ def log(msg: str, tag: str = "Core"):
     if buf is not None:
         buf.append(formatted_msg)
 
-# Production is a visible, text-first browser with long prompts attached as files.
-LOW_MEMORY_MODE = True
+# Production uses a visible browser with long prompts attached as files.
 PROMPT_FILE_UPLOAD_THRESHOLD = 1500
 BROWSER_TIMEOUT_SECONDS = 480
 
