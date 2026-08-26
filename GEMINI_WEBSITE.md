@@ -79,7 +79,9 @@ known-ready state. If reset fails, replace the page once and prepare that page.
 `thinking-overlay` may expose a short changing summary while Extended reasoning
 is active, but Gemini leaves an empty overlay mounted after completion. Count
 only a visible animation or non-empty summary as liveness, and never require
-reasoning text for success.
+reasoning text for success. Sample the state once per second. A changed summary
+or growing response resets the progress clock; static reasoning fails after
+120 seconds, or 180 seconds while relevant Gemini network traffic remains live.
 
 `Ctrl+Shift+S` toggles Chat/Spark and is not idempotent. Use it only when state
 already proves Spark is active and always verify afterward. `Ctrl+Shift+O`

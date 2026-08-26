@@ -48,10 +48,10 @@ STALL_NO_PROGRESS_SECONDS_SMALL = 180
 STALL_NO_PROGRESS_SECONDS_SMALL_WITH_ACTIVITY = 300
 STALL_NO_PROGRESS_SECONDS_WITH_ACTIVITY = 180
 STALL_SMALL_LEN_THRESHOLD = 200
-STALL_THINKING_NO_PROGRESS_SECONDS = 300
-STALL_THINKING_NO_PROGRESS_SECONDS_WITH_ACTIVITY = 420
-STALL_STATIC_THINKING_SECONDS = 300
-STALL_STATIC_THINKING_SECONDS_WITH_ACTIVITY = 420
+# The DOM is sampled every second. A changing reasoning summary resets this
+# deadline; recent Gemini network activity earns one additional minute.
+STALL_THINKING_NO_PROGRESS_SECONDS = 120
+STALL_THINKING_NO_PROGRESS_SECONDS_WITH_ACTIVITY = 180
 FINALIZE_STABLE_RESPONSE_SECONDS = 45
 FINALIZE_STABLE_RESPONSE_LEN = 800
 RECENT_NETWORK_ACTIVITY_SECONDS = 75
@@ -1747,16 +1747,11 @@ class GeminiWebAutomation:
                 # First check the current active UI configuration
                 ui_model, ui_thinking = await self._get_current_ui_model_and_thinking()
                 
-                # Update tracked state from what is currently on the screen
-                if ui_model:
-                    self._current_selected_model = ui_model
-                if ui_thinking:
-                    self._current_selected_thinking_level = ui_thinking
-
-                # Select model if it differs
-                if model and not self._matches_model(self._current_selected_model or "", model):
+                # The visible picker is authoritative on every request. Match
+                # stable families (Pro/Flash/Lite), not changing version text.
+                if model and (not ui_model or not self._matches_model(ui_model, model)):
                     selected = await self._select_model(model)
-                    # Re-read UI state since selecting a model changes the layout / resets defaults
+                    # Selecting a model can also reset reasoning; re-read both.
                     ui_model, ui_thinking = await self._get_current_ui_model_and_thinking()
                     if not selected or not ui_model or not self._matches_model(ui_model, model):
                         err = f"Requested model {model!r} but Gemini UI is {ui_model or 'unknown'!r}"
@@ -1767,20 +1762,22 @@ class GeminiWebAutomation:
                             {"requested_model": model, "ui_model": ui_model, "selection_ok": bool(selected)},
                         )
                         return {"success": False, "error": err}
+                if ui_model:
                     self._current_selected_model = ui_model
-                    if ui_thinking:
-                        self._current_selected_thinking_level = ui_thinking
 
-                # Select thinking level if it differs
+                # Select and verify reasoning from the current UI, never from
+                # cached state left by the previous Temporary Chat.
                 target_thinking = thinking_level or "Standard"
-                if target_thinking and self._current_selected_thinking_level != target_thinking:
+                if target_thinking and ui_thinking != target_thinking:
                     await self._set_thinking_level(target_thinking)
                     _, verified_thinking = await self._get_current_ui_model_and_thinking()
                     if verified_thinking != target_thinking:
                         err = f"Requested thinking {target_thinking!r} but Gemini UI is {verified_thinking or 'unknown'!r}"
                         self._track_error(err, "thinking_level", "send_message")
                         return {"success": False, "error": err}
-                    self._current_selected_thinking_level = verified_thinking
+                    ui_thinking = verified_thinking
+                if ui_thinking:
+                    self._current_selected_thinking_level = ui_thinking
 
             # 3. Enter Prompt
             input_selector = await self._resolve_selector("input", require_visible=True, timeout_ms=2000)
@@ -2304,11 +2301,11 @@ class GeminiWebAutomation:
                     ):
                         if is_new_thinking:
                             static_thinking_age = int(now - last_thinking_label_change_at)
-                            static_thinking_threshold = STALL_STATIC_THINKING_SECONDS
+                            static_thinking_threshold = STALL_THINKING_NO_PROGRESS_SECONDS
                             if backend_activity_live:
                                 static_thinking_threshold = max(
                                     static_thinking_threshold,
-                                    STALL_STATIC_THINKING_SECONDS_WITH_ACTIVITY,
+                                    STALL_THINKING_NO_PROGRESS_SECONDS_WITH_ACTIVITY,
                                 )
                             if response_body_len == 0 and static_thinking_age >= static_thinking_threshold:
                                 stall_reason = (
