@@ -42,6 +42,7 @@ class WorkerPool:
             self.playwright = await async_playwright().start()
             args = [
                 "--disable-blink-features=AutomationControlled",
+                "--start-maximized",
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-setuid-sandbox",
@@ -51,7 +52,7 @@ class WorkerPool:
                 "--disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling,BatterySaverModeAvailability",
             ]
             log(
-                "Chromium background throttling and native occlusion are disabled",
+                "Launching maximized Chromium with native viewport and background throttling disabled",
                 "Worker",
             )
 
@@ -61,7 +62,7 @@ class WorkerPool:
                 headless=False,
                 args=args,
                 permissions=["clipboard-read", "clipboard-write"],
-                viewport={"width": 1600, "height": 900},
+                no_viewport=True,
             )
             page = await self._replace_restored_pages()
             worker = await self._initialize_page(page)

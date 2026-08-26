@@ -62,7 +62,8 @@ Create image/video/music, Canvas, or Deep research as an automation fallback.
 
 Every request must:
 
-1. prove Chat mode;
+1. prove Chat mode from an active Chat tab, or from a ready `/app` composer
+   when Spark is not active (some layouts expose no stable selected-tab state);
 2. prove the conversation is empty (no user query, response, or Stop state);
 3. enter temporary chat when available;
 4. select and re-read model/reasoning;

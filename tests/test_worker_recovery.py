@@ -97,11 +97,11 @@ class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(new_chat.clicked, 1)
         worker._trigger_new_chat_shortcut.assert_not_awaited()
 
-    def test_ready_app_without_mode_switcher_is_chat(self):
+    def test_ready_app_without_explicit_mode_state_is_chat(self):
         self.assertTrue(GeminiWebAutomation._is_implicit_chat_mode({
             "url": "https://gemini.google.com/app",
             "input_visible": True,
-            "chat_tab_visible": False,
+            "chat_tab_visible": True,
             "spark_mode_active": False,
             "error_page_500": False,
         }))
@@ -110,6 +110,13 @@ class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
             "input_visible": True,
             "chat_tab_visible": False,
             "spark_mode_active": False,
+            "error_page_500": False,
+        }))
+        self.assertFalse(GeminiWebAutomation._is_implicit_chat_mode({
+            "url": "https://gemini.google.com/app",
+            "input_visible": True,
+            "chat_tab_visible": True,
+            "spark_mode_active": True,
             "error_page_500": False,
         }))
 

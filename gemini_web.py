@@ -1217,10 +1217,11 @@ class GeminiWebAutomation:
 
     @staticmethod
     def _is_implicit_chat_mode(snapshot: Optional[Dict[str, Any]]) -> bool:
-        """Accept a ready /app composer when Google omits the mode switcher.
+        """Accept a ready /app composer when mode selection is not explicit.
 
-        Some accounts/layouts do not render Chat/Spark tabs. A visible prompt
-        composer on /app is still an authoritative Chat signal; /spark is not.
+        Some accounts/layouts omit the switcher; others render it without a
+        stable active attribute. A visible composer on /app is still an
+        authoritative Chat signal, while Spark uses /spark or an active tab.
         """
         snap = snapshot or {}
         try:
@@ -1230,7 +1231,6 @@ class GeminiWebAutomation:
         return bool(
             path == "/app"
             and snap.get("input_visible")
-            and not snap.get("chat_tab_visible")
             and not snap.get("spark_mode_active")
             and not snap.get("error_page_500")
         )
@@ -1247,7 +1247,7 @@ class GeminiWebAutomation:
         if self._is_chat_mode(snapshot):
             return True
         if self._is_implicit_chat_mode(snapshot):
-            log("Gemini Chat inferred from ready /app composer (mode switcher absent)", f"Worker {self.worker_id}")
+            log("Gemini Chat confirmed by ready /app composer", f"Worker {self.worker_id}")
             return True
 
         # The mode switcher lives in the side navigation in the current UI.
@@ -1279,7 +1279,7 @@ class GeminiWebAutomation:
             deadline = time.time() + timeout_seconds
             while time.time() < deadline:
                 current = await self._capture_state_snapshot()
-                if self._is_chat_mode(current) and current.get("input_visible"):
+                if (self._is_chat_mode(current) or self._is_implicit_chat_mode(current)) and current.get("input_visible"):
                     log("Gemini Chat mode confirmed via shortcut", f"Worker {self.worker_id}")
                     return True
                 await asyncio.sleep(0.2)
@@ -1318,7 +1318,7 @@ class GeminiWebAutomation:
         deadline = time.time() + timeout_seconds
         while time.time() < deadline:
             current = await self._capture_state_snapshot()
-            if self._is_chat_mode(current) and current.get("input_visible"):
+            if (self._is_chat_mode(current) or self._is_implicit_chat_mode(current)) and current.get("input_visible"):
                 log("Gemini Chat mode confirmed", f"Worker {self.worker_id}")
                 return True
             await asyncio.sleep(0.2)
