@@ -14,17 +14,15 @@ import asyncio
 import threading
 import base64
 import tempfile
-import json
 import time
 import uuid
 import math
 import pathlib
 from collections import deque
 from datetime import datetime, timezone
-from typing import List, Optional, Dict, Union
+from typing import List, Optional, Dict
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, ConfigDict
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 
@@ -38,13 +36,13 @@ def log(msg: str, tag: str = "Server"):
 # Load .env file
 load_dotenv()
 
-from core import WorkerPool
+from gemini_models import MODEL_FAMILIES, normalize_thinking_level, parse_model_and_thinking
+from worker_pool import WorkerPool
 
 # Configuration
-WORKER_COUNT = int(os.getenv("WORKER_COUNT", "1"))
-PROVIDER = os.getenv("PROVIDER", "auto").lower()  # "auto", "aistudio", or "gemini-web"
 BROWSER_TIMEOUT = int(os.getenv("BROWSER_TIMEOUT", "480"))
 API_TIMEOUT_HEADROOM = int(os.getenv("API_TIMEOUT_HEADROOM", "30"))
+QUEUE_TIMEOUT = int(os.getenv("QUEUE_TIMEOUT", "1800"))
 RECENT_REQUEST_LIMIT = int(os.getenv("RECENT_REQUEST_LIMIT", "200"))
 IMAGE_TOKEN_ESTIMATE = 300
 
@@ -64,127 +62,59 @@ async def init_browser_thread():
     browser_thread = threading.Thread(target=run_browser_loop, args=(browser_loop,), daemon=True)
     browser_thread.start()
     
-    worker_pool = WorkerPool(worker_count=WORKER_COUNT, provider=PROVIDER)
+    worker_pool = WorkerPool()
     # Empty cookies - we use persistent browser session instead
-    future = asyncio.run_coroutine_threadsafe(worker_pool.init([]), browser_loop)
+    future = asyncio.run_coroutine_threadsafe(worker_pool.init(), browser_loop)
     return future.result(timeout=120)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     success = await init_browser_thread()
-    if success:
-        log(f"✅ Multi-Worker Pool Ready ({WORKER_COUNT} workers)")
-        if WORKER_COUNT < 2:
-            log(
-                "WORKER_COUNT=1: concurrent requests will queue behind one Gemini tab; "
-                "set WORKER_COUNT=2 or higher for parallel processing",
-                "API",
-            )
-    else:
+    if not success:
+        if browser_loop:
+            browser_loop.call_soon_threadsafe(browser_loop.stop)
+        if browser_thread:
+            browser_thread.join(timeout=5)
         raise RuntimeError("Worker pool failed to initialize")
-    
-    yield
-    if worker_pool:
-        future = asyncio.run_coroutine_threadsafe(worker_pool.close(), browser_loop)
-        future.result(timeout=10)
+
+    log("Gemini worker ready; concurrent requests will queue", "API")
+    try:
+        yield
+    finally:
+        if worker_pool and browser_loop and browser_loop.is_running():
+            future = asyncio.run_coroutine_threadsafe(worker_pool.close(), browser_loop)
+            future.result(timeout=15)
+        if browser_loop and browser_loop.is_running():
+            browser_loop.call_soon_threadsafe(browser_loop.stop)
+        if browser_thread:
+            browser_thread.join(timeout=5)
 
 
 app = FastAPI(title="Gemini Studio API", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# --- Models ---
-
-class OpenAIMessage(BaseModel):
-    model_config = ConfigDict(extra="allow")
-    
-    role: str
-    content: Union[str, List[Dict]]  # Support both text and multipart (Vision API)
-
-class OpenAIChatRequest(BaseModel):
-    model_config = ConfigDict(extra="allow")
-    
-    model: str
-    messages: List[OpenAIMessage]
-    temperature: Optional[float] = 1.0
-    stream: bool = False  # Ignored, but accepted for compatibility
-    thinking_level: Optional[str] = None
-    use_search: Optional[bool] = False
-
 # --- Helpers ---
-
-def parse_model_and_thinking(model_name: str) -> tuple:
-    """
-    Parse model and thinking level from model name.
-    Canonical Web UI model IDs:
-    - gemini-3.6-flash
-    - gemini-3.5-flash-lite
-    - gemini-3.1-pro
-
-    Thinking suffixes: -extended, :extended, -standard, -high, -medium, -low, -minimal
-
-    Clean Aliases (recommended for version-agnostic client configuration):
-    - flash, gemini-flash                     → gemini-3.6-flash
-    - flash-lite, flash lite, fast, lite      → gemini-3.5-flash-lite
-    - pro, gemini-pro                          → gemini-3.1-pro
-    - thinking                                 → gemini-3.6-flash + Extended
-    - gemini-3.5-flash, 3.5-flash              → gemini-3.6-flash
-    - gemini-3.1-flash-lite, 3.1-flash-lite    → gemini-3.5-flash-lite
-    """
-    model_lower = model_name.lower().strip()
-
-    # 1. Parse thinking level suffix first
-    thinking_level = None
-    thinking_suffixes = ["extended", "standard", "high", "medium", "low", "minimal"]
-    for suffix in thinking_suffixes:
-        if model_lower.endswith(f"-{suffix}"):
-            thinking_level = suffix.capitalize()
-            model_lower = model_lower[:-(len(suffix) + 1)].strip()
-            break
-        elif model_lower.endswith(f":{suffix}"):
-            thinking_level = suffix.capitalize()
-            model_lower = model_lower[:-(len(suffix) + 1)].strip()
-            break
-
-    # 2. Map to canonical Web UI model slugs and aliases
-    if model_lower in {"gemini-3.6-flash", "3.6-flash", "gemini-3.5-flash", "3.5-flash", "flash", "gemini-flash"}:
-        base_model = "gemini-3.6-flash"
-    elif model_lower in {"gemini-3.5-flash-lite", "3.5-flash-lite", "gemini-3.1-flash-lite", "3.1-flash-lite", "flash-lite", "flash lite", "fast", "lite", "gemini-flash-lite"}:
-        base_model = "gemini-3.5-flash-lite"
-    elif model_lower in {"gemini-3.1-pro", "3.1-pro", "pro", "gemini-pro"}:
-        base_model = "gemini-3.1-pro"
-    elif model_lower == "thinking":
-        base_model = "gemini-3.6-flash"
-        if not thinking_level:
-            thinking_level = "Extended"
-    else:
-        base_model = model_name  # Unknown — pass through, let worker handle it
-
-    # Default thinking level to Standard if not specified
-    if not thinking_level:
-        thinking_level = "Standard"
-
-    return base_model, thinking_level
-
 
 def extract_request_source(request: Request, body: Dict) -> Dict[str, str]:
     """Extract source labels from headers/body for diagnostics."""
     headers = request.headers
+    metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
     project = (
         headers.get("x-project-name")
         or body.get("project")
-        or (body.get("metadata") or {}).get("project")
+        or metadata.get("project")
         or "unknown"
     )
     client = (
         headers.get("x-client-name")
         or body.get("client")
-        or (body.get("metadata") or {}).get("client")
+        or metadata.get("client")
         or "unknown"
     )
     req_id = (
         headers.get("x-request-id")
         or body.get("request_id")
-        or (body.get("metadata") or {}).get("request_id")
+        or metadata.get("request_id")
         or str(uuid.uuid4())
     )
 
@@ -388,89 +318,129 @@ def write_error_transaction_log(
 async def list_models():
     """List available Gemini Web models."""
     return {
-        "data": [
-            {"id": "gemini-3.6-flash", "object": "model", "provider": "gemini-web"},
-            {"id": "gemini-3.5-flash-lite", "object": "model", "provider": "gemini-web"},
-            {"id": "gemini-3.1-pro", "object": "model", "provider": "gemini-web"},
-            {"id": "flash", "object": "model", "provider": "gemini-web"},
-            {"id": "flash-lite", "object": "model", "provider": "gemini-web"},
-            {"id": "pro", "object": "model", "provider": "gemini-web"},
-        ]
+        "data": [{"id": name, "object": "model", "provider": "gemini-web"} for name in MODEL_FAMILIES]
     }
 
 @app.post("/v1/chat/completions")
 async def openai_chat(request: Request):
     """OpenAI-compatible chat completions endpoint."""
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Request body must be valid JSON") from exc
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Request body must be a JSON object")
+    if body.get("stream"):
+        raise HTTPException(status_code=400, detail="Streaming responses are not supported")
     
     if not worker_pool:
         raise HTTPException(status_code=503, detail="Worker pool not initialized")
     
     source = extract_request_source(request, body)
     trace_id = source["request_id"]
-    trace = {
-        "request_id": trace_id,
-        "project": source["project"],
-        "client": source["client"],
-        "ip": source["ip"],
-        "model": body.get("model", ""),       # Raw value from client
-        "resolved_model": "",                  # Set after parse_model_and_thinking
-        "thinking_level": "",                  # Set after parse_model_and_thinking
-        "status": "started",
-        "started_at": datetime.now(timezone.utc).isoformat(),
-    }
-    recent_requests.append(trace)
 
     # Extract fields
-    model = body.get("model", "gemini-3.6-flash")
+    model = body.get("model", "flash")
     messages = body.get("messages", [])
+    if not isinstance(messages, list) or not messages:
+        raise HTTPException(status_code=400, detail="messages must be a non-empty array")
     thinking_level_explicit = body.get("thinking_level")
     use_search = body.get("use_search", False)
+    if not isinstance(model, str):
+        raise HTTPException(status_code=400, detail="model must be a string")
+    if thinking_level_explicit is not None and not isinstance(thinking_level_explicit, str):
+        raise HTTPException(status_code=400, detail="thinking_level must be a string")
+    if not isinstance(use_search, bool):
+        raise HTTPException(status_code=400, detail="use_search must be a boolean")
 
     # Parse thinking level from model name
-    base_model, thinking_level = parse_model_and_thinking(model)
+    try:
+        base_model, thinking_level = parse_model_and_thinking(model)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if thinking_level_explicit:
-        thinking_level = thinking_level_explicit
-
-    # Record resolved model in trace (raw model already stored above)
-    trace["resolved_model"] = base_model
-    trace["thinking_level"] = thinking_level
-
-    log(f"[{trace_id}] Source: project={source['project']} client={source['client']} ip={source['ip']}", "API")
-    log(f"Model: {base_model} | Thinking: {thinking_level} | Messages: {len(messages)} | Raw: {model}", "API")
+        try:
+            thinking_level = normalize_thinking_level(thinking_level_explicit)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     # Combine messages and extract images
     prompt = ""
     image_paths = []
+
+    def cleanup_image_paths() -> None:
+        for path in image_paths:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
     
     for msg in messages:
-        role = msg.get("role", "user")
+        if not isinstance(msg, dict):
+            cleanup_image_paths()
+            raise HTTPException(status_code=400, detail="Each message must be an object")
         content = msg.get("content", "")
         
         if isinstance(content, list):
             for part in content:
+                if not isinstance(part, dict):
+                    cleanup_image_paths()
+                    raise HTTPException(status_code=400, detail="Message content parts must be objects")
                 part_type = part.get("type", "text")
                 if part_type == "text":
                     text_content = part.get('text', '')
                     if text_content:
-                        prompt += text_content + "\n"
+                        prompt += str(text_content) + "\n"
                 elif part_type == "image_url":
-                    image_url = part.get("image_url", {}).get("url", "")
+                    image_spec = part.get("image_url")
+                    image_url = image_spec.get("url", "") if isinstance(image_spec, dict) else ""
                     if image_url.startswith("data:image/"):
                         try:
                             header, base64_data = image_url.split(",", 1)
-                            image_bytes = base64.b64decode(base64_data)
+                            image_bytes = base64.b64decode(base64_data, validate=True)
                             mime_type = header.split(";")[0].split(":")[1]
-                            ext = mime_type.split("/")[1]
+                            ext = {
+                                "image/png": "png",
+                                "image/jpeg": "jpg",
+                                "image/gif": "gif",
+                                "image/webp": "webp",
+                            }.get(mime_type)
+                            if not ext:
+                                raise ValueError(f"Unsupported image MIME type: {mime_type}")
                             temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}")
                             temp_file.write(image_bytes)
                             temp_file.close()
                             image_paths.append(temp_file.name)
                         except Exception as e:
-                            log(f"Failed to decode image: {e}", "API")
+                            cleanup_image_paths()
+                            raise HTTPException(status_code=400, detail=f"Invalid image attachment: {e}") from e
+                    else:
+                        cleanup_image_paths()
+                        raise HTTPException(status_code=400, detail="Only data:image/... image URLs are supported")
+                else:
+                    cleanup_image_paths()
+                    raise HTTPException(status_code=400, detail=f"Unsupported message content type: {part_type}")
         else:
             if content:
-                prompt += content + "\n"
+                prompt += str(content) + "\n"
+
+    if not prompt.strip() and not image_paths:
+        raise HTTPException(status_code=400, detail="Request contains no text or image content")
+
+    trace = {
+        "request_id": trace_id,
+        "project": source["project"],
+        "client": source["client"],
+        "ip": source["ip"],
+        "model": model,
+        "resolved_model": base_model,
+        "thinking_level": thinking_level,
+        "status": "started",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+    }
+    recent_requests.append(trace)
+    log(f"[{trace_id}] Source: project={source['project']} client={source['client']} ip={source['ip']}", "API")
+    log(f"Model: {base_model} | Thinking: {thinking_level} | Messages: {len(messages)} | Raw: {model}", "API")
     
     # Send to worker
     prompt_chars = len(prompt)
@@ -486,7 +456,7 @@ async def openai_chat(request: Request):
         f"Prompt stats: chars={prompt_chars} tokens_est={prompt_tokens_est} images={len(image_paths)}",
         "API",
     )
-    log(f"Dispatching to browser thread...", "API")
+    log("Dispatching to browser thread...", "API")
     coro = worker_pool.send_message(
         prompt, 
         model=base_model, 
@@ -497,19 +467,19 @@ async def openai_chat(request: Request):
     )
     future = asyncio.run_coroutine_threadsafe(coro, browser_loop)
     
-    retry_budget = min(3, max(1, WORKER_COUNT))
-    api_timeout = (BROWSER_TIMEOUT * retry_budget) + API_TIMEOUT_HEADROOM
+    retry_budget = 2
+    api_timeout = QUEUE_TIMEOUT + (BROWSER_TIMEOUT * retry_budget) + API_TIMEOUT_HEADROOM
     
     try:
         log(
-            f"Waiting for browser thread (worker_timeout={BROWSER_TIMEOUT}s, retries={retry_budget}, api_timeout={api_timeout}s)...",
+            f"Waiting for queue/browser (queue_timeout={QUEUE_TIMEOUT}s, worker_timeout={BROWSER_TIMEOUT}s, retries={retry_budget}, api_timeout={api_timeout}s)...",
             "API"
         )
         result = await asyncio.get_event_loop().run_in_executor(
             None, 
             lambda: future.result(timeout=api_timeout)
         )
-        log(f"Browser thread returned", "API")
+        log("Browser thread returned", "API")
     except TimeoutError:
         try:
             future.cancel()
@@ -525,13 +495,13 @@ async def openai_chat(request: Request):
         trace["finished_at"] = datetime.now(timezone.utc).isoformat()
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        for img_path in image_paths:
-            try: os.unlink(img_path)
-            except: pass
+        cleanup_image_paths()
 
     if not result["success"]:
         trace["status"] = "failed"
         trace["error"] = result.get("error")
+        trace["queue_wait_ms"] = result.get("queue_wait_ms")
+        trace["attempts"] = result.get("attempts")
         trace["finished_at"] = datetime.now(timezone.utc).isoformat()
         write_error_transaction_log(trace, result, list(recent_requests))
         raise HTTPException(status_code=500, detail=result.get("error"))
@@ -539,6 +509,8 @@ async def openai_chat(request: Request):
     content = result["response"] or ""
     completion_tokens_est = estimate_text_tokens(content)
     trace["status"] = "ok"
+    trace["queue_wait_ms"] = result.get("queue_wait_ms")
+    trace["attempts"] = result.get("attempts")
     trace["response_chars"] = len(content)
     trace["response_tokens_est"] = completion_tokens_est
     trace["finished_at"] = datetime.now(timezone.utc).isoformat()
@@ -587,7 +559,7 @@ def public_request_trace(trace: Dict) -> Dict:
     return {
         key: value
         for key, value in trace.items()
-        if key not in {"prompt_full", "prompt_preview"}
+        if key not in {"prompt_full", "prompt_preview", "ip"}
     }
 
 
@@ -599,7 +571,7 @@ async def health(response: Response):
     return {
         "status": "ok" if is_ready else "degraded",
         "ready": is_ready,
-        "workers": WORKER_COUNT,
+        "workers": 1,
         "ready_workers": ready_workers,
     }
 
@@ -611,34 +583,12 @@ async def diagnostics():
 
     pool_diag = await worker_pool.get_live_diagnostics()
     return {
-        "status": "ok",
+        "status": "ok" if ready_worker_count() else "degraded",
         "pool": pool_diag,
         "recent_requests": [public_request_trace(trace) for trace in recent_requests],
     }
 
-@app.get("/v1/screenshot")
-async def get_screenshot(worker: int = 1, full_page: bool = False):
-    if not worker_pool:
-        raise HTTPException(status_code=503, detail="Worker pool not initialized")
-    if worker < 1 or worker > len(worker_pool.workers):
-        raise HTTPException(status_code=400, detail="Invalid worker index")
-    w = worker_pool.workers[worker - 1]
-    if not w.page:
-        raise HTTPException(status_code=404, detail="Worker page not found")
-    
-    from fastapi.responses import FileResponse
-    import tempfile
-    screenshot_path = pathlib.Path(tempfile.gettempdir()) / f"worker_{worker}_screenshot.png"
-    try:
-        await w.page.screenshot(path=str(screenshot_path), full_page=full_page)
-        return FileResponse(str(screenshot_path), media_type="image/png")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to capture screenshot: {e}")
-
 if __name__ == "__main__":
     import uvicorn
-    import sys
-    # Note: Windows event loop policy is set automatically in Python 3.8+
-    # The deprecated set_event_loop_policy warning can be ignored
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port)

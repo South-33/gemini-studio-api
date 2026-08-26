@@ -1,7 +1,5 @@
 # Session data (contains login cookies - NEVER commit!)
-.aistudio_data/
 .browser_session/
-cookies.json
 
 # Python
 __pycache__/
@@ -10,9 +8,6 @@ venv/
 
 # Environment files with secrets
 .env
-
-# Bandwidth tracking
-.bandwidth_usage
 
 # Error transaction logs
 logs/

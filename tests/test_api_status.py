@@ -43,6 +43,7 @@ class ApiStatusTests(unittest.TestCase):
     def test_public_trace_excludes_prompt_content(self):
         public = main.public_request_trace({
             "request_id": "req-1",
+            "ip": "127.0.0.1",
             "status": "failed",
             "prompt_chars": 1234,
             "prompt_preview": "private preview",

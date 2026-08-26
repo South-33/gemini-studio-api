@@ -1,29 +1,8 @@
 import unittest
 from unittest.mock import AsyncMock
 
-from core import GeminiWebAutomation, WorkerPool
-
-
-class FakePage:
-    def __init__(self, url="https://gemini.google.com/app"):
-        self.url = url
-        self.closed = False
-
-    def is_closed(self):
-        return self.closed
-
-    async def close(self):
-        self.closed = True
-
-
-class FakeContext:
-    def __init__(self, pages):
-        self.pages = pages
-
-    async def new_page(self):
-        page = FakePage("about:blank")
-        self.pages.append(page)
-        return page
+from gemini_web import GeminiWebAutomation
+from worker_pool import WorkerPool
 
 
 class FakeLocator:
@@ -51,23 +30,10 @@ class FakeLocatorPage:
 
 
 class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
-    async def test_uninitialized_pool_fails_assignment_immediately(self):
-        pool = WorkerPool(worker_count=1)
-        worker = GeminiWebAutomation(worker_id=1)
-        worker._initialized = False
-        pool.workers = [worker]
-        pool._worker_busy = [False]
-        pool._worker_busy_since = [None]
-
-        index, selected = await pool._get_available_worker()
-
-        self.assertIsNone(index)
-        self.assertIsNone(selected)
-
-    def test_model_picker_prefers_exact_gemini_button(self):
+    def test_model_picker_prefers_semantic_label_then_test_id(self):
         selectors = GeminiWebAutomation.SELECTORS["model_btn"]
-        self.assertEqual(selectors[0], 'button[data-test-id="bard-mode-menu-button"]')
-        self.assertEqual(selectors[1], 'button[aria-label^="Open mode picker" i]')
+        self.assertEqual(selectors[0], 'button[aria-label^="Open mode picker" i]')
+        self.assertEqual(selectors[1], 'button[data-test-id="bard-mode-menu-button"]')
 
     def test_model_matching_tolerates_version_and_label_changes(self):
         matcher = GeminiWebAutomation(worker_id=1)._matches_model
@@ -75,6 +41,15 @@ class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(matcher("Flash Lite", "flash-lite"))
         self.assertTrue(matcher("Gemini 4 Pro", "pro"))
         self.assertFalse(matcher("Gemini 3.7 Flash", "flash-lite"))
+
+    def test_long_prompt_search_hint_uses_stable_intent_words(self):
+        helper = GeminiWebAutomation._needs_search_hint
+        self.assertTrue(helper("Search the current reporting"))
+        self.assertTrue(helper("Use the web for sources"))
+        self.assertTrue(helper("Check Google", use_search=False))
+        self.assertTrue(helper("Plain request", use_search=True))
+        self.assertFalse(helper("Plain request"))
+        self.assertFalse(helper("Improve this website layout"))
 
     def test_chat_mode_requires_chat_active_and_spark_inactive(self):
         self.assertTrue(GeminiWebAutomation._is_chat_mode({
@@ -105,63 +80,38 @@ class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(selected)
         self.assertEqual(chat_tab.clicked, 1)
 
-    async def test_startup_closes_all_restored_pages(self):
-        pages = [FakePage(), FakePage("about:blank")]
-        pool = WorkerPool(worker_count=1)
-        pool.shared_context = FakeContext(pages)
-
-        closed, failed = await pool._close_restored_context_pages()
-
-        self.assertEqual((closed, failed), (2, 0))
-        self.assertTrue(all(page.closed for page in pages[:2]))
-        self.assertFalse(pool._startup_guard_page.closed)
-        self.assertEqual(pool._startup_pages_closed, 2)
-
-    async def test_hard_refresh_rejects_page_that_is_still_generating(self):
+    async def test_new_chat_control_is_preferred_over_keyboard_shortcut(self):
         worker = GeminiWebAutomation(worker_id=1)
-        worker.page = object()
-        worker.context = object()
-        worker._initialized = True
-        worker._force_reload = AsyncMock()
-        worker._human_delay = AsyncMock()
-        worker.init_with_page = AsyncMock(return_value=True)
-        worker._capture_state_snapshot = AsyncMock(return_value={
-            "stop_visible": True,
-            "error_page_500": False,
+        new_chat = FakeLocator()
+        worker._ensure_chat_mode = AsyncMock(return_value=True)
+        worker._resolve_locator = AsyncMock(return_value=new_chat)
+        worker._trigger_new_chat_shortcut = AsyncMock(return_value=True)
+        worker._capture_state_snapshot = AsyncMock(side_effect=[
+            {"input_visible": True, "user_query_count": 1, "response_count": 1},
+            {"input_visible": True, "user_query_count": 0, "response_count": 0},
+        ])
+
+        ready = await worker._ensure_fresh_chat()
+
+        self.assertTrue(ready)
+        self.assertEqual(new_chat.clicked, 1)
+        worker._trigger_new_chat_shortcut.assert_not_awaited()
+
+    def test_ready_app_without_mode_switcher_is_chat(self):
+        self.assertTrue(GeminiWebAutomation._is_implicit_chat_mode({
+            "url": "https://gemini.google.com/app",
             "input_visible": True,
-            "input_text_len": 100,
-            "user_query_count": 1,
-            "response_count": 1,
-            "page_title": "Google Gemini",
-        })
-
-        recovered = await worker._hard_refresh_and_reinit("test")
-
-        self.assertFalse(recovered)
-        self.assertFalse(worker._initialized)
-        self.assertEqual(worker._last_recovery["stop_visible"], True)
-
-    async def test_hard_refresh_accepts_clean_ready_page(self):
-        worker = GeminiWebAutomation(worker_id=1)
-        worker.page = object()
-        worker.context = object()
-        worker._force_reload = AsyncMock()
-        worker._human_delay = AsyncMock()
-        worker.init_with_page = AsyncMock(return_value=True)
-        worker._capture_state_snapshot = AsyncMock(return_value={
-            "stop_visible": False,
+            "chat_tab_visible": False,
+            "spark_mode_active": False,
             "error_page_500": False,
+        }))
+        self.assertFalse(GeminiWebAutomation._is_implicit_chat_mode({
+            "url": "https://gemini.google.com/spark",
             "input_visible": True,
-            "input_text_len": 0,
-            "user_query_count": 0,
-            "response_count": 0,
-            "page_title": "Google Gemini",
-        })
-
-        recovered = await worker._hard_refresh_and_reinit("test")
-
-        self.assertTrue(recovered)
-        self.assertTrue(worker._last_recovery["ok"])
+            "chat_tab_visible": False,
+            "spark_mode_active": False,
+            "error_page_500": False,
+        }))
 
     async def test_retained_prompt_is_cleared_only_after_acceptance(self):
         worker = GeminiWebAutomation(worker_id=1)
@@ -205,12 +155,8 @@ class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(cleared)
         self.assertEqual(locator.filled, [])
 
-    def test_reset_and_fill_timeouts_poison_worker(self):
-        self.assertTrue(WorkerPool._is_stall_class_error("Fresh temp chat reset not confirmed"))
-        self.assertTrue(WorkerPool._is_stall_class_error("Locator.fill: Timeout 30000ms exceeded"))
-
     async def test_live_diagnostics_flag_idle_page_still_showing_stop(self):
-        pool = WorkerPool(worker_count=1)
+        pool = WorkerPool()
         worker = GeminiWebAutomation(worker_id=1)
         worker._initialized = True
         worker._generation_in_progress = False
@@ -228,8 +174,6 @@ class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
             "error_page_500": False,
         })
         pool.workers = [worker]
-        pool._worker_busy = [False]
-        pool._worker_busy_since = [None]
 
         diagnostics = await pool.get_live_diagnostics()
 
