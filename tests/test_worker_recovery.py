@@ -80,6 +80,31 @@ class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(selected)
         self.assertEqual(chat_tab.clicked, 1)
 
+    async def test_chat_mode_waits_for_composer_when_tab_is_missing_during_load(self):
+        worker = GeminiWebAutomation(worker_id=1)
+        worker._ensure_sidebar_open = AsyncMock(return_value=False)
+        worker._resolve_locator = AsyncMock(return_value=None)
+        worker._capture_state_snapshot = AsyncMock(side_effect=[
+            {
+                "url": "https://gemini.google.com/app",
+                "input_visible": False,
+                "chat_mode_active": False,
+                "spark_mode_active": False,
+                "error_page_500": False,
+            },
+            {
+                "url": "https://gemini.google.com/app",
+                "input_visible": True,
+                "chat_mode_active": False,
+                "spark_mode_active": False,
+                "error_page_500": False,
+            },
+        ])
+
+        selected = await worker._ensure_chat_mode(timeout_seconds=0.5)
+
+        self.assertTrue(selected)
+
     async def test_new_chat_control_is_preferred_over_keyboard_shortcut(self):
         worker = GeminiWebAutomation(worker_id=1)
         new_chat = FakeLocator()

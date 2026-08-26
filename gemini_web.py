@@ -1271,21 +1271,26 @@ class GeminiWebAutomation:
                 return False
 
         if chat_tab is None:
-            if not await toggle_chat_with_shortcut():
-                log("Chat mode tab was not found", f"Worker {self.worker_id}")
-                self._track_error("Chat mode tab not found", "chat_tab", "ensure_chat_mode", snapshot)
-                return False
-
             deadline = time.time() + timeout_seconds
+            shortcut_attempted = False
             while time.time() < deadline:
                 current = await self._capture_state_snapshot()
                 if (self._is_chat_mode(current) or self._is_implicit_chat_mode(current)) and current.get("input_visible"):
-                    log("Gemini Chat mode confirmed via shortcut", f"Worker {self.worker_id}")
+                    log("Gemini Chat mode confirmed after UI became ready", f"Worker {self.worker_id}")
                     return True
+                if current.get("spark_mode_active") and not shortcut_attempted:
+                    snapshot = current
+                    shortcut_attempted = await toggle_chat_with_shortcut()
                 await asyncio.sleep(0.2)
 
             final_snapshot = await self._capture_state_snapshot()
-            self._track_error("Chat mode shortcut confirmation timed out", "chat_tab", "ensure_chat_mode", final_snapshot)
+            log(
+                f"Chat mode unavailable after {timeout_seconds:.1f}s: state={final_snapshot.get('ui_state_hint')} "
+                f"url={final_snapshot.get('url')} input={final_snapshot.get('input_visible')} "
+                f"chat={final_snapshot.get('chat_mode_active')} spark={final_snapshot.get('spark_mode_active')}",
+                f"Worker {self.worker_id}",
+            )
+            self._track_error("Chat mode readiness timed out", "chat_tab", "ensure_chat_mode", final_snapshot)
             return False
 
         clicked = False
