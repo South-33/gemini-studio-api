@@ -40,6 +40,7 @@ BROWSER_TIMEOUT_SECONDS = 480
 UI_POLL_SECONDS = 0.2
 SEND_VERIFY_POLL_SECONDS = 0.1
 CLIPBOARD_POLL_SECONDS = 0.05
+NEW_CHAT_CONTROL_CONFIRM_SECONDS = 0.8
 WAIT_LOG_INTERVAL_SECONDS = 10
 STALL_EMPTY_SECONDS = 45
 STALL_EMPTY_SECONDS_WITH_ACTIVITY = 90
@@ -63,7 +64,7 @@ POOL_RECOVERY_WORKER_TIMEOUT_SECONDS = 75
 STALE_BUSY_WITHOUT_ACTIVE_SECONDS = 90
 SCROLL_NUDGE_AFTER_NO_PROGRESS_SECONDS = 8
 SCROLL_NUDGE_MIN_INTERVAL_SECONDS = 4
-UNSENT_STUCK_SECONDS = 20
+UNSENT_STUCK_SECONDS = 3
 STALL_RECREATE_THRESHOLD = 1
 NETWORK_OUTAGE_PROBE_TIMEOUT_SECONDS = 2.0
 
@@ -1399,7 +1400,7 @@ class GeminiWebAutomation:
         if new_chat is not None:
             try:
                 await new_chat.click(timeout=2000)
-                if await wait_until_clear():
+                if await wait_until_clear(NEW_CHAT_CONTROL_CONFIRM_SECONDS):
                     return True
             except Exception as exc:
                 log(f"New chat control failed: {exc}", f"Worker {self.worker_id}")
@@ -1825,6 +1826,7 @@ class GeminiWebAutomation:
             
             async def verify_send_worked(before_text, timeout_seconds: float = 1.0):
                 deadline = time.time() + timeout_seconds
+                weak_signal_count = 0
                 while time.time() < deadline:
                     try:
                         # Try both contenteditable and textarea access paths.
@@ -1839,16 +1841,18 @@ class GeminiWebAutomation:
                         before_len = len(before_text.strip()) if before_text else 0
                         after_len = len(after_text.strip())
 
-                        if before_len == 0 or after_len < before_len / 2:
-                            return True
-
                         snap = await self._capture_state_snapshot()
                         signal = start_signal_from_snapshot(snap, after_len)
-                        if signal:
+                        if signal in ("copy_increased", "response_increased", "stop_visible"):
                             log(
                                 f"Send accepted despite composer retaining text (signal={signal}, input_len={after_len})",
                                 f"Worker {worker_id}",
                             )
+                            return True
+
+                        weak_signal = before_len == 0 or after_len < before_len / 2 or bool(signal)
+                        weak_signal_count = weak_signal_count + 1 if weak_signal else 0
+                        if weak_signal_count >= 2:
                             return True
                     except Exception as e:
                         log(f"⚠️ Send verification error: {e}", f"Worker {worker_id}")
@@ -1928,6 +1932,8 @@ class GeminiWebAutomation:
 
             for send_attempt in range(MAX_SEND_RETRIES):
                 start_signal = ""
+                weak_start_signal = ""
+                weak_start_count = 0
                 last_snap = None
                 observe_deadline = time.time() + start_observe_seconds
 
@@ -1945,7 +1951,18 @@ class GeminiWebAutomation:
                     start_signal = start_signal_from_snapshot(snap, input_now_len)
 
                     if start_signal:
-                        break
+                        if start_signal in ("copy_increased", "response_increased", "stop_visible"):
+                            break
+                        if start_signal == weak_start_signal:
+                            weak_start_count += 1
+                        else:
+                            weak_start_signal = start_signal
+                            weak_start_count = 1
+                        if weak_start_count >= 3:
+                            break
+                    else:
+                        weak_start_signal = ""
+                        weak_start_count = 0
 
                     await asyncio.sleep(start_poll_seconds)
 
@@ -2013,6 +2030,9 @@ class GeminiWebAutomation:
             last_scroll_nudge_at = 0.0
             finalize_attempted = False
             seen_new_response = False
+            unsent_recovery_attempted = False
+            unsent_recovery_at = 0.0
+            last_unsent_check_at = 0.0
             while (time.time() - start_time) < max_wait:
                 outage = self._get_active_network_outage()
                 if outage:
@@ -2071,6 +2091,37 @@ class GeminiWebAutomation:
                     break
 
                 now = time.time()
+                elapsed_float = now - start_time
+
+                # A transient composer change can look like a successful send.
+                # Re-check the durable state quickly instead of waiting for the
+                # normal ten-second diagnostic interval.
+                if (
+                    elapsed_float >= UNSENT_STUCK_SECONDS
+                    and (now - last_unsent_check_at) >= 0.5
+                    and not page_snapshot.get("stop_visible")
+                    and page_snapshot.get("send_visible")
+                    and int(page_snapshot.get("response_count") or 0) <= pre_send_resp_count
+                ):
+                    last_unsent_check_at = now
+                    input_now = await get_input_text()
+                    input_now_len = len((input_now or "").strip())
+                    prompt_still_present = prompt_len > 0 and input_now_len >= max(1, prompt_len // 2)
+                    if prompt_still_present:
+                        if not unsent_recovery_attempted:
+                            unsent_recovery_attempted = True
+                            unsent_recovery_at = now
+                            log(
+                                f"[{self._request_id}] Prompt remained unsent for {UNSENT_STUCK_SECONDS}s; retrying submission",
+                                f"Worker {self.worker_id}",
+                            )
+                            if await attempt_same_page_resend("unsent_stuck"):
+                                continue
+                        elif (now - unsent_recovery_at) >= UNSENT_STUCK_SECONDS:
+                            error = "Prompt remained unsent after one same-page retry"
+                            self._track_error(error, "send_btn", "wait_for_response_unsent", page_snapshot)
+                            return {"success": False, "error": error}
+
                 if (now - last_wait_log) >= self._wait_log_interval_seconds:
                     snap = page_snapshot
                     elapsed = int(now - start_time)
@@ -2137,54 +2188,12 @@ class GeminiWebAutomation:
 
                     # Progress watchdog: recover poisoned/stalled generation before full timeout
                     stop_visible = bool(snap.get("stop_visible"))
-                    send_visible = bool(snap.get("send_visible"))
                     if phase == "thinking_only":
                         progress_age_basis = max(last_phase_change_at, last_thinking_progress_at)
                     else:
                         progress_age_basis = max(last_phase_change_at, last_response_progress_at)
                     no_progress_age = int(now - progress_age_basis)
                     stall_reason = ""
-
-                    # Guardrail: request likely never sent, avoid waiting full timeout.
-                    if (
-                        (not stop_visible)
-                        and send_visible
-                        and resp_count == 0
-                        and elapsed >= UNSENT_STUCK_SECONDS
-                    ):
-                        input_now = await get_input_text()
-                        input_now_len = len((input_now or "").strip())
-                        prompt_still_present = prompt_len > 0 and input_now_len >= max(1, prompt_len // 2)
-
-                        if prompt_still_present:
-                            log(
-                                f"[{self._request_id}] Unsent diagnostics: input_len={snap.get('input_text_len')} "
-                                f"send_disabled={snap.get('send_btn_disabled')} aria_disabled={snap.get('send_btn_aria_disabled')} "
-                                f"overlay={snap.get('overlay_visible')} active={snap.get('active_element_tag')}:{snap.get('active_element_aria_label')} "
-                                f"send_class={snap.get('send_btn_class')}",
-                                f"Worker {self.worker_id}"
-                            )
-                            resend_ok = await attempt_same_page_resend("unsent_stuck")
-                            if resend_ok:
-                                resend_deadline = time.time() + 5.0
-                                while time.time() < resend_deadline:
-                                    resend_snap = await self._capture_state_snapshot()
-                                    resend_stop = bool(resend_snap.get("stop_visible"))
-                                    resend_send = bool(resend_snap.get("send_visible"))
-                                    resend_resp = int(resend_snap.get("response_count") or 0)
-                                    resend_input_len = int(resend_snap.get("input_text_len") or 0)
-                                    resend_input_cleared = prompt_len == 0 or resend_input_len < max(1, prompt_len // 2)
-                                    if resend_stop or resend_resp > 0 or resend_input_cleared or not resend_send:
-                                        log("✅ Same-page resend recovered unsent start", f"Worker {self.worker_id}")
-                                        stall_reason = ""
-                                        break
-                                    await asyncio.sleep(0.2)
-                                if not stall_reason:
-                                    last_wait_log = now
-                                    continue
-                            stall_reason = (
-                                f"Unsent stuck: send visible and no output for {UNSENT_STUCK_SECONDS}s"
-                            )
 
                     # If generation appears active but no progress, nudge scroll to bottom.
                     if (

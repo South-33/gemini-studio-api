@@ -143,6 +143,14 @@ class WorkerPool:
     def _is_network_outage(error: str) -> bool:
         return (error or "").strip().lower().startswith("network outage:")
 
+    @staticmethod
+    def _is_transient_gemini_refusal(response: str) -> bool:
+        normalized = " ".join((response or "").strip().lower().split())
+        return normalized == (
+            "i'm having a hard time fulfilling your request. "
+            "can i help with something else instead?"
+        )
+
     async def send_message(
         self,
         prompt: str,
@@ -192,6 +200,15 @@ class WorkerPool:
                         attempt_logs.extend(request_log)
 
                     if result.get("success") and str(result.get("response") or "").strip():
+                        response = str(result.get("response") or "")
+                        if self._is_transient_gemini_refusal(response):
+                            last_error = "Gemini returned its generic transient refusal"
+                            log(f"[{request_id}] {last_error}", "Worker")
+                            if attempt < 2 and await self._ensure_ready_after_request(
+                                f"request {request_id} returned a transient refusal"
+                            ):
+                                continue
+                            break
                         result["queue_wait_ms"] = wait_ms
                         result["attempts"] = attempt
                         result["ready_for_next_request"] = await self._ensure_ready_after_request(

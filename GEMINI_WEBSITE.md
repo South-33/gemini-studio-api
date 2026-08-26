@@ -77,6 +77,9 @@ lock or returning the result. The next queued request must always inherit this
 known-ready state. Do not repeat a readiness wait already proved by the reset
 action. If reset fails, replace the page once and prepare that page.
 
+The visible New chat control gets a short confirmation window; if it does not
+clear the conversation promptly, use `Ctrl+Shift+O` and verify the empty state.
+
 `thinking-overlay` may expose a short changing summary while Extended reasoning
 is active, but Gemini leaves an empty overlay mounted after completion. Count
 only a visible animation or non-empty summary as liveness, and never require
@@ -102,6 +105,8 @@ discarded. Never refresh a healthy idle page because of age or request count.
 - DNS/network outage: report it immediately; tab recreation cannot fix DNS.
 - Missing selector: report selector/action, URL, UI state, visible model label,
   request ID, queue wait, and recovery outcome.
+- Gemini's exact generic "hard time fulfilling your request" response is treated
+  as transient and retried once from a fresh Temporary Chat.
 - Startup: close Chromium-restored pages, create one managed page, and become
   healthy only after its composer is ready.
 

@@ -102,6 +102,25 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["ready_for_next_request"])
         self.assertFalse(pool._initialized)
 
+    async def test_generic_gemini_refusal_is_retried_on_a_fresh_temp_chat(self):
+        pool = WorkerPool()
+        worker = FakeWorker([
+            {
+                "success": True,
+                "response": "I'm having a hard time fulfilling your request. Can I help with something else instead?",
+            },
+            {"success": True, "response": "expected"},
+        ])
+        pool.workers = [worker]
+        pool._initialized = True
+
+        result = await pool.send_message("hello", request_id="transient-refusal")
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["response"], "expected")
+        self.assertEqual(result["attempts"], 2)
+        self.assertEqual(worker.prepare_calls, 2)
+
 
 if __name__ == "__main__":
     unittest.main()
