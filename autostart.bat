@@ -9,29 +9,16 @@ cd /d "%~dp0"
 if not exist "logs" mkdir "logs"
 set "API_LOG=logs\server.log"
 
-:: Load PORT and NGROK_DOMAIN from .env file
-set PORT=8000
-for /f "tokens=1,* delims==" %%a in (.env) do (
-    if "%%a"=="PORT" set PORT=%%b
-    if "%%a"=="NGROK_DOMAIN" set NGROK_DOMAIN=%%b
-    if "%%a"=="DISCORD_WEBHOOK" set DISCORD_WEBHOOK=%%b
-    if "%%a"=="DISCORD_USER_ID" set DISCORD_USER_ID=%%b
+set "PORT=8000"
+set "NGROK_DOMAIN=believable-unplagiarised-josette.ngrok-free.dev"
+if exist ".env" for /f "tokens=1,* delims==" %%a in (.env) do (
+    if "%%a"=="DISCORD_WEBHOOK" set "DISCORD_WEBHOOK=%%b"
+    if "%%a"=="DISCORD_USER_ID" set "DISCORD_USER_ID=%%b"
 )
-
-:: Normalize ngrok domain so .env can contain either the bare host or a full URL
-set "NGROK_DOMAIN=%NGROK_DOMAIN:https://=%"
-set "NGROK_DOMAIN=%NGROK_DOMAIN:http://=%"
-if "%NGROK_DOMAIN:~-1%"=="/" set "NGROK_DOMAIN=%NGROK_DOMAIN:~0,-1%"
 
 echo [Config] PORT=%PORT%
 echo [Config] NGROK_DOMAIN=%NGROK_DOMAIN%
 set "NGROK_CMD=ngrok http %PORT% --domain=%NGROK_DOMAIN%"
-
-if not defined NGROK_DOMAIN (
-    echo [ERROR] NGROK_DOMAIN not set in .env file!
-    pause
-    exit /b 1
-)
 
 :: Kill any orphaned processes on this port
 echo [1/3] Killing any orphaned process on port %PORT%...

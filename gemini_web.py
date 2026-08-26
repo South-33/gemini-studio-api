@@ -32,12 +32,10 @@ def log(msg: str, tag: str = "Core"):
     if buf is not None:
         buf.append(formatted_msg)
 
-# Low memory mode: block images, fonts, etc.
-LOW_MEMORY_MODE = os.getenv("LOW_MEMORY_MODE", "true").lower() == "true"
-
-# Prompt file upload optimization for long prompts
-ENABLE_PROMPT_FILE_UPLOAD = os.getenv("ENABLE_PROMPT_FILE_UPLOAD", "true").lower() in ("true", "1", "yes")
-PROMPT_FILE_UPLOAD_THRESHOLD = int(os.getenv("PROMPT_FILE_UPLOAD_THRESHOLD", "1500"))
+# Production is a visible, text-first browser with long prompts attached as files.
+LOW_MEMORY_MODE = True
+PROMPT_FILE_UPLOAD_THRESHOLD = 1500
+BROWSER_TIMEOUT_SECONDS = 480
 
 # Reliability constants (intentionally hardcoded)
 WAIT_LOG_INTERVAL_SECONDS = 10
@@ -68,16 +66,6 @@ STALL_RECREATE_THRESHOLD = 1
 NETWORK_OUTAGE_PROBE_TIMEOUT_SECONDS = 2.0
 
 
-def _read_headed_page_zoom() -> float:
-    raw = os.getenv("HEADED_PAGE_ZOOM", "1.0").strip()
-    try:
-        value = float(raw)
-    except Exception:
-        value = 1.0
-    return max(0.5, min(1.0, value))
-
-
-HEADED_PAGE_ZOOM = _read_headed_page_zoom()
 class GeminiWebAutomation:
     # Gemini remembers the last side-bar mode (Chat or Spark).  Always start on
     # the Chat surface because the automation selectors and generation flow are
@@ -197,8 +185,6 @@ class GeminiWebAutomation:
         self._recent_network_events = deque(maxlen=40)
         self._network_failure_counts: Dict[str, int] = {}
         self._last_network_outage: Optional[Dict[str, Any]] = None
-        self._zoom_applied = False
-        self._browser_zoom_reset = False
         self._current_prompt_tokens_est: int = 0  # Set per-request for stall scaling
         self._request_log_lines: List[str] = []   # Per-request log buffer for error reports
         self._current_selected_model: Optional[str] = None
@@ -212,52 +198,6 @@ class GeminiWebAutomation:
         self._current_selected_model = None
         self._current_selected_thinking_level = None
 
-    async def _reset_browser_zoom(self, force: bool = False):
-        try:
-            if os.getenv("HEADLESS", "false").lower() == "true":
-                return
-            if self._browser_zoom_reset and not force:
-                return
-
-            await self.page.bring_to_front()
-            await self.page.keyboard.press("Control+0")
-            await self._human_delay(50, 90)
-            self._browser_zoom_reset = True
-            log("Reset browser zoom to 100%", f"Worker {self.worker_id}")
-        except Exception:
-            pass
-
-    async def _apply_headed_zoom(self, force: bool = False):
-        """Keep headed sessions zoomed out to reduce long-output clipping/stalls."""
-        try:
-            if os.getenv("HEADLESS", "false").lower() == "true":
-                return
-
-            if HEADED_PAGE_ZOOM >= 0.999:
-                return
-
-            zoom_css = f"{int(HEADED_PAGE_ZOOM * 100)}%"
-            if not force:
-                current_zoom = await self.page.evaluate(
-                    "() => (document.documentElement && document.documentElement.style && document.documentElement.style.zoom) || ''"
-                )
-                if str(current_zoom).strip() == zoom_css:
-                    return
-
-            await self.page.evaluate(
-                """
-                (zoomCss) => {
-                    try { document.documentElement.style.zoom = zoomCss; } catch (_) {}
-                    try { if (document.body) document.body.style.zoom = zoomCss; } catch (_) {}
-                }
-                """,
-                zoom_css,
-            )
-            self._zoom_applied = True
-            log(f"Applied page zoom: {zoom_css}", f"Worker {self.worker_id}")
-        except Exception as e:
-            if force:
-                log(f"Zoom apply warning: {e}", f"Worker {self.worker_id}")
 
     @classmethod
     def _is_relevant_network_url(cls, url: str) -> bool:
@@ -1672,8 +1612,6 @@ class GeminiWebAutomation:
                     await self._human_delay(500, 1000)
                     print("[GeminiWeb] ✅ Logged in and ready")
                     
-                    await self._reset_browser_zoom(force=True)
-                    await self._apply_headed_zoom(force=True)
                     self._attach_network_logging()
                     await self._ensure_sidebar_open()
                     
@@ -1773,8 +1711,6 @@ class GeminiWebAutomation:
             # In headed mode, explicitly foreground the active worker page before send.
             try:
                 await self.page.bring_to_front()
-                await self._reset_browser_zoom()
-                await self._apply_headed_zoom()
                 await self._human_delay(60, 120)
             except:
                 pass
@@ -2076,7 +2012,7 @@ class GeminiWebAutomation:
             
             # Polling for copy button (Wait until we have MORE buttons than before)
             start_time = time.time()
-            max_wait = int(os.getenv("BROWSER_TIMEOUT", "480"))
+            max_wait = BROWSER_TIMEOUT_SECONDS
             copy_btn = None
             last_wait_log = start_time
             last_thinking_len = -1
@@ -2826,16 +2762,13 @@ class GeminiWebAutomation:
     ) -> Tuple[str, Optional[str]]:
         """
         Enter prompt into Gemini Web UI.
-        If len(prompt) >= PROMPT_FILE_UPLOAD_THRESHOLD and ENABLE_PROMPT_FILE_UPLOAD is True,
-        converts the prompt to a .txt file in clipboard / attachment to prevent DOM contenteditable freezing.
+        If len(prompt) >= PROMPT_FILE_UPLOAD_THRESHOLD, converts the prompt to a
+        .txt attachment to prevent DOM contenteditable freezing.
         Returns tuple of (entered_text_or_empty, created_temp_file_path).
         """
         prompt_str = (prompt or "").strip()
         needs_search_hint = self._needs_search_hint(prompt_str, use_search)
-        should_file_upload = (
-            ENABLE_PROMPT_FILE_UPLOAD
-            and len(prompt_str) >= PROMPT_FILE_UPLOAD_THRESHOLD
-        )
+        should_file_upload = len(prompt_str) >= PROMPT_FILE_UPLOAD_THRESHOLD
 
         if should_file_upload:
             temp_file_path = None

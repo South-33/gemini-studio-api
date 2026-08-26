@@ -40,10 +40,10 @@ from gemini_models import MODEL_FAMILIES, normalize_thinking_level, parse_model_
 from worker_pool import WorkerPool
 
 # Configuration
-BROWSER_TIMEOUT = int(os.getenv("BROWSER_TIMEOUT", "480"))
-API_TIMEOUT_HEADROOM = int(os.getenv("API_TIMEOUT_HEADROOM", "30"))
-QUEUE_TIMEOUT = int(os.getenv("QUEUE_TIMEOUT", "1800"))
-RECENT_REQUEST_LIMIT = int(os.getenv("RECENT_REQUEST_LIMIT", "200"))
+BROWSER_TIMEOUT = 480
+API_TIMEOUT_HEADROOM = 30
+QUEUE_TIMEOUT = 1800
+RECENT_REQUEST_LIMIT = 200
 IMAGE_TOKEN_ESTIMATE = 300
 
 # Global State
@@ -590,5 +590,4 @@ async def diagnostics():
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", "8000"))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=8000)

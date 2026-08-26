@@ -247,7 +247,7 @@ def get_notifier() -> DiscordNotifier:
     """Get or create the global notifier instance."""
     global _notifier
     if _notifier is None:
-        cooldown = int(os.getenv("DISCORD_COOLDOWN", "300"))
+        cooldown = 300
         _notifier = DiscordNotifier(cooldown_seconds=cooldown)
     return _notifier
 

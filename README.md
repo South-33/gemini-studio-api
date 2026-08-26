@@ -13,8 +13,8 @@ created tab after a concrete browser failure.
    playwright install chromium
    ```
 
-2. Copy `.env.example` to `.env`. Start with `HEADLESS=false`, run `python
-   main.py`, and sign in to Gemini in the opened browser.
+2. Run `python main.py` and sign in to Gemini in the opened browser. Copy
+   `.env.example` to `.env` only if Discord failure alerts are wanted.
 
 3. On the Windows server, run `autostart.bat`. It starts the API and ngrok in
    one terminal and writes output to `logs\server.log` and `logs\ngrok.log`.
@@ -47,16 +47,17 @@ Flash, or send `thinking_level`, to choose the reasoning mode.
 
 ## Configuration
 
-The supported settings are documented in `.env.example`: server/tunnel,
-browser, timeouts, low-memory mode, long-prompt upload, and optional Discord
-alerts. The service intentionally uses one worker. Concurrent calls wait in an
-in-process queue; `/v1/diagnostics` exposes `active_request` and
-`queued_requests`. After a successful response is returned, an idle queue
-prepares the next clean Temporary Chat in the background; queued calls skip
-that extra work and reset as part of their normal request.
+Operational settings are intentionally fixed in code for this deployment:
+port 8000, the production ngrok domain, visible Chromium, one worker, and the
+tested timeout/retry policy. `.env` is optional and contains only Discord alert
+delivery values. Concurrent calls wait in an in-process queue;
+`/v1/diagnostics` exposes `active_request` and `queued_requests`. After a
+successful response is returned, an idle queue prepares the next clean
+Temporary Chat in the background; queued calls skip that extra work and reset
+as part of their normal request.
 
-Prompts at or above `PROMPT_FILE_UPLOAD_THRESHOLD` are attached as `prompt.txt`
-to avoid freezing Gemini's editor. For those attached prompts, explicit
+Prompts at or above 1,500 characters are attached as `prompt.txt` to avoid
+freezing Gemini's editor. For those attached prompts, explicit
 `use_search: true` or standalone `google`, `search`, or `web` wording leaves a
 short Search instruction in the composer.
 

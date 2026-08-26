@@ -17,7 +17,6 @@ class WorkerPool:
     """Serialize requests through one tab and recreate it after concrete failures."""
 
     def __init__(self):
-        self.browser_channel = os.getenv("BROWSER_CHANNEL", "").strip()
         self.playwright = None
         self.context = None
         self.workers: List[GeminiWebAutomation] = []
@@ -41,7 +40,6 @@ class WorkerPool:
         """Launch the persistent browser profile and initialize one managed tab."""
         try:
             self.playwright = await async_playwright().start()
-            headless = os.getenv("HEADLESS", "false").lower() == "true"
             args = [
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
@@ -52,8 +50,6 @@ class WorkerPool:
                 "--disable-renderer-backgrounding",
                 "--disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling,BatterySaverModeAvailability",
             ]
-            if headless:
-                args.extend(["--disable-gpu", "--disable-software-rasterizer"])
             if LOW_MEMORY_MODE:
                 args.extend([
                     "--disable-extensions",
@@ -69,18 +65,13 @@ class WorkerPool:
                 "Worker",
             )
 
-            launch_options: Dict[str, Any] = {}
-            if self.browser_channel:
-                launch_options["channel"] = self.browser_channel
-
             profile_dir = os.path.join(os.path.dirname(__file__), ".browser_session")
             self.context = await self.playwright.chromium.launch_persistent_context(
                 profile_dir,
-                headless=headless,
+                headless=False,
                 args=args,
                 permissions=["clipboard-read", "clipboard-write"],
                 viewport={"width": 1600, "height": 900},
-                **launch_options,
             )
             if LOW_MEMORY_MODE:
                 await self.context.route("**/*", self._block_resources)
@@ -290,7 +281,7 @@ class WorkerPool:
             "parallel_capacity": 1,
             "active_request": self._active_request,
             "queued_requests": self._queued_requests,
-            "browser_channel": self.browser_channel or "chromium",
+            "browser_channel": "chromium",
             "startup_pages_closed": self._startup_pages_closed,
             "worker_recreation_count": self._worker_recreation_count,
             "last_worker_recreation": self._last_worker_recreation,
