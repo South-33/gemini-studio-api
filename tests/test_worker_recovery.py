@@ -35,6 +35,14 @@ class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(selectors[0], 'button[aria-label^="Open mode picker" i]')
         self.assertEqual(selectors[1], 'button[data-test-id="bard-mode-menu-button"]')
 
+    def test_copy_selector_can_be_used_before_a_copy_button_exists(self):
+        worker = GeminiWebAutomation(worker_id=1)
+
+        self.assertEqual(
+            worker._selector_candidates("copy_btn"),
+            ['button[aria-label="Copy"]'],
+        )
+
     def test_model_matching_tolerates_version_and_label_changes(self):
         matcher = GeminiWebAutomation(worker_id=1)._matches_model
         self.assertTrue(matcher("Gemini 3.7 Flash", "gemini-3.6-flash"))

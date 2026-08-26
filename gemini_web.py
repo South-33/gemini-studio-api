@@ -1694,11 +1694,15 @@ class GeminiWebAutomation:
                 self._track_error(err, "chat_tab", "send_message")
                 return {"success": False, "error": err}
 
-            copy_selector = await self._resolve_selector("copy_btn")
-            if not copy_selector:
-                err = "Copy selector not found"
+            copy_candidates = self._selector_candidates("copy_btn")
+            if not copy_candidates:
+                err = "Copy selector is not configured"
                 self._track_error(err, "copy_btn", "send_message")
                 return {"success": False, "error": err}
+            # A fresh chat correctly has no Copy button. Keep the configured
+            # selector so zero can be recorded as the pre-send baseline; the
+            # response wait below requires a new matching button to appear.
+            copy_selector = copy_candidates[0]
 
             # A dirty page is replaced by WorkerPool; request code never refreshes it.
             preflight = await self._capture_state_snapshot()
