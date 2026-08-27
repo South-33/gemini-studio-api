@@ -43,6 +43,14 @@ class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
             ['button[aria-label="Copy"]'],
         )
 
+    def test_response_marker_is_required_and_removed_before_returning(self):
+        self.assertEqual(
+            GeminiWebAutomation._strip_response_marker("response=good\n\nanswer"),
+            "answer",
+        )
+        with self.assertRaisesRegex(ValueError, "response=good"):
+            GeminiWebAutomation._strip_response_marker("Sorry, please try again")
+
     def test_model_matching_tolerates_version_and_label_changes(self):
         matcher = GeminiWebAutomation(worker_id=1)._matches_model
         self.assertTrue(matcher("Gemini 3.7 Flash", "gemini-3.6-flash"))

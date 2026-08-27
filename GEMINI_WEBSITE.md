@@ -72,6 +72,12 @@ Every request must:
 7. wait using Stop, response, thinking, and network state;
 8. copy the latest response through Gemini's Copy control.
 
+The API prepends one small instruction to every request: start the answer with
+`response=good` on its first line. The worker removes that marker before returning
+the answer to callers. A missing marker is treated as an unusable Gemini reply,
+so the existing tab-recreate and bounded retry path handles it. This is not a
+JSON requirement and the public API remains OpenAI-compatible.
+
 After Copy succeeds, prepare a fresh Temporary Chat before releasing the queue
 lock or returning the result. The next queued request must always inherit this
 known-ready state. Do not repeat a readiness wait already proved by the reset
@@ -105,8 +111,9 @@ discarded. Never refresh a healthy idle page because of age or request count.
 - DNS/network outage: report it immediately; tab recreation cannot fix DNS.
 - Missing selector: report selector/action, URL, UI state, visible model label,
   request ID, queue wait, and recovery outcome.
-- Gemini's exact generic "hard time fulfilling your request" response is treated
-  as transient and retried once from a fresh Temporary Chat.
+- A reply without the `response=good` first line is treated as an unusable
+  response and retried once from a fresh Temporary Chat. Keep the original reply
+  in the private response log for diagnosis.
 - Startup: close Chromium-restored pages, create one managed page, and become
   healthy only after its composer is ready.
 

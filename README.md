@@ -58,6 +58,12 @@ ready-state reset. Each serialized request verifies its model, sends, waits,
 copies the response, and resets to a clean Temporary Chat before the next
 queued request can start.
 
+The worker asks Gemini to begin every answer with `response=good`. It strips that
+marker before returning the answer. If the marker is missing, the reply is
+recorded and the worker recreates the tab for one bounded retry. This is only an
+automation health check; the API does not require JSON and remains generic for
+callers.
+
 Prompts at or above 1,500 characters are attached as `prompt.txt` to avoid
 freezing Gemini's editor. For those attached prompts, explicit
 `use_search: true` or standalone `google`, `search`, or `web` wording leaves a

@@ -68,6 +68,11 @@ UNSENT_STUCK_SECONDS = 3
 STALL_RECREATE_THRESHOLD = 1
 NETWORK_OUTAGE_PROBE_TIMEOUT_SECONDS = 2.0
 
+# Every request handled by this server gets one small, caller-transparent
+# instruction. The marker lets the server distinguish a usable Gemini answer
+# from a refusal/error message without imposing a response schema on callers.
+RESPONSE_MARKER = "response=good"
+
 
 class GeminiWebAutomation:
     # Gemini remembers the last side-bar mode (Chat or Spark).  Always start on
@@ -119,6 +124,15 @@ class GeminiWebAutomation:
         if cls._clipboard_lock is None:
             cls._clipboard_lock = asyncio.Lock()
         return cls._clipboard_lock
+
+    @staticmethod
+    def _strip_response_marker(response: str) -> str:
+        """Require and remove the server-owned first-line response marker."""
+        normalized = (response or "").strip()
+        first_line, separator, remainder = normalized.partition("\n")
+        if first_line.strip().lower() != RESPONSE_MARKER:
+            raise ValueError(f"Gemini response missing {RESPONSE_MARKER} marker")
+        return remainder.strip() if separator else ""
     
     # Stable selectors first; bounded fallbacks second with fuzzy/partial matching
     SELECTORS = {
@@ -1653,6 +1667,15 @@ class GeminiWebAutomation:
             if not prompt.strip().startswith("IMPORTANT: Do NOT generate or create any images"):
                 prompt = anti_image_inst + prompt
 
+        marker_inst = (
+            f"IMPORTANT: Always start your response with {RESPONSE_MARKER} on the first line. "
+            "Then answer the request normally.\n\n"
+        )
+        if not prompt.lstrip().lower().startswith(
+            f"important: always start your response with {RESPONSE_MARKER}"
+        ):
+            prompt = marker_inst + prompt
+
         log_buffer = []
         self._request_log_lines = log_buffer
         token = current_request_log_buffer.set(log_buffer)
@@ -2419,6 +2442,20 @@ class GeminiWebAutomation:
                 f"✅ Response: chars={out_chars}, tokens_est={out_tokens_est}",
                 f"Worker {self.worker_id}",
             )
+            try:
+                markdown = self._strip_response_marker(markdown)
+            except ValueError as marker_error:
+                marker_error_text = str(marker_error)
+                log(f"⚠️ {marker_error_text}; treating response as failed", f"Worker {self.worker_id}")
+                snapshot = await self._capture_state_snapshot()
+                self._track_error(marker_error_text, "copy_btn", "validate_response_marker", snapshot)
+                # Preserve Gemini's original reply for response logs. WorkerPool
+                # will recreate the tab and perform its bounded retry.
+                return {"success": False, "error": marker_error_text, "response": markdown}
+            if not markdown:
+                error = "Gemini returned only the response marker"
+                self._track_error(error, "copy_btn", "validate_response_marker")
+                return {"success": False, "error": error, "response": markdown}
             self._last_request_success = True
             return {"success": True, "response": markdown.strip()}
 
