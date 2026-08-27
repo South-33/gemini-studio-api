@@ -69,6 +69,12 @@ short Search instruction in the composer.
   root and is preloaded with the production tunnel.
 - Check `logs\server.log` for API/browser failures and `logs\ngrok.log` for
   tunnel failures.
+- `logs\responses\response_*.json` records Gemini's text from every attempt,
+  including HTTP-200 replies and refusals before retries. Match `request_id` to
+  `server.log` to find the caller. These files are private, Git-ignored, and not
+  served by the API. No prompt bodies are copied into them. Retention is at most
+  200 records / 64 MiB; responses over one million characters are explicitly
+  marked as truncated. Logging failures warn but do not fail a completion.
 - If disconnecting RDP suspends Chromium, run `disconnect_rdp.bat` or use the
   included virtual-display installer.
 - Healthy idle tabs are never refreshed because of age or request count.

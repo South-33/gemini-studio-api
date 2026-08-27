@@ -1,6 +1,6 @@
 import asyncio
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from worker_pool import WorkerPool
 
@@ -40,6 +40,11 @@ class FakeWorker:
 
 
 class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        patcher = patch("worker_pool.write_response_log", return_value="response_test.json")
+        self.response_logger = patcher.start()
+        self.addCleanup(patcher.stop)
+
     async def test_concurrent_requests_are_serialized(self):
         pool = WorkerPool()
         worker = FakeWorker()
@@ -120,6 +125,20 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["response"], "expected")
         self.assertEqual(result["attempts"], 2)
         self.assertEqual(worker.prepare_calls, 2)
+        self.assertEqual(self.response_logger.call_count, 2)
+        self.assertIn("hard time fulfilling", self.response_logger.call_args_list[0].kwargs["result"]["response"])
+        self.assertEqual(self.response_logger.call_args_list[1].kwargs["attempt"], 2)
+
+    async def test_response_log_disk_failure_does_not_fail_completion(self):
+        self.response_logger.side_effect = OSError("disk unavailable")
+        pool = WorkerPool()
+        pool.workers = [FakeWorker()]
+        pool._initialized = True
+
+        result = await pool.send_message("hello", request_id="disk-error")
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["response"], "ok")
 
 
 if __name__ == "__main__":

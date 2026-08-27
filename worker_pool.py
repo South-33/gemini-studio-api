@@ -11,6 +11,7 @@ from playwright.async_api import Page, async_playwright
 
 from gemini_web import GeminiWebAutomation, log
 from notifier import notify_error
+from response_log import write_response_log
 
 
 class WorkerPool:
@@ -193,6 +194,22 @@ class WorkerPool:
                         )
                     except Exception as exc:
                         result = {"success": False, "error": str(exc)}
+
+                    # Save before refusal handling so retrying never hides the original output.
+                    try:
+                        response_file = await asyncio.to_thread(
+                            write_response_log,
+                            request_id=request_id,
+                            attempt=attempt,
+                            result=result,
+                            model=model,
+                            thinking_level=thinking_level,
+                            prompt_chars=len(prompt),
+                        )
+                        result["response_log"] = response_file
+                        log(f"[{request_id}] Attempt {attempt} response saved: logs/responses/{response_file}", "Worker")
+                    except Exception as exc:
+                        log(f"[{request_id}] Response logging failed ({type(exc).__name__}); request handling continues", "Worker")
 
                     request_log = worker.get_request_log()
                     if request_log:

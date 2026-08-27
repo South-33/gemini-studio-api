@@ -516,6 +516,7 @@ async def openai_chat(request: Request):
     trace["queue_wait_ms"] = result.get("queue_wait_ms")
     trace["attempts"] = result.get("attempts")
     trace["response_chars"] = len(content)
+    trace["response_log"] = result.get("response_log")
     trace["response_tokens_est"] = completion_tokens_est
     trace["finished_at"] = datetime.now(timezone.utc).isoformat()
     log(
