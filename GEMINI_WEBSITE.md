@@ -52,6 +52,11 @@ file upload. Images are pasted/uploaded as attachments. Long text prompts are
 written to `prompt.txt` and uploaded to avoid freezing the contenteditable.
 An upload counts as successful only after the expected filename is visibly
 rendered in the composer and Send is enabled; Send readiness alone is not proof.
+
+Every request also prepends a transport-only first-line marker instruction. Gemini
+must output `response=good` on line 1, then continue on a new line using the
+caller's requested format unchanged. JSON-only and fenced-code requirements apply
+after the marker; the server removes the marker before returning the response.
 Gemini often skips Search when the request exists only inside that attachment,
 so prompts containing the standalone words `google`, `search`, or `web` leave a
 short search instruction in the composer. `use_search: true` forces that hint;

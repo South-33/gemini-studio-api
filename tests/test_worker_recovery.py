@@ -48,6 +48,12 @@ class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
             GeminiWebAutomation._strip_response_marker("response=good\n\nanswer"),
             "answer",
         )
+        self.assertEqual(
+            GeminiWebAutomation._strip_response_marker(
+                'response=good\n```json\n{"probe":"ok"}\n```'
+            ),
+            '```json\n{"probe":"ok"}\n```',
+        )
         with self.assertRaisesRegex(ValueError, "response=good"):
             GeminiWebAutomation._strip_response_marker("Sorry, please try again")
 

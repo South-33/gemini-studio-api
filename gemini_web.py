@@ -1668,11 +1668,14 @@ class GeminiWebAutomation:
                 prompt = anti_image_inst + prompt
 
         marker_inst = (
-            f"IMPORTANT: Always start your response with {RESPONSE_MARKER} on the first line. "
-            "Then answer the request normally.\n\n"
+            f"IMPORTANT transport rule: Your first line must be exactly {RESPONSE_MARKER} "
+            "in plain text. Then start a new line and answer the user's request exactly as requested. "
+            "Treat the first line as transport metadata outside the requested answer format. "
+            "If the request says JSON only, a fenced code block, or 'nothing else', those rules apply "
+            "to everything after the first line and must still be followed exactly.\n\n"
         )
         if not prompt.lstrip().lower().startswith(
-            f"important: always start your response with {RESPONSE_MARKER}"
+            "important transport rule: your first line must be exactly "
         ):
             prompt = marker_inst + prompt
 
