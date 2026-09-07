@@ -2719,13 +2719,58 @@ class GeminiWebAutomation:
         except Exception as e:
             print(f"[Worker {self.worker_id}] ⚠️ Image paste warning: {e}")
 
-    async def _wait_for_attachment_upload_complete(self, max_timeout_seconds: float = 30.0) -> bool:
-        """Wait until the Send button becomes enabled/clickable after file attachment."""
+    async def _visible_attachment_file_names(self, file_paths: List[str]) -> List[str]:
+        """Return expected attachment filenames that are visibly rendered in Gemini."""
+        expected_names = [os.path.basename(path) for path in file_paths if path]
+        if not expected_names:
+            return []
+
+        try:
+            return await self.page.evaluate(
+                """
+                (expectedNames) => {
+                    const isVisible = (el) => {
+                        if (!el || !(el instanceof HTMLElement)) return false;
+                        const style = window.getComputedStyle(el);
+                        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+                        const rect = el.getBoundingClientRect();
+                        return rect.width > 0 && rect.height > 0;
+                    };
+
+                    const visibleElements = Array.from(document.querySelectorAll('body *')).filter(isVisible);
+                    return expectedNames.filter((name) => visibleElements.some((el) => {
+                        const values = [
+                            el.innerText || '',
+                            el.getAttribute('aria-label') || '',
+                            el.getAttribute('title') || '',
+                        ];
+                        return values.some((value) => value.includes(name));
+                    }));
+                }
+                """,
+                expected_names,
+            )
+        except Exception as e:
+            log(f"Attachment visibility check failed: {e}", f"Worker {self.worker_id}")
+            return []
+
+    async def _wait_for_attachment_upload_complete(
+        self,
+        max_timeout_seconds: float = 30.0,
+        expected_file_paths: Optional[List[str]] = None,
+    ) -> bool:
+        """Wait until attachments are visibly present and the Send button is ready."""
         log("Waiting for Send button to become enabled...", f"Worker {self.worker_id}")
         start = time.time()
         deadline = start + max_timeout_seconds
+        expected_names = [os.path.basename(path) for path in (expected_file_paths or []) if path]
 
         while time.time() < deadline:
+            attachments_ready = True
+            if expected_names:
+                visible_names = await self._visible_attachment_file_names(expected_file_paths or [])
+                attachments_ready = all(name in visible_names for name in expected_names)
+
             send_selector = await self._resolve_selector("send_btn", require_visible=True, timeout_ms=500)
             if send_selector:
                 send_btn = self.page.locator(send_selector).first
@@ -2734,9 +2779,15 @@ class GeminiWebAutomation:
                         disabled_attr = await send_btn.get_attribute("disabled")
                         aria_disabled = await send_btn.get_attribute("aria-disabled")
                         is_disabled = await send_btn.is_disabled()
-                        if disabled_attr is None and aria_disabled != "true" and not is_disabled:
+                        if attachments_ready and disabled_attr is None and aria_disabled != "true" and not is_disabled:
                             elapsed = round(time.time() - start, 2)
-                            log(f"✅ Send button enabled & ready ({elapsed}s)", f"Worker {self.worker_id}")
+                            if expected_names:
+                                log(
+                                    f"✅ Attachment visible and Send button ready ({elapsed}s): {expected_names}",
+                                    f"Worker {self.worker_id}",
+                                )
+                            else:
+                                log(f"✅ Send button enabled & ready ({elapsed}s)", f"Worker {self.worker_id}")
                             return True
                     except Exception:
                         pass
@@ -2744,7 +2795,13 @@ class GeminiWebAutomation:
             await asyncio.sleep(UI_POLL_SECONDS)
 
         elapsed = round(time.time() - start, 2)
-        log(f"⚠️ Send button ready wait timeout ({elapsed}s), proceeding to send attempt", f"Worker {self.worker_id}")
+        if expected_names:
+            log(
+                f"⚠️ Attachment confirmation timed out ({elapsed}s): {expected_names}",
+                f"Worker {self.worker_id}",
+            )
+        else:
+            log(f"⚠️ Send button ready wait timeout ({elapsed}s), proceeding to send attempt", f"Worker {self.worker_id}")
         return False
 
     async def _upload_file_attachment(self, file_paths: List[str]) -> bool:
@@ -2773,7 +2830,7 @@ class GeminiWebAutomation:
             await file_input.set_input_files(file_paths)
             log("Attached files through Gemini's local file input", f"Worker {self.worker_id}")
 
-            return await self._wait_for_attachment_upload_complete(30.0)
+            return await self._wait_for_attachment_upload_complete(30.0, file_paths)
         except Exception as e:
             log(f"⚠️ Error uploading file attachments: {e}", f"Worker {self.worker_id}")
             return False

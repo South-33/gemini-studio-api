@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 from gemini_web import GeminiWebAutomation
 from worker_pool import WorkerPool
@@ -66,6 +66,28 @@ class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(helper("Plain request", use_search=True))
         self.assertFalse(helper("Plain request"))
         self.assertFalse(helper("Improve this website layout"))
+
+    async def test_attachment_upload_requires_visible_filename_not_just_ready_send(self):
+        worker = GeminiWebAutomation(worker_id=1)
+        send_btn = MagicMock()
+        send_btn.first = send_btn
+        send_btn.count = AsyncMock(return_value=1)
+        send_btn.is_visible = AsyncMock(return_value=True)
+        send_btn.get_attribute = AsyncMock(return_value=None)
+        send_btn.is_disabled = AsyncMock(return_value=False)
+
+        worker.page = MagicMock()
+        worker.page.locator.return_value = send_btn
+        worker._resolve_selector = AsyncMock(return_value="send")
+        worker._visible_attachment_file_names = AsyncMock(side_effect=[[], ["prompt_1_123.txt"]])
+
+        ready = await worker._wait_for_attachment_upload_complete(
+            1.0,
+            [r"C:\\Temp\\prompt_1_123.txt"],
+        )
+
+        self.assertTrue(ready)
+        self.assertEqual(worker._visible_attachment_file_names.await_count, 2)
 
     def test_chat_mode_requires_chat_active_and_spark_inactive(self):
         self.assertTrue(GeminiWebAutomation._is_chat_mode({

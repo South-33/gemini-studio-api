@@ -50,6 +50,8 @@ items, but never their index. Re-read the picker after selection.
 `Add from Drive`, plus creative/deep-research tools. Production uses only local
 file upload. Images are pasted/uploaded as attachments. Long text prompts are
 written to `prompt.txt` and uploaded to avoid freezing the contenteditable.
+An upload counts as successful only after the expected filename is visibly
+rendered in the composer and Send is enabled; Send readiness alone is not proof.
 Gemini often skips Search when the request exists only inside that attachment,
 so prompts containing the standalone words `google`, `search`, or `web` leave a
 short search instruction in the composer. `use_search: true` forces that hint;
