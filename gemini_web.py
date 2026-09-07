@@ -127,12 +127,38 @@ class GeminiWebAutomation:
 
     @staticmethod
     def _strip_response_marker(response: str) -> str:
-        """Require and remove the server-owned first-line response marker."""
+        """Remove the transport marker, while preserving clearly structured replies."""
         normalized = (response or "").strip()
         first_line, separator, remainder = normalized.partition("\n")
-        if first_line.strip().lower() != RESPONSE_MARKER:
-            raise ValueError(f"Gemini response missing {RESPONSE_MARKER} marker")
-        return remainder.strip() if separator else ""
+        if first_line.strip().lower() == RESPONSE_MARKER:
+            return remainder.strip() if separator else ""
+
+        if (
+            (normalized.startswith("```") and normalized.endswith("```"))
+            or (normalized.startswith("<json>") and normalized.endswith("</json>"))
+            or (normalized.startswith("{") and normalized.endswith("}"))
+            or (normalized.startswith("[") and normalized.endswith("]"))
+        ):
+            return normalized
+
+        raise ValueError(f"Gemini response missing {RESPONSE_MARKER} marker")
+
+    @staticmethod
+    def _submission_start_signal(
+        snapshot: Dict[str, Any],
+        pre_send_count: int,
+        pre_send_resp_count: int,
+        pre_send_user_query_count: int,
+    ) -> str:
+        if int(snapshot.get("copy_count") or 0) > pre_send_count:
+            return "copy_increased"
+        if int(snapshot.get("response_count") or 0) > pre_send_resp_count:
+            return "response_increased"
+        if int(snapshot.get("user_query_count") or 0) > pre_send_user_query_count:
+            return "user_query_increased"
+        if bool(snapshot.get("stop_visible")) and not bool(snapshot.get("send_visible")):
+            return "stop_visible"
+        return ""
     
     # Stable selectors first; bounded fallbacks second with fuzzy/partial matching
     SELECTORS = {
@@ -1668,14 +1694,12 @@ class GeminiWebAutomation:
                 prompt = anti_image_inst + prompt
 
         marker_inst = (
-            f"IMPORTANT transport rule: Your first line must be exactly {RESPONSE_MARKER} "
-            "in plain text. Then start a new line and answer the user's request exactly as requested. "
-            "Treat the first line as transport metadata outside the requested answer format. "
-            "If the request says JSON only, a fenced code block, or 'nothing else', those rules apply "
-            "to everything after the first line and must still be followed exactly.\n\n"
+            f"First line exactly: {RESPONSE_MARKER}\n"
+            "Then answer on the next line in the user's requested format. "
+            "JSON-only or 'nothing else' rules apply after that first line.\n\n"
         )
         if not prompt.lstrip().lower().startswith(
-            "important transport rule: your first line must be exactly "
+            f"first line exactly: {RESPONSE_MARKER}"
         ):
             prompt = marker_inst + prompt
 
@@ -1824,20 +1848,15 @@ class GeminiWebAutomation:
             worker_id = self.worker_id  # Capture for closure
 
             def start_signal_from_snapshot(snap: Dict[str, Any], input_text_len: Optional[int] = None) -> str:
-                stop_now = bool(snap.get("stop_visible"))
                 send_now = bool(snap.get("send_visible"))
-                resp_now = int(snap.get("response_count") or 0)
-                copy_now = int(snap.get("copy_count") or 0)
-                user_now = int(snap.get("user_query_count") or 0)
-
-                if copy_now > pre_send_count:
-                    return "copy_increased"
-                if resp_now > pre_send_resp_count:
-                    return "response_increased"
-                if user_now > pre_send_user_query_count:
-                    return "user_query_increased"
-                if stop_now and not send_now:
-                    return "stop_visible"
+                signal = self._submission_start_signal(
+                    snap,
+                    pre_send_count,
+                    pre_send_resp_count,
+                    pre_send_user_query_count,
+                )
+                if signal:
+                    return signal
                 if input_text_len is not None:
                     input_cleared = prompt_len == 0 or input_text_len < max(1, prompt_len // 2)
                     if input_cleared and not send_now:
@@ -1938,7 +1957,22 @@ class GeminiWebAutomation:
             send_success = await attempt_send_submission("initial_send", send_before_text)
             
             if not send_success:
-                log("❌ Send button click failed", f"Worker {self.worker_id}")
+                snapshot = await self._capture_state_snapshot()
+                late_signal = self._submission_start_signal(
+                    snapshot,
+                    pre_send_count,
+                    pre_send_resp_count,
+                    pre_send_user_query_count,
+                )
+                if late_signal:
+                    log(
+                        f"Send accepted after click verifier timeout (signal={late_signal})",
+                        f"Worker {self.worker_id}",
+                    )
+                    send_success = True
+
+            if not send_success:
+                log("Send button click failed", f"Worker {self.worker_id}")
                 snapshot = await self._capture_state_snapshot()
                 outage = self._get_active_network_outage()
                 if outage:

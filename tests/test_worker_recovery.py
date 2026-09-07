@@ -43,7 +43,7 @@ class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
             ['button[aria-label="Copy"]'],
         )
 
-    def test_response_marker_is_required_and_removed_before_returning(self):
+    def test_response_marker_is_removed_and_structured_markerless_replies_survive(self):
         self.assertEqual(
             GeminiWebAutomation._strip_response_marker("response=good\n\nanswer"),
             "answer",
@@ -54,8 +54,37 @@ class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
             ),
             '```json\n{"probe":"ok"}\n```',
         )
+        self.assertEqual(
+            GeminiWebAutomation._strip_response_marker('```json\n{"probe":"ok"}\n```'),
+            '```json\n{"probe":"ok"}\n```',
+        )
+        self.assertEqual(
+            GeminiWebAutomation._strip_response_marker('{"probe":"ok"}'),
+            '{"probe":"ok"}',
+        )
         with self.assertRaisesRegex(ValueError, "response=good"):
             GeminiWebAutomation._strip_response_marker("Sorry, please try again")
+
+    def test_submission_signal_accepts_late_ui_evidence_after_click_timeout(self):
+        helper = GeminiWebAutomation._submission_start_signal
+        self.assertEqual(
+            helper(
+                {"user_query_count": 1, "response_count": 0, "copy_count": 0},
+                0,
+                0,
+                0,
+            ),
+            "user_query_increased",
+        )
+        self.assertEqual(
+            helper(
+                {"stop_visible": True, "send_visible": False},
+                0,
+                0,
+                0,
+            ),
+            "stop_visible",
+        )
 
     def test_model_matching_tolerates_version_and_label_changes(self):
         matcher = GeminiWebAutomation(worker_id=1)._matches_model
