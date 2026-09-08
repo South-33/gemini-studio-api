@@ -78,7 +78,8 @@ short Search instruction in the composer.
   for tunnel events.
 - `logs\requests\request_*.json` is the canonical diagnostic history. Every
   browser attempt stores the complete caller prompt and Gemini response, caller
-  project/client metadata, model/thinking/search settings, queue and attempt
+  project/client metadata, model/thinking settings, requested/effective Search
+  state, queue and attempt
   timing, retry decision, ready-state result, and the full timestamped browser
   log for that attempt. Records are private, Git-ignored, and never exposed by
   `/v1/diagnostics`.

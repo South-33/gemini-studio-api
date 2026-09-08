@@ -221,6 +221,7 @@ class WorkerPool:
                         attempt_logs.extend(request_log)
 
                     retryable = self._is_retryable_response_rejection(result)
+                    effective_search = GeminiWebAutomation._needs_search_hint(prompt, use_search)
                     if result.get("success") and str(result.get("response") or "").strip():
                         response = str(result.get("response") or "")
                         if not self._is_transient_gemini_refusal(response):
@@ -239,6 +240,7 @@ class WorkerPool:
                                     model=model,
                                     thinking_level=thinking_level,
                                     use_search=use_search,
+                                    effective_search=effective_search,
                                     queue_wait_ms=wait_ms,
                                     queued_at=queued_at_iso,
                                     attempt_started_at=attempt_started_at,
@@ -277,6 +279,7 @@ class WorkerPool:
                                 model=model,
                                 thinking_level=thinking_level,
                                 use_search=use_search,
+                                effective_search=effective_search,
                                 queue_wait_ms=wait_ms,
                                 queued_at=queued_at_iso,
                                 attempt_started_at=attempt_started_at,
@@ -309,6 +312,7 @@ class WorkerPool:
                             model=model,
                             thinking_level=thinking_level,
                             use_search=use_search,
+                            effective_search=effective_search,
                             queue_wait_ms=wait_ms,
                             queued_at=queued_at_iso,
                             attempt_started_at=attempt_started_at,
