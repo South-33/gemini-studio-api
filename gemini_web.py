@@ -72,6 +72,7 @@ NETWORK_OUTAGE_PROBE_TIMEOUT_SECONDS = 2.0
 # instruction. The marker lets the server distinguish a usable Gemini answer
 # from a refusal/error message without imposing a response schema on callers.
 RESPONSE_MARKER = "response=good"
+DEAD_RESPONSE_SHELL_SECONDS = 5.0
 
 
 class GeminiWebAutomation:
@@ -159,6 +160,18 @@ class GeminiWebAutomation:
         if bool(snapshot.get("stop_visible")) and not bool(snapshot.get("send_visible")):
             return "stop_visible"
         return ""
+
+    @staticmethod
+    def _is_dead_response_shell(snapshot: Dict[str, Any], pre_send_resp_count: int) -> bool:
+        """Detect Gemini's non-copyable terminal shell after a request was accepted."""
+        return (
+            int(snapshot.get("response_count") or 0) > pre_send_resp_count
+            and str(snapshot.get("phase") or "") == "idle_or_unknown"
+            and not bool(snapshot.get("stop_visible"))
+            and not bool(snapshot.get("thinking_active"))
+            and int(snapshot.get("response_body_len") or 0) == 0
+            and int(snapshot.get("response_copy_count") or 0) == 0
+        )
     
     # Stable selectors first; bounded fallbacks second with fuzzy/partial matching
     SELECTORS = {
@@ -1003,46 +1016,6 @@ class GeminiWebAutomation:
 
         return snapshot
 
-    async def _click_stop_if_visible(self) -> bool:
-        """Best-effort stop click using in-page DOM lookup."""
-        try:
-            clicked = await self.page.evaluate(
-                """
-                () => {
-                    const isVisible = (el) => {
-                        if (!el) return false;
-                        const style = window.getComputedStyle(el);
-                        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-                        return !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
-                    };
-
-                    const buttons = Array.from(document.querySelectorAll('button')).filter(isVisible);
-                    const stopBtn = buttons.find((b) => {
-                        const label = (b.getAttribute('aria-label') || '').toLowerCase();
-                        const text = (b.innerText || '').toLowerCase();
-                        return label.includes('stop') || text.includes('stop');
-                    });
-
-                    if (!stopBtn) return false;
-
-                    try {
-                        stopBtn.click();
-                        return true;
-                    } catch (_) {}
-
-                    try {
-                        stopBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-                        return true;
-                    } catch (_) {}
-
-                    return false;
-                }
-                """
-            )
-            return bool(clicked)
-        except:
-            return False
-
     async def _extract_latest_via_copy(self, copy_selector: str, pre_send_count: int) -> Optional[str]:
         """Try extracting response markdown via latest copy button."""
         try:
@@ -1070,17 +1043,10 @@ class GeminiWebAutomation:
         self,
         copy_selector: str,
         pre_send_count: int,
-        click_stop: bool = True,
     ) -> Optional[str]:
-        """Try to finalize an in-flight stalled generation before giving up."""
+        """Try Copy once more without interrupting an in-flight generation."""
         try:
-            if click_stop:
-                stop_clicked = await self._click_stop_if_visible()
-                if stop_clicked:
-                    log("Attempted stop click on stalled generation", f"Worker {self.worker_id}")
-                await self._human_delay(1200, 1800)
-            else:
-                await self._human_delay(300, 600)
+            await self._human_delay(300, 600)
 
             markdown = await self._extract_latest_via_copy(copy_selector, pre_send_count)
             if markdown:
@@ -1694,12 +1660,12 @@ class GeminiWebAutomation:
                 prompt = anti_image_inst + prompt
 
         marker_inst = (
-            f"First line exactly: {RESPONSE_MARKER}\n"
-            "Then answer on the next line in the user's requested format. "
-            "JSON-only or 'nothing else' rules apply after that first line.\n\n"
+            "If you are able to answer this request, start with exactly:\n"
+            f"{RESPONSE_MARKER}\n\n"
+            "Then continue normally in the format the user requested.\n\n"
         )
         if not prompt.lstrip().lower().startswith(
-            f"first line exactly: {RESPONSE_MARKER}"
+            "if you are able to answer this request, start with exactly:"
         ):
             prompt = marker_inst + prompt
 
@@ -2153,6 +2119,15 @@ class GeminiWebAutomation:
                 now = time.time()
                 elapsed_float = now - start_time
 
+                if (
+                    elapsed_float >= DEAD_RESPONSE_SHELL_SECONDS
+                    and self._is_dead_response_shell(page_snapshot, pre_send_resp_count)
+                ):
+                    error = "Gemini entered a non-copyable terminal response state"
+                    log(f"❌ {error}", f"Worker {self.worker_id}")
+                    self._track_error(error, "copy_btn", "wait_for_response_dead_shell", page_snapshot)
+                    return {"success": False, "error": error}
+
                 # A transient composer change can look like a successful send.
                 # Re-check the durable state quickly instead of waiting for the
                 # normal ten-second diagnostic interval.
@@ -2285,7 +2260,6 @@ class GeminiWebAutomation:
                         finalized_text = await self._attempt_finalize_stalled_response(
                             copy_selector,
                             pre_send_count,
-                            click_stop=False,
                         )
                         if finalized_text:
                             log("✅ Finalized stable response during post-processing", f"Worker {self.worker_id}")
@@ -2414,7 +2388,13 @@ class GeminiWebAutomation:
                                 tail.append(f"{kind}:{code}:{url[-48:]}")
                             log(f"[{self._request_id}] Network tail: {' | '.join(tail)}", f"Worker {self.worker_id}")
 
-                        recovered_text = await self._attempt_finalize_stalled_response(copy_selector, pre_send_count)
+                        # Never click Gemini's Stop button as a recovery tactic. A stalled
+                        # request should fail cleanly and retry on a fresh tab instead of
+                        # creating a visible "You stopped this response" partial answer.
+                        recovered_text = await self._attempt_finalize_stalled_response(
+                            copy_selector,
+                            pre_send_count,
+                        )
                         if recovered_text:
                             log("✅ Recovered stalled generation via finalize path", f"Worker {self.worker_id}")
                             self._last_request_success = True

@@ -53,15 +53,17 @@ written to `prompt.txt` and uploaded to avoid freezing the contenteditable.
 An upload counts as successful only after the expected filename is visibly
 rendered in the composer and Send is enabled; Send readiness alone is not proof.
 
-Every request also prepends a transport-only first-line marker instruction. Gemini
-must output `response=good` on line 1, then continue on a new line using the
-caller's requested format unchanged. JSON-only and fenced-code requirements apply
-after the marker; the server removes the marker before returning the response. Keep
-this instruction compact so normal BorderClash curation stays below file-upload mode.
+Every request also prepends a compact transport-only marker instruction. If Gemini
+is able to answer, it should output `response=good`, then a blank line, then continue
+normally using the caller's requested format. The server removes the marker before
+returning the response. Keep this instruction compact so normal BorderClash curation
+stays below file-upload mode.
 If Gemini omits only the marker but returns an unmistakably structured payload
 (fenced code, `<json>`, raw object, or raw array), the payload is accepted unchanged;
 markerless prose is still rejected. A send is also treated as accepted when the UI
 shows late proof such as a new user query or active Stop state after click verification.
+Recovery never clicks Gemini's Stop button. Stalled generations fail cleanly and are
+retried on a fresh tab instead of creating a partial "You stopped this response" result.
 Gemini often skips Search when the request exists only inside that attachment,
 so prompts containing the standalone words `google`, `search`, or `web` leave a
 short search instruction in the composer. `use_search: true` forces that hint;

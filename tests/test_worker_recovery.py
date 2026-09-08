@@ -86,6 +86,25 @@ class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
             "stop_visible",
         )
 
+    def test_dead_response_shell_is_detected_without_waiting_for_full_timeout(self):
+        helper = GeminiWebAutomation._is_dead_response_shell
+        self.assertTrue(helper({
+            "response_count": 1,
+            "phase": "idle_or_unknown",
+            "stop_visible": False,
+            "thinking_active": False,
+            "response_body_len": 0,
+            "response_copy_count": 0,
+        }, 0))
+        self.assertFalse(helper({
+            "response_count": 1,
+            "phase": "response_streaming",
+            "stop_visible": True,
+            "thinking_active": False,
+            "response_body_len": 20,
+            "response_copy_count": 0,
+        }, 0))
+
     def test_model_matching_tolerates_version_and_label_changes(self):
         matcher = GeminiWebAutomation(worker_id=1)._matches_model
         self.assertTrue(matcher("Gemini 3.7 Flash", "gemini-3.6-flash"))
