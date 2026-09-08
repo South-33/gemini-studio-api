@@ -468,6 +468,15 @@ async def openai_chat(request: Request):
         use_search=use_search, 
         images=image_paths,
         request_id=trace_id,
+        request_context={
+            "project": source["project"],
+            "client": source["client"],
+            "ip": source["ip"],
+            "raw_model": model,
+            "message_count": len(messages),
+            "image_count": len(image_paths),
+            "prompt_tokens_est": prompt_tokens_est,
+        },
     )
     future = asyncio.run_coroutine_threadsafe(coro, browser_loop)
     
@@ -506,6 +515,7 @@ async def openai_chat(request: Request):
         trace["error"] = result.get("error")
         trace["queue_wait_ms"] = result.get("queue_wait_ms")
         trace["attempts"] = result.get("attempts")
+        trace["request_logs"] = result.get("request_logs") or []
         trace["finished_at"] = datetime.now(timezone.utc).isoformat()
         write_error_transaction_log(trace, result, list(recent_requests))
         raise HTTPException(status_code=500, detail=result.get("error"))
@@ -516,7 +526,7 @@ async def openai_chat(request: Request):
     trace["queue_wait_ms"] = result.get("queue_wait_ms")
     trace["attempts"] = result.get("attempts")
     trace["response_chars"] = len(content)
-    trace["response_log"] = result.get("response_log")
+    trace["request_logs"] = result.get("request_logs") or []
     trace["response_tokens_est"] = completion_tokens_est
     trace["finished_at"] = datetime.now(timezone.utc).isoformat()
     log(

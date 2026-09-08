@@ -5,13 +5,14 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from playwright.async_api import Page, async_playwright
 
 from gemini_web import GeminiWebAutomation, log
 from notifier import notify_error
-from response_log import write_response_log
+from request_log import write_request_log
 
 
 class WorkerPool:
@@ -171,11 +172,13 @@ class WorkerPool:
         use_search: bool = False,
         images: List[str] | None = None,
         request_id: str | None = None,
+        request_context: Dict[str, Any] | None = None,
     ) -> Dict:
         if not self.worker or not self._initialized:
             return {"success": False, "error": "Gemini worker is not ready"}
 
         queued_at = time.time()
+        queued_at_iso = datetime.now(timezone.utc).isoformat()
         self._queued_requests += 1
         waiting = True
         try:
@@ -188,6 +191,7 @@ class WorkerPool:
 
                 self._active_request = True
                 attempt_logs: List[str] = []
+                request_log_files: List[str] = []
                 last_error = "unknown"
                 attempt = 0
                 for attempt in (1, 2):
@@ -195,6 +199,8 @@ class WorkerPool:
                     if not worker:
                         last_error = "Gemini worker disappeared"
                         break
+                    attempt_started = time.time()
+                    attempt_started_at = datetime.now(timezone.utc).isoformat()
                     try:
                         result = await worker.send_message(
                             prompt,
@@ -206,27 +212,15 @@ class WorkerPool:
                         )
                     except Exception as exc:
                         result = {"success": False, "error": str(exc)}
-
-                    try:
-                        response_file = await asyncio.to_thread(
-                            write_response_log,
-                            request_id=request_id,
-                            attempt=attempt,
-                            result=result,
-                            model=model,
-                            thinking_level=thinking_level,
-                            prompt_chars=len(prompt),
-                        )
-                        result["response_log"] = response_file
-                        log(f"[{request_id}] Attempt {attempt} response saved: logs/responses/{response_file}", "Worker")
-                    except Exception as exc:
-                        log(f"[{request_id}] Response logging failed ({type(exc).__name__}); request handling continues", "Worker")
+                    attempt_finished_at = datetime.now(timezone.utc).isoformat()
+                    attempt_duration_ms = int((time.time() - attempt_started) * 1000)
 
                     request_log = worker.get_request_log()
                     if request_log:
                         attempt_logs.append(f"--- Attempt {attempt} ---")
                         attempt_logs.extend(request_log)
 
+                    retryable = self._is_retryable_response_rejection(result)
                     if result.get("success") and str(result.get("response") or "").strip():
                         response = str(result.get("response") or "")
                         if not self._is_transient_gemini_refusal(response):
@@ -235,26 +229,111 @@ class WorkerPool:
                             result["ready_for_next_request"] = await self._ensure_ready_after_request(
                                 f"request {request_id} completed"
                             )
+                            try:
+                                request_file = await asyncio.to_thread(
+                                    write_request_log,
+                                    request_id=request_id,
+                                    attempt=attempt,
+                                    prompt=prompt,
+                                    result=result,
+                                    model=model,
+                                    thinking_level=thinking_level,
+                                    use_search=use_search,
+                                    queue_wait_ms=wait_ms,
+                                    queued_at=queued_at_iso,
+                                    attempt_started_at=attempt_started_at,
+                                    attempt_finished_at=attempt_finished_at,
+                                    attempt_duration_ms=attempt_duration_ms,
+                                    browser_log=request_log,
+                                    request_context=request_context,
+                                    retryable=False,
+                                    will_retry=False,
+                                    ready_for_next_request=result["ready_for_next_request"],
+                                    ready_state=self._last_ready_reset,
+                                )
+                                request_log_files.append(request_file)
+                                log(f"[{request_id}] Attempt {attempt} saved: logs/requests/{request_file}", "Worker")
+                            except Exception as exc:
+                                log(f"[{request_id}] Request logging failed ({type(exc).__name__}); request handling continues", "Worker")
+                            result["request_logs"] = request_log_files
                             return result
                         last_error = "Gemini returned its generic transient refusal"
                     else:
                         last_error = result.get("error") or "Empty response"
 
-                    if attempt == 1 and self._is_retryable_response_rejection(result):
+                    ready_after_failure = None
+                    if attempt == 1 and retryable:
                         log(f"[{request_id}] Response rejected; retrying once", "Worker")
-                        if await self._ensure_ready_after_request(
+                        ready_for_retry = await self._ensure_ready_after_request(
                             f"request {request_id} response rejected before retry"
-                        ):
+                        )
+                        try:
+                            request_file = await asyncio.to_thread(
+                                write_request_log,
+                                request_id=request_id,
+                                attempt=attempt,
+                                prompt=prompt,
+                                result=result,
+                                model=model,
+                                thinking_level=thinking_level,
+                                use_search=use_search,
+                                queue_wait_ms=wait_ms,
+                                queued_at=queued_at_iso,
+                                attempt_started_at=attempt_started_at,
+                                attempt_finished_at=attempt_finished_at,
+                                attempt_duration_ms=attempt_duration_ms,
+                                browser_log=request_log,
+                                request_context=request_context,
+                                retryable=True,
+                                will_retry=bool(ready_for_retry),
+                                ready_for_next_request=ready_for_retry,
+                                ready_state=self._last_ready_reset,
+                            )
+                            request_log_files.append(request_file)
+                            log(f"[{request_id}] Attempt {attempt} saved: logs/requests/{request_file}", "Worker")
+                        except Exception as exc:
+                            log(f"[{request_id}] Request logging failed ({type(exc).__name__}); request handling continues", "Worker")
+                        if ready_for_retry:
                             continue
+                        ready_after_failure = ready_for_retry
+
+                    if ready_after_failure is None:
+                        ready_after_failure = await self._ensure_ready_after_request(f"request {request_id} failed")
+                    try:
+                        request_file = await asyncio.to_thread(
+                            write_request_log,
+                            request_id=request_id,
+                            attempt=attempt,
+                            prompt=prompt,
+                            result=result,
+                            model=model,
+                            thinking_level=thinking_level,
+                            use_search=use_search,
+                            queue_wait_ms=wait_ms,
+                            queued_at=queued_at_iso,
+                            attempt_started_at=attempt_started_at,
+                            attempt_finished_at=attempt_finished_at,
+                            attempt_duration_ms=attempt_duration_ms,
+                            browser_log=request_log,
+                            request_context=request_context,
+                            retryable=retryable,
+                            will_retry=False,
+                            ready_for_next_request=ready_after_failure,
+                            ready_state=self._last_ready_reset,
+                        )
+                        request_log_files.append(request_file)
+                        log(f"[{request_id}] Attempt {attempt} saved: logs/requests/{request_file}", "Worker")
+                    except Exception as exc:
+                        log(f"[{request_id}] Request logging failed ({type(exc).__name__}); request handling continues", "Worker")
                     break
 
                 log(f"[{request_id}] Request failed: {last_error}", "Worker")
-                await self._ensure_ready_after_request(f"request {request_id} failed")
                 await self._notify_final_failure(last_error)
                 return {
                     "success": False,
                     "error": f"Gemini request failed: {last_error}",
                     "attempt_logs": attempt_logs,
+                    "request_logs": request_log_files,
                     "queue_wait_ms": wait_ms,
                     "attempts": max(1, attempt),
                 }

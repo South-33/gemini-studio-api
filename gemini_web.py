@@ -2267,9 +2267,31 @@ class GeminiWebAutomation:
                             pre_send_count,
                         )
                         if recovered_text:
-                            log("✅ Recovered stalled generation via finalize path", f"Worker {self.worker_id}")
+                            try:
+                                cleaned_recovered = self._strip_response_marker(recovered_text)
+                            except ValueError as marker_error:
+                                marker_error_text = str(marker_error)
+                                self._track_error(
+                                    marker_error_text,
+                                    "copy_btn",
+                                    "validate_recovered_response_marker",
+                                    snap,
+                                )
+                                return {
+                                    "success": False,
+                                    "error": marker_error_text,
+                                    "response": recovered_text,
+                                    "raw_response": recovered_text,
+                                    "response_marker_ok": False,
+                                }
+                            log("Recovered stalled generation via finalize path", f"Worker {self.worker_id}")
                             self._last_request_success = True
-                            return {"success": True, "response": recovered_text}
+                            return {
+                                "success": True,
+                                "response": cleaned_recovered,
+                                "raw_response": recovered_text,
+                                "response_marker_ok": True,
+                            }
 
                         error_snapshot = dict(snap)
                         try:
@@ -2330,15 +2352,27 @@ class GeminiWebAutomation:
                 f"✅ Response: chars={out_chars}, tokens_est={out_tokens_est}",
                 f"Worker {self.worker_id}",
             )
+            raw_markdown = markdown
             try:
-                markdown = self._strip_response_marker(markdown)
+                markdown = self._strip_response_marker(raw_markdown)
             except ValueError as marker_error:
                 marker_error_text = str(marker_error)
                 snapshot = await self._capture_state_snapshot()
                 self._track_error(marker_error_text, "copy_btn", "validate_response_marker", snapshot)
-                return {"success": False, "error": marker_error_text, "response": markdown}
+                return {
+                    "success": False,
+                    "error": marker_error_text,
+                    "response": raw_markdown,
+                    "raw_response": raw_markdown,
+                    "response_marker_ok": False,
+                }
             self._last_request_success = True
-            return {"success": True, "response": markdown.strip()}
+            return {
+                "success": True,
+                "response": markdown.strip(),
+                "raw_response": raw_markdown,
+                "response_marker_ok": True,
+            }
 
         except Exception as e:
             self._generation_in_progress = False

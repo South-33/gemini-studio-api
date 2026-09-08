@@ -41,8 +41,8 @@ class FakeWorker:
 
 class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        patcher = patch("worker_pool.write_response_log", return_value="response_test.json")
-        self.response_logger = patcher.start()
+        patcher = patch("worker_pool.write_request_log", return_value="request_test.json")
+        self.request_logger = patcher.start()
         self.addCleanup(patcher.stop)
 
     async def test_concurrent_requests_are_serialized(self):
@@ -146,12 +146,13 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["response"], "expected")
         self.assertEqual(result["attempts"], 2)
         self.assertEqual(worker.prepare_calls, 2)
-        self.assertEqual(self.response_logger.call_count, 2)
-        self.assertIn("hard time fulfilling", self.response_logger.call_args_list[0].kwargs["result"]["response"])
-        self.assertEqual(self.response_logger.call_args_list[1].kwargs["attempt"], 2)
+        self.assertEqual(self.request_logger.call_count, 2)
+        self.assertIn("hard time fulfilling", self.request_logger.call_args_list[0].kwargs["result"]["response"])
+        self.assertTrue(self.request_logger.call_args_list[0].kwargs["will_retry"])
+        self.assertEqual(self.request_logger.call_args_list[1].kwargs["attempt"], 2)
 
-    async def test_response_log_disk_failure_does_not_fail_completion(self):
-        self.response_logger.side_effect = OSError("disk unavailable")
+    async def test_request_log_disk_failure_does_not_fail_completion(self):
+        self.request_logger.side_effect = OSError("disk unavailable")
         pool = WorkerPool()
         pool.workers = [FakeWorker()]
         pool._initialized = True
@@ -160,6 +161,39 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(result["success"])
         self.assertEqual(result["response"], "ok")
+
+    async def test_request_log_receives_full_context_and_timing(self):
+        pool = WorkerPool()
+        pool.workers = [FakeWorker()]
+        pool._initialized = True
+        context = {
+            "project": "borderclash",
+            "client": "borderclash-convex",
+            "raw_model": "flash-standard",
+            "message_count": 1,
+            "image_count": 0,
+            "prompt_tokens_est": 12,
+        }
+
+        result = await pool.send_message(
+            "full prompt",
+            model="flash",
+            thinking_level="Standard",
+            use_search=True,
+            request_id="trace-me",
+            request_context=context,
+        )
+
+        self.assertTrue(result["success"])
+        kwargs = self.request_logger.call_args.kwargs
+        self.assertEqual(kwargs["prompt"], "full prompt")
+        self.assertEqual(kwargs["request_context"], context)
+        self.assertEqual(kwargs["model"], "flash")
+        self.assertEqual(kwargs["thinking_level"], "Standard")
+        self.assertTrue(kwargs["use_search"])
+        self.assertGreaterEqual(kwargs["attempt_duration_ms"], 0)
+        self.assertIn("attempt_started_at", kwargs)
+        self.assertIn("attempt_finished_at", kwargs)
 
 
 if __name__ == "__main__":

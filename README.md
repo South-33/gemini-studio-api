@@ -1,8 +1,9 @@
 # Gemini Studio API
 
 A small OpenAI-compatible API backed by one logged-in Gemini Web tab. Requests
-queue, run in clean chats, copy Gemini's response, and retry once on a newly
-created tab after a concrete browser failure.
+queue, run in clean chats, and return only text copied through Gemini's Copy
+control. A missing `response=good` acceptance marker gets one clean retry;
+transport/browser failures are returned instead of silently resending prompts.
 
 ## Run
 
@@ -58,11 +59,11 @@ ready-state reset. Each serialized request verifies its model, sends, waits,
 copies the response, and resets to a clean Temporary Chat before the next
 queued request can start.
 
-The worker asks Gemini to begin every answer with `response=good`. It strips that
-marker before returning the answer. If the marker is missing, the reply is
-recorded and the worker recreates the tab for one bounded retry. This is only an
-automation health check; the API does not require JSON and remains generic for
-callers.
+The worker asks Gemini to begin every usable answer with `response=good`, then a
+blank line, then the caller's requested output normally. It strips the marker
+before returning the answer. If Gemini answers without the marker, that attempt
+is recorded and gets one bounded retry in a clean chat. The marker is only an
+acceptance signal; the API does not impose JSON or any other response format.
 
 Prompts at or above 1,500 characters are attached as `prompt.txt` to avoid
 freezing Gemini's editor. For those attached prompts, explicit
@@ -71,18 +72,24 @@ short Search instruction in the composer.
 
 ## Operations
 
-- `stress_test.html` submits concurrent queue checks. It remembers the last API
+- `tools\stress_test.html` submits concurrent queue checks. It remembers the last API
   root and is preloaded with the production tunnel.
-- Check `logs\server.log` for API/browser failures and `logs\ngrok.log` for
-  tunnel failures.
-- `logs\responses\response_*.json` records Gemini's text from every attempt,
-  including HTTP-200 replies and refusals before retries. Match `request_id` to
-  `server.log` to find the caller. These files are private, Git-ignored, and not
-  served by the API. No prompt bodies are copied into them. Retention is at most
-  200 records / 64 MiB; responses over one million characters are explicitly
-  marked as truncated. Logging failures warn but do not fail a completion.
-- If disconnecting RDP suspends Chromium, run `disconnect_rdp.bat` or use the
-  included virtual-display installer.
+- Check `logs\server.log` for the live API/browser stream and `logs\ngrok.log`
+  for tunnel events.
+- `logs\requests\request_*.json` is the canonical diagnostic history. Every
+  browser attempt stores the complete caller prompt and Gemini response, caller
+  project/client metadata, model/thinking/search settings, queue and attempt
+  timing, retry decision, ready-state result, and the full timestamped browser
+  log for that attempt. Records are private, Git-ignored, and never exposed by
+  `/v1/diagnostics`.
+- Retention rotates whole old request records at 500 files or 512 MiB. Retained
+  prompt/response bodies are never silently truncated, so a retained record can
+  be replayed exactly. Logging failure warns but never fails a completion.
+- Failed requests can additionally produce screenshots/text extracts and a
+  transaction bundle under `logs\`; these are supporting artifacts, while the
+  structured request-attempt record remains the primary history.
+- If disconnecting RDP suspends Chromium, run `ops\windows\disconnect_rdp.bat`
+  or use `ops\windows\install_virtual_display.ps1`.
 - Healthy idle tabs are never refreshed because of age or request count.
 
 Gemini's maintained UI inventory is [GEMINI_WEBSITE.md](GEMINI_WEBSITE.md).
@@ -92,5 +99,5 @@ Update it and a focused test whenever the site changes.
 
 ```powershell
 python -m unittest discover -s tests -v
-python -m py_compile launcher.py main.py gemini_web.py worker_pool.py gemini_models.py notifier.py
+python -m py_compile launcher.py main.py gemini_web.py worker_pool.py gemini_models.py notifier.py request_log.py
 ```

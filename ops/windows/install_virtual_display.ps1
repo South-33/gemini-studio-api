@@ -57,10 +57,9 @@ if ($infFiles) {
 # Step 4: Create Scheduled Task for Auto RDP Console Redirection
 Write-Host "[4/4] Setting up Windows Scheduled Task for RDP Keep-Alive..." -ForegroundColor Yellow
 $taskName = "KeepScreenActiveOnRDPDisconnect"
-$scriptPath = "$PSScriptRoot\disconnect_rdp.bat"
-
+$scriptPath = Join-Path $PSScriptRoot 'disconnect_rdp.bat'
 if (-not (Test-Path $scriptPath)) {
-    $scriptPath = "C:\Users\nyxy\Desktop\gemini-studio-api\disconnect_rdp.bat"
+    throw "disconnect_rdp.bat must be beside this installer in $PSScriptRoot"
 }
 
 $action = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c `"$scriptPath`""

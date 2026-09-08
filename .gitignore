@@ -1,16 +1,28 @@
 # Session data (contains login cookies - NEVER commit!)
 .browser_session/
+.browser_session_backup/
+
+# Local remote-admin bootstrap/status files
+remote-admin/
+SETUP_REMOTE_ADMIN.bat
 
 # Python
 __pycache__/
 *.pyc
+.pytest_cache/
 venv/
 
 # Environment files with secrets
 .env
+.env.*
+!.env.example
 
-# Error transaction logs
+# Private runtime/request logs and diagnostics
 logs/
+
+# Accidental Windows shell artifacts
+$null
+*.tmp
 
 # Zip files
 *.zip
