@@ -25,7 +25,7 @@ class RequestLogTests(unittest.TestCase):
             model="flash",
             thinking_level="Standard",
             use_search=True,
-            effective_search=True,
+            search_instruction_present=True,
             queue_wait_ms=321,
             queued_at="2026-09-08T12:00:00+00:00",
             attempt_started_at="2026-09-08T12:00:01+00:00",
@@ -62,14 +62,14 @@ class RequestLogTests(unittest.TestCase):
         self.assertEqual(saved["timing"]["attempt_duration_ms"], 2000)
         self.assertEqual(saved["source"]["project"], "borderclash")
         self.assertTrue(saved["request"]["search_requested"])
-        self.assertTrue(saved["request"]["search_effective"])
+        self.assertTrue(saved["request"]["search_instruction_present"])
         self.assertIn("Single send click dispatched", saved["browser_log"][0])
 
-    def test_effective_search_can_come_from_prompt_intent(self):
-        path = self.save(use_search=False, effective_search=True)
+    def test_search_instruction_is_not_inferred_from_prompt_text(self):
+        path = self.save(use_search=False, search_instruction_present=False)
         saved = json.loads(path.read_text(encoding="utf-8"))
         self.assertFalse(saved["request"]["search_requested"])
-        self.assertTrue(saved["request"]["search_effective"])
+        self.assertFalse(saved["request"]["search_instruction_present"])
 
     def test_failure_and_retry_decision_are_recorded(self):
         path = self.save(

@@ -2752,10 +2752,8 @@ class GeminiWebAutomation:
 
     @staticmethod
     def _needs_search_hint(prompt: str, use_search: bool = False) -> bool:
-        """Keep search intent visible when a long prompt moves into an attachment."""
-        return use_search or bool(
-            re.search(r"\b(?:google|search|web)\b", prompt or "", flags=re.IGNORECASE)
-        )
+        """Only explicit caller intent may add a transport-level Search instruction."""
+        return bool(use_search)
 
     async def _prepare_and_enter_prompt(
         self,

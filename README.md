@@ -66,9 +66,10 @@ is recorded and gets one bounded retry in a clean chat. The marker is only an
 acceptance signal; the API does not impose JSON or any other response format.
 
 Prompts at or above 1,500 characters are attached as `prompt.txt` to avoid
-freezing Gemini's editor. For those attached prompts, explicit
-`use_search: true` or standalone `google`, `search`, or `web` wording leaves a
-short Search instruction in the composer.
+freezing Gemini's editor. `use_search: true` explicitly adds a short Search
+instruction in the composer. Prompt wording is never keyword-guessed. This is
+only an instruction to Gemini, not proof that a live Search tool was available
+or used.
 
 ## Operations
 
@@ -78,8 +79,8 @@ short Search instruction in the composer.
   for tunnel events.
 - `logs\requests\request_*.json` is the canonical diagnostic history. Every
   browser attempt stores the complete caller prompt and Gemini response, caller
-  project/client metadata, model/thinking settings, requested/effective Search
-  state, queue and attempt
+  project/client metadata, model/thinking settings, whether Search was requested
+  and whether a Search instruction was placed in the composer, queue and attempt
   timing, retry decision, ready-state result, and the full timestamped browser
   log for that attempt. Records are private, Git-ignored, and never exposed by
   `/v1/diagnostics`.

@@ -191,7 +191,7 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["model"], "flash")
         self.assertEqual(kwargs["thinking_level"], "Standard")
         self.assertTrue(kwargs["use_search"])
-        self.assertTrue(kwargs["effective_search"])
+        self.assertTrue(kwargs["search_instruction_present"])
         self.assertGreaterEqual(kwargs["attempt_duration_ms"], 0)
         self.assertIn("attempt_started_at", kwargs)
         self.assertIn("attempt_finished_at", kwargs)

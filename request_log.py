@@ -42,7 +42,7 @@ def write_request_log(
     model: str | None,
     thinking_level: str | None,
     use_search: bool,
-    effective_search: bool | None = None,
+    search_instruction_present: bool | None = None,
     queue_wait_ms: int,
     queued_at: str,
     attempt_started_at: str,
@@ -84,7 +84,9 @@ def write_request_log(
             "thinking_level": thinking_level,
             "use_search": bool(use_search),
             "search_requested": bool(use_search),
-            "search_effective": bool(use_search if effective_search is None else effective_search),
+            "search_instruction_present": bool(
+                use_search if search_instruction_present is None else search_instruction_present
+            ),
             "message_count": context.get("message_count"),
             "image_count": context.get("image_count", 0),
             "prompt_chars": len(prompt),

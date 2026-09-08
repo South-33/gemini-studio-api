@@ -128,11 +128,11 @@ class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(matcher("Gemini 4 Pro", "pro"))
         self.assertFalse(matcher("Gemini 3.7 Flash", "flash-lite"))
 
-    def test_long_prompt_search_hint_uses_stable_intent_words(self):
+    def test_long_prompt_search_hint_requires_explicit_flag(self):
         helper = GeminiWebAutomation._needs_search_hint
-        self.assertTrue(helper("Search the current reporting"))
-        self.assertTrue(helper("Use the web for sources"))
-        self.assertTrue(helper("Check Google", use_search=False))
+        self.assertFalse(helper("Search the current reporting"))
+        self.assertFalse(helper("Use the web for sources"))
+        self.assertFalse(helper("Check Google", use_search=False))
         self.assertTrue(helper("Plain request", use_search=True))
         self.assertFalse(helper("Plain request"))
         self.assertFalse(helper("Improve this website layout"))

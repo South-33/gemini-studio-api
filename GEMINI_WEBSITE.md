@@ -61,10 +61,13 @@ Temporary Chat. Keep this instruction compact so normal BorderClash curation sta
 below file-upload mode. A send is treated as accepted when the UI shows late proof
 such as a new user query or active Stop state after click verification.
 Recovery never clicks Gemini's Stop button.
-Gemini often skips Search when the request exists only inside that attachment,
-so prompts containing the standalone words `google`, `search`, or `web` leave a
-short search instruction in the composer. `use_search: true` forces that hint;
-short prompts use only the explicit flag and are not keyword-guessed.
+Gemini often skips Search when the request exists only inside an attachment, so
+`use_search: true` explicitly leaves a short search instruction in the composer.
+Prompt wording is never keyword-guessed because words such as "search" can also
+appear in negative instructions or quoted evidence.
+This is prompt transport only. It does not prove that Gemini exposed or used a
+live Search tool, so callers that require grounded web evidence must fetch that
+evidence themselves and pass it in the prompt.
 
 For text-only API calls, keep the anti-image instruction. Do not activate
 Create image/video/music, Canvas, or Deep research as an automation fallback.
