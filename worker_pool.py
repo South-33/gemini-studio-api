@@ -152,6 +152,17 @@ class WorkerPool:
             "can i help with something else instead?"
         )
 
+    @staticmethod
+    def _is_retryable_response_rejection(result: Dict) -> bool:
+        """Retry once only when Gemini answered but did not confirm a usable response."""
+        error = str(result.get("error") or "").strip().lower()
+        response = str(result.get("response") or "")
+        return (
+            "missing response=good marker" in error
+            or "returned only the response marker" in error
+            or WorkerPool._is_transient_gemini_refusal(response)
+        )
+
     async def send_message(
         self,
         prompt: str,
@@ -178,6 +189,7 @@ class WorkerPool:
                 self._active_request = True
                 attempt_logs: List[str] = []
                 last_error = "unknown"
+                attempt = 0
                 for attempt in (1, 2):
                     worker = self.worker
                     if not worker:
@@ -195,7 +207,6 @@ class WorkerPool:
                     except Exception as exc:
                         result = {"success": False, "error": str(exc)}
 
-                    # Save before refusal handling so retrying never hides the original output.
                     try:
                         response_file = await asyncio.to_thread(
                             write_response_log,
@@ -218,36 +229,34 @@ class WorkerPool:
 
                     if result.get("success") and str(result.get("response") or "").strip():
                         response = str(result.get("response") or "")
-                        if self._is_transient_gemini_refusal(response):
-                            last_error = "Gemini returned its generic transient refusal"
-                            log(f"[{request_id}] {last_error}", "Worker")
-                            if attempt < 2 and await self._ensure_ready_after_request(
-                                f"request {request_id} returned a transient refusal"
-                            ):
-                                continue
-                            break
-                        result["queue_wait_ms"] = wait_ms
-                        result["attempts"] = attempt
-                        result["ready_for_next_request"] = await self._ensure_ready_after_request(
-                            f"request {request_id} completed"
-                        )
-                        return result
+                        if not self._is_transient_gemini_refusal(response):
+                            result["queue_wait_ms"] = wait_ms
+                            result["attempts"] = attempt
+                            result["ready_for_next_request"] = await self._ensure_ready_after_request(
+                                f"request {request_id} completed"
+                            )
+                            return result
+                        last_error = "Gemini returned its generic transient refusal"
+                    else:
+                        last_error = result.get("error") or "Empty response"
 
-                    last_error = result.get("error") or "Empty response"
-                    log(f"[{request_id}] Attempt {attempt} failed: {last_error}", "Worker")
-                    if attempt == 2 or self._is_network_outage(last_error):
-                        break
-                    if not await self._recreate_worker(last_error):
-                        break
+                    if attempt == 1 and self._is_retryable_response_rejection(result):
+                        log(f"[{request_id}] Response rejected; retrying once", "Worker")
+                        if await self._ensure_ready_after_request(
+                            f"request {request_id} response rejected before retry"
+                        ):
+                            continue
+                    break
 
+                log(f"[{request_id}] Request failed: {last_error}", "Worker")
                 await self._ensure_ready_after_request(f"request {request_id} failed")
                 await self._notify_final_failure(last_error)
                 return {
                     "success": False,
-                    "error": f"Gemini request failed after retry: {last_error}",
+                    "error": f"Gemini request failed: {last_error}",
                     "attempt_logs": attempt_logs,
                     "queue_wait_ms": wait_ms,
-                    "attempts": attempt,
+                    "attempts": max(1, attempt),
                 }
         finally:
             if waiting:

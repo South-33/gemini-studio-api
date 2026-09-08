@@ -54,16 +54,13 @@ An upload counts as successful only after the expected filename is visibly
 rendered in the composer and Send is enabled; Send readiness alone is not proof.
 
 Every request also prepends a compact transport-only marker instruction. If Gemini
-is able to answer, it should output `response=good`, then a blank line, then continue
+is able to answer, it must output `response=good`, then a blank line, then continue
 normally using the caller's requested format. The server removes the marker before
-returning the response. Keep this instruction compact so normal BorderClash curation
-stays below file-upload mode.
-If Gemini omits only the marker but returns an unmistakably structured payload
-(fenced code, `<json>`, raw object, or raw array), the payload is accepted unchanged;
-markerless prose is still rejected. A send is also treated as accepted when the UI
-shows late proof such as a new user query or active Stop state after click verification.
-Recovery never clicks Gemini's Stop button. Stalled generations fail cleanly and are
-retried on a fresh tab instead of creating a partial "You stopped this response" result.
+returning the response. A markerless reply is rejected and retried once from a fresh
+Temporary Chat. Keep this instruction compact so normal BorderClash curation stays
+below file-upload mode. A send is treated as accepted when the UI shows late proof
+such as a new user query or active Stop state after click verification.
+Recovery never clicks Gemini's Stop button.
 Gemini often skips Search when the request exists only inside that attachment,
 so prompts containing the standalone words `google`, `search`, or `web` leave a
 short search instruction in the composer. `use_search: true` forces that hint;
@@ -82,15 +79,15 @@ Every request must:
 3. enter temporary chat when available;
 4. select and re-read model/reasoning;
 5. enter prompt/attachments and capture pre-send counters;
-6. send and prove generation started;
+6. click Send exactly once and prove generation started; never resubmit from the same tab;
 7. wait using Stop, response, thinking, and network state;
 8. copy the latest response through Gemini's Copy control.
 
-The API prepends one small instruction to every request: start the answer with
-`response=good` on its first line. The worker removes that marker before returning
-the answer to callers. A missing marker is treated as an unusable Gemini reply,
-so the existing tab-recreate and bounded retry path handles it. This is not a
-JSON requirement and the public API remains OpenAI-compatible.
+The API prepends one small instruction to every request: if Gemini can answer,
+start with `response=good`, leave one blank line, then answer normally in the caller's
+requested format. The worker removes that marker before returning the answer. Missing
+the marker means the answer was not accepted and gets exactly one retry. This is not
+a JSON requirement and the public API remains OpenAI-compatible.
 
 After Copy succeeds, prepare a fresh Temporary Chat before releasing the queue
 lock or returning the result. The next queued request must always inherit this
@@ -120,14 +117,14 @@ discarded. Never refresh a healthy idle page because of age or request count.
 
 ## Failure and recovery
 
-- Google 500, dead page, retained Stop, or verified stall: capture diagnostics,
-  recreate the tab, and retry once.
+- Google 500, dead page, retained Stop, verified stall, or other transport failure:
+  capture diagnostics, clean/reset the tab, and return the failure without resending.
 - DNS/network outage: report it immediately; tab recreation cannot fix DNS.
 - Missing selector: report selector/action, URL, UI state, visible model label,
   request ID, queue wait, and recovery outcome.
-- A reply without the `response=good` first line is treated as an unusable
-  response and retried once from a fresh Temporary Chat. Keep the original reply
-  in the private response log for diagnosis.
+- A reply without the `response=good` first line, or Gemini's known generic refusal,
+  is retried exactly once from a fresh Temporary Chat. Keep both attempts in the
+  private response log for diagnosis.
 - Startup: close Chromium-restored pages, create one managed page, and become
   healthy only after its composer is ready.
 

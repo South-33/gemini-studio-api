@@ -59,18 +59,15 @@ STALL_THINKING_NO_PROGRESS_SECONDS_WITH_ACTIVITY = 180
 FINALIZE_STABLE_RESPONSE_SECONDS = 45
 FINALIZE_STABLE_RESPONSE_LEN = 800
 RECENT_NETWORK_ACTIVITY_SECONDS = 75
-MAX_SEND_RETRIES = 2
 POOL_RECOVERY_WORKER_TIMEOUT_SECONDS = 75
 STALE_BUSY_WITHOUT_ACTIVE_SECONDS = 90
 SCROLL_NUDGE_AFTER_NO_PROGRESS_SECONDS = 8
 SCROLL_NUDGE_MIN_INTERVAL_SECONDS = 4
-UNSENT_STUCK_SECONDS = 3
 STALL_RECREATE_THRESHOLD = 1
 NETWORK_OUTAGE_PROBE_TIMEOUT_SECONDS = 2.0
 
-# Every request handled by this server gets one small, caller-transparent
-# instruction. The marker lets the server distinguish a usable Gemini answer
-# from a refusal/error message without imposing a response schema on callers.
+# A copied response is usable only when Gemini explicitly confirms it could
+# answer the request. The marker is stripped before returning to callers.
 RESPONSE_MARKER = "response=good"
 DEAD_RESPONSE_SHELL_SECONDS = 5.0
 
@@ -128,21 +125,15 @@ class GeminiWebAutomation:
 
     @staticmethod
     def _strip_response_marker(response: str) -> str:
-        """Remove the transport marker, while preserving clearly structured replies."""
+        """Require and remove the success marker without changing response formatting."""
         normalized = (response or "").strip()
         first_line, separator, remainder = normalized.partition("\n")
-        if first_line.strip().lower() == RESPONSE_MARKER:
-            return remainder.strip() if separator else ""
-
-        if (
-            (normalized.startswith("```") and normalized.endswith("```"))
-            or (normalized.startswith("<json>") and normalized.endswith("</json>"))
-            or (normalized.startswith("{") and normalized.endswith("}"))
-            or (normalized.startswith("[") and normalized.endswith("]"))
-        ):
-            return normalized
-
-        raise ValueError(f"Gemini response missing {RESPONSE_MARKER} marker")
+        if first_line.strip().lower() != RESPONSE_MARKER:
+            raise ValueError(f"Gemini response missing {RESPONSE_MARKER} marker")
+        cleaned = remainder.lstrip("\r\n") if separator else ""
+        if not cleaned.strip():
+            raise ValueError("Gemini returned only the response marker")
+        return cleaned.strip()
 
     @staticmethod
     def _submission_start_signal(
@@ -162,10 +153,11 @@ class GeminiWebAutomation:
         return ""
 
     @staticmethod
-    def _is_dead_response_shell(snapshot: Dict[str, Any], pre_send_resp_count: int) -> bool:
+    def _is_dead_response_shell(snapshot: Dict[str, Any], pre_send_user_query_count: int) -> bool:
         """Detect Gemini's non-copyable terminal shell after a request was accepted."""
         return (
-            int(snapshot.get("response_count") or 0) > pre_send_resp_count
+            int(snapshot.get("user_query_count") or 0) > pre_send_user_query_count
+            and int(snapshot.get("response_count") or 0) > 0
             and str(snapshot.get("phase") or "") == "idle_or_unknown"
             and not bool(snapshot.get("stop_visible"))
             and not bool(snapshot.get("thinking_active"))
@@ -1551,6 +1543,10 @@ class GeminiWebAutomation:
         previous_request_id = self._request_id
         self._request_id = "ready-reset"
         try:
+            snapshot = await self._capture_state_snapshot()
+            if snapshot.get("stop_visible"):
+                log("Ready reset refused: generation is still active", f"Worker {self.worker_id}")
+                return False
             return await self._ensure_fresh_temp_chat()
         finally:
             self._request_id = previous_request_id
@@ -1660,13 +1656,10 @@ class GeminiWebAutomation:
                 prompt = anti_image_inst + prompt
 
         marker_inst = (
-            "If you are able to answer this request, start with exactly:\n"
-            f"{RESPONSE_MARKER}\n\n"
-            "Then continue normally in the format the user requested.\n\n"
+            f"If you can answer, first line exactly {RESPONSE_MARKER}, then one blank line, then answer normally "
+            "in the requested format. If you cannot answer, do not write response=good.\n\n"
         )
-        if not prompt.lstrip().lower().startswith(
-            "if you are able to answer this request, start with exactly:"
-        ):
+        if not prompt.lstrip().lower().startswith("if you can answer, first line exactly response=good"):
             prompt = marker_inst + prompt
 
         log_buffer = []
@@ -1811,7 +1804,6 @@ class GeminiWebAutomation:
             prompt_len = len((filled_text or "").strip())
 
             # 4. Click Send - VERIFIED
-            worker_id = self.worker_id  # Capture for closure
 
             def start_signal_from_snapshot(snap: Dict[str, Any], input_text_len: Optional[int] = None) -> str:
                 send_now = bool(snap.get("send_visible"))
@@ -1835,53 +1827,15 @@ class GeminiWebAutomation:
                 except:
                     return ""
             
-            async def verify_send_worked(before_text, timeout_seconds: float = 1.0):
-                deadline = time.time() + timeout_seconds
-                weak_signal_count = 0
-                while time.time() < deadline:
-                    try:
-                        # Try both contenteditable and textarea access paths.
-                        try:
-                            after_text = await input_area.inner_text()
-                        except:
-                            try:
-                                after_text = await input_area.input_value()
-                            except:
-                                after_text = ""
-
-                        before_len = len(before_text.strip()) if before_text else 0
-                        after_len = len(after_text.strip())
-
-                        snap = await self._capture_state_snapshot()
-                        signal = start_signal_from_snapshot(snap, after_len)
-                        if signal in ("copy_increased", "response_increased", "stop_visible"):
-                            log(
-                                f"Send accepted despite composer retaining text (signal={signal}, input_len={after_len})",
-                                f"Worker {worker_id}",
-                            )
-                            return True
-
-                        weak_signal = before_len == 0 or after_len < before_len / 2 or bool(signal)
-                        weak_signal_count = weak_signal_count + 1 if weak_signal else 0
-                        if weak_signal_count >= 2:
-                            return True
-                    except Exception as e:
-                        log(f"⚠️ Send verification error: {e}", f"Worker {worker_id}")
-                        return False
-
-                    await asyncio.sleep(SEND_VERIFY_POLL_SECONDS)
-
-                log("⚠️ Send failed: composer still contains the prompt", f"Worker {worker_id}")
-                return False
-
-            async def attempt_send_submission(reason: str, before_text: str) -> bool:
-                log(f"Attempting send submission ({reason})", f"Worker {self.worker_id}")
+            async def submit_once() -> bool:
+                """Click Gemini's Send control exactly once for this request."""
+                log("Attempting single send submission", f"Worker {self.worker_id}")
                 try:
                     await self.page.bring_to_front()
                 except:
                     pass
 
-                # Ensure any pending attachment upload spinner has cleared and Send button is active
+                # Ensure any pending attachment upload spinner has cleared and Send is active.
                 await self._wait_for_attachment_upload_complete(15.0)
 
                 try:
@@ -1890,55 +1844,22 @@ class GeminiWebAutomation:
                     pass
 
                 try:
-                    await self.page.keyboard.press("Control+Enter")
-                    if await verify_send_worked(before_text):
-                        log(f"Send submission worked via Ctrl+Enter ({reason})", f"Worker {self.worker_id}")
-                        return True
-                except:
-                    pass
-
-                try:
                     for selector in self._selector_candidates("send_btn"):
                         send_btn = self.page.locator(selector).first
                         if await send_btn.is_visible():
+                            aria_label = (await send_btn.get_attribute("aria-label") or "").lower()
+                            if "stop" in aria_label:
+                                continue
                             await send_btn.click()
-                            if await verify_send_worked(before_text):
-                                log(f"Send submission worked via button ({reason})", f"Worker {self.worker_id}")
-                                return True
+                            log("Single send click dispatched", f"Worker {self.worker_id}")
+                            return True
                 except:
                     pass
 
                 return False
 
-            async def attempt_same_page_resend(reason: str) -> bool:
-                snap = await self._capture_state_snapshot()
-                signal = start_signal_from_snapshot(snap, int(snap.get("input_text_len") or 0))
-                if signal:
-                    log(f"Skipping resend because generation already started (reason={reason}, signal={signal})", f"Worker {self.worker_id}")
-                    return True
-                before_text = await get_input_text()
-                return await attempt_send_submission(reason, before_text)
-            
-            send_before_text = await get_input_text()
-            send_success = await attempt_send_submission("initial_send", send_before_text)
-            
-            if not send_success:
-                snapshot = await self._capture_state_snapshot()
-                late_signal = self._submission_start_signal(
-                    snapshot,
-                    pre_send_count,
-                    pre_send_resp_count,
-                    pre_send_user_query_count,
-                )
-                if late_signal:
-                    log(
-                        f"Send accepted after click verifier timeout (signal={late_signal})",
-                        f"Worker {self.worker_id}",
-                    )
-                    send_success = True
-
-            if not send_success:
-                log("Send button click failed", f"Worker {self.worker_id}")
+            if not await submit_once():
+                log("Send button click failed before dispatch", f"Worker {self.worker_id}")
                 snapshot = await self._capture_state_snapshot()
                 outage = self._get_active_network_outage()
                 if outage:
@@ -1946,58 +1867,55 @@ class GeminiWebAutomation:
                     snapshot.update(outage_diag)
                     self._track_error(outage_error, "send_btn", "send_message", snapshot)
                     return {"success": False, "error": outage_error}
-                self._track_error("Send button click failed", "send_btn", "send_message", snapshot)
-                return {"success": False, "error": "Send button click failed"}
-            
-            # 4.5 Verify generation started using a short observation loop.
-            # This avoids false negatives for very fast responses and avoids
-            # resubmitting when Gemini starts thinking but leaves text in the editor.
+                self._track_error("Send button click failed before dispatch", "send_btn", "send_message", snapshot)
+                return {"success": False, "error": "Send button click failed before dispatch"}
+
+            # 4.5 Observe only. Never submit again from this tab after the click:
+            # Gemini can morph Send into Stop immediately, so a second click can
+            # cancel the generation that just started.
             start_observe_seconds = 6.0
             start_poll_seconds = UI_POLL_SECONDS
             generation_started = False
 
-            for send_attempt in range(MAX_SEND_RETRIES):
-                start_signal = ""
-                weak_start_signal = ""
-                weak_start_count = 0
-                last_snap = None
-                observe_deadline = time.time() + start_observe_seconds
+            start_signal = ""
+            weak_start_signal = ""
+            weak_start_count = 0
+            last_snap = None
+            observe_deadline = time.time() + start_observe_seconds
 
-                while time.time() < observe_deadline:
-                    snap = await self._capture_state_snapshot()
-                    last_snap = snap
-                    outage = self._get_active_network_outage()
-                    if outage:
-                        outage_error, outage_diag = await self._build_network_outage_error()
-                        snap.update(outage_diag)
-                        self._track_error(outage_error, "send_btn", "verify_generation_started", snap)
-                        return {"success": False, "error": outage_error}
-                    input_now = await get_input_text()
-                    input_now_len = len((input_now or "").strip())
-                    start_signal = start_signal_from_snapshot(snap, input_now_len)
-
-                    if start_signal:
-                        if start_signal in ("copy_increased", "response_increased", "stop_visible"):
-                            break
-                        if start_signal == weak_start_signal:
-                            weak_start_count += 1
-                        else:
-                            weak_start_signal = start_signal
-                            weak_start_count = 1
-                        if weak_start_count >= 3:
-                            break
-                    else:
-                        weak_start_signal = ""
-                        weak_start_count = 0
-
-                    await asyncio.sleep(start_poll_seconds)
+            while time.time() < observe_deadline:
+                snap = await self._capture_state_snapshot()
+                last_snap = snap
+                outage = self._get_active_network_outage()
+                if outage:
+                    outage_error, outage_diag = await self._build_network_outage_error()
+                    snap.update(outage_diag)
+                    self._track_error(outage_error, "send_btn", "verify_generation_started", snap)
+                    return {"success": False, "error": outage_error}
+                input_now = await get_input_text()
+                input_now_len = len((input_now or "").strip())
+                start_signal = start_signal_from_snapshot(snap, input_now_len)
 
                 if start_signal:
-                    log(f"✅ Generation started (attempt {send_attempt + 1}, signal={start_signal})", f"Worker {self.worker_id}")
-                    generation_started = True
-                    break
+                    if start_signal in ("copy_increased", "response_increased", "stop_visible"):
+                        break
+                    if start_signal == weak_start_signal:
+                        weak_start_count += 1
+                    else:
+                        weak_start_signal = start_signal
+                        weak_start_count = 1
+                    if weak_start_count >= 3:
+                        break
+                else:
+                    weak_start_signal = ""
+                    weak_start_count = 0
 
-                # No start signals detected: confirm unsent before retrying.
+                await asyncio.sleep(start_poll_seconds)
+
+            if start_signal:
+                log(f"✅ Generation started (signal={start_signal})", f"Worker {self.worker_id}")
+                generation_started = True
+            else:
                 if last_snap is None:
                     last_snap = await self._capture_state_snapshot()
                 send_still_visible = bool(last_snap.get("send_visible"))
@@ -2005,28 +1923,13 @@ class GeminiWebAutomation:
                 input_after_len = len((input_after or "").strip())
                 input_still_present = prompt_len > 0 and input_after_len >= max(1, prompt_len // 2)
                 confirmed_unsent = send_still_visible and input_still_present
-
-                if confirmed_unsent and send_attempt < MAX_SEND_RETRIES - 1:
-                    log(
-                        f"⚠️ Confirmed unsent; retrying send (attempt {send_attempt + 2}/{MAX_SEND_RETRIES})",
-                        f"Worker {self.worker_id}"
-                    )
-                    await attempt_same_page_resend(f"soft_retry_{send_attempt + 2}")
-                    continue
-
                 if not confirmed_unsent:
-                    # Ambiguous state: continue to normal wait path instead of over-retrying.
-                    log("⚠️ Ambiguous start state; proceeding to response wait", f"Worker {self.worker_id}")
+                    log("⚠️ Ambiguous start state; proceeding to response wait without resending", f"Worker {self.worker_id}")
                     generation_started = True
-                    break
 
-                # Confirmed unsent and out of retries.
-                log("Soft send retries failed", f"Worker {self.worker_id}")
-                break
-            
             if not generation_started:
                 snapshot = await self._capture_state_snapshot()
-                err = "Generation did not start after verified send retries"
+                err = "Generation did not start after single send"
                 self._track_error(err, "send_btn", "verify_generation_started", snapshot)
                 return {"success": False, "error": err}
             
@@ -2056,9 +1959,6 @@ class GeminiWebAutomation:
             last_scroll_nudge_at = 0.0
             finalize_attempted = False
             seen_new_response = False
-            unsent_recovery_attempted = False
-            unsent_recovery_at = 0.0
-            last_unsent_check_at = 0.0
             while (time.time() - start_time) < max_wait:
                 outage = self._get_active_network_outage()
                 if outage:
@@ -2121,41 +2021,12 @@ class GeminiWebAutomation:
 
                 if (
                     elapsed_float >= DEAD_RESPONSE_SHELL_SECONDS
-                    and self._is_dead_response_shell(page_snapshot, pre_send_resp_count)
+                    and self._is_dead_response_shell(page_snapshot, pre_send_user_query_count)
                 ):
                     error = "Gemini entered a non-copyable terminal response state"
                     log(f"❌ {error}", f"Worker {self.worker_id}")
                     self._track_error(error, "copy_btn", "wait_for_response_dead_shell", page_snapshot)
                     return {"success": False, "error": error}
-
-                # A transient composer change can look like a successful send.
-                # Re-check the durable state quickly instead of waiting for the
-                # normal ten-second diagnostic interval.
-                if (
-                    elapsed_float >= UNSENT_STUCK_SECONDS
-                    and (now - last_unsent_check_at) >= 0.5
-                    and not page_snapshot.get("stop_visible")
-                    and page_snapshot.get("send_visible")
-                    and int(page_snapshot.get("response_count") or 0) <= pre_send_resp_count
-                ):
-                    last_unsent_check_at = now
-                    input_now = await get_input_text()
-                    input_now_len = len((input_now or "").strip())
-                    prompt_still_present = prompt_len > 0 and input_now_len >= max(1, prompt_len // 2)
-                    if prompt_still_present:
-                        if not unsent_recovery_attempted:
-                            unsent_recovery_attempted = True
-                            unsent_recovery_at = now
-                            log(
-                                f"[{self._request_id}] Prompt remained unsent for {UNSENT_STUCK_SECONDS}s; retrying submission",
-                                f"Worker {self.worker_id}",
-                            )
-                            if await attempt_same_page_resend("unsent_stuck"):
-                                continue
-                        elif (now - unsent_recovery_at) >= UNSENT_STUCK_SECONDS:
-                            error = "Prompt remained unsent after one same-page retry"
-                            self._track_error(error, "send_btn", "wait_for_response_unsent", page_snapshot)
-                            return {"success": False, "error": error}
 
                 if (now - last_wait_log) >= self._wait_log_interval_seconds:
                     snap = page_snapshot
@@ -2463,16 +2334,9 @@ class GeminiWebAutomation:
                 markdown = self._strip_response_marker(markdown)
             except ValueError as marker_error:
                 marker_error_text = str(marker_error)
-                log(f"⚠️ {marker_error_text}; treating response as failed", f"Worker {self.worker_id}")
                 snapshot = await self._capture_state_snapshot()
                 self._track_error(marker_error_text, "copy_btn", "validate_response_marker", snapshot)
-                # Preserve Gemini's original reply for response logs. WorkerPool
-                # will recreate the tab and perform its bounded retry.
                 return {"success": False, "error": marker_error_text, "response": markdown}
-            if not markdown:
-                error = "Gemini returned only the response marker"
-                self._track_error(error, "copy_btn", "validate_response_marker")
-                return {"success": False, "error": error, "response": markdown}
             self._last_request_success = True
             return {"success": True, "response": markdown.strip()}
 

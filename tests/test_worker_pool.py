@@ -76,7 +76,7 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(worker.prepare_calls, 1)
         self.assertTrue(pool._last_ready_reset["ok"])
 
-    async def test_failed_request_recreates_once_then_retries(self):
+    async def test_transport_failure_is_not_resent_inside_pool(self):
         pool = WorkerPool()
         worker = FakeWorker([
             {"success": False, "error": "stalled generation"},
@@ -89,10 +89,31 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
 
         result = await pool.send_message("hello", request_id="retry")
 
+        self.assertFalse(result["success"])
+        self.assertEqual(worker.calls, 1)
+        pool._recreate_worker.assert_not_awaited()
+        pool._notify_final_failure.assert_awaited_once()
+
+    async def test_missing_response_marker_is_retried_once(self):
+        pool = WorkerPool()
+        worker = FakeWorker([
+            {
+                "success": False,
+                "error": "Gemini response missing response=good marker",
+                "response": "```json\n{\"probe\":\"ok\"}\n```",
+            },
+            {"success": True, "response": "expected"},
+        ])
+        pool.workers = [worker]
+        pool._initialized = True
+
+        result = await pool.send_message("hello", request_id="marker-retry")
+
         self.assertTrue(result["success"])
+        self.assertEqual(result["response"], "expected")
+        self.assertEqual(result["attempts"], 2)
         self.assertEqual(worker.calls, 2)
-        pool._recreate_worker.assert_awaited_once()
-        pool._notify_final_failure.assert_not_awaited()
+        self.assertEqual(worker.prepare_calls, 2)
 
     async def test_unrecoverable_ready_reset_marks_pool_unavailable(self):
         pool = WorkerPool()

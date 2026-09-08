@@ -1,3 +1,4 @@
+import inspect
 import unittest
 from unittest.mock import AsyncMock, MagicMock
 
@@ -43,7 +44,7 @@ class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
             ['button[aria-label="Copy"]'],
         )
 
-    def test_response_marker_is_removed_and_structured_markerless_replies_survive(self):
+    def test_response_marker_is_required_and_removed_without_changing_format(self):
         self.assertEqual(
             GeminiWebAutomation._strip_response_marker("response=good\n\nanswer"),
             "answer",
@@ -54,14 +55,8 @@ class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
             ),
             '```json\n{"probe":"ok"}\n```',
         )
-        self.assertEqual(
-            GeminiWebAutomation._strip_response_marker('```json\n{"probe":"ok"}\n```'),
-            '```json\n{"probe":"ok"}\n```',
-        )
-        self.assertEqual(
-            GeminiWebAutomation._strip_response_marker('{"probe":"ok"}'),
-            '{"probe":"ok"}',
-        )
+        with self.assertRaisesRegex(ValueError, "response=good"):
+            GeminiWebAutomation._strip_response_marker('```json\n{"probe":"ok"}\n```')
         with self.assertRaisesRegex(ValueError, "response=good"):
             GeminiWebAutomation._strip_response_marker("Sorry, please try again")
 
@@ -86,9 +81,29 @@ class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
             "stop_visible",
         )
 
+    def test_send_path_never_resubmits_or_uses_ctrl_enter(self):
+        source = inspect.getsource(GeminiWebAutomation.send_message)
+        self.assertNotIn('keyboard.press("Control+Enter")', source)
+        self.assertNotIn("attempt_same_page_resend", source)
+        self.assertNotIn("retrying send", source.lower())
+        self.assertIn("submit_once", source)
+
+    async def test_ready_reset_refuses_to_navigate_active_generation(self):
+        worker = GeminiWebAutomation(worker_id=1)
+        worker._initialized = True
+        worker._generation_in_progress = False
+        worker._capture_state_snapshot = AsyncMock(return_value={"stop_visible": True})
+        worker._ensure_fresh_temp_chat = AsyncMock(return_value=True)
+
+        ready = await worker.prepare_next_request()
+
+        self.assertFalse(ready)
+        worker._ensure_fresh_temp_chat.assert_not_awaited()
+
     def test_dead_response_shell_is_detected_without_waiting_for_full_timeout(self):
         helper = GeminiWebAutomation._is_dead_response_shell
         self.assertTrue(helper({
+            "user_query_count": 1,
             "response_count": 1,
             "phase": "idle_or_unknown",
             "stop_visible": False,
@@ -97,6 +112,7 @@ class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
             "response_copy_count": 0,
         }, 0))
         self.assertFalse(helper({
+            "user_query_count": 1,
             "response_count": 1,
             "phase": "response_streaming",
             "stop_visible": True,
