@@ -23,8 +23,9 @@ LAUNCHER_LOG = LOGS / "launcher.log"
 MAX_PROCESS_LOG_BYTES = 10 * 1024 * 1024
 PORT = 8000
 DOMAIN = "believable-unplagiarised-josette.ngrok-free.dev"
+PUBLIC_ROOT = f"https://{DOMAIN}"
 LOCAL_HEALTH = f"http://127.0.0.1:{PORT}/health"
-PUBLIC_HEALTH = f"https://{DOMAIN}/health"
+PUBLIC_HEALTH = f"{PUBLIC_ROOT}/health"
 
 
 def log(message: str) -> None:
@@ -235,7 +236,7 @@ def run() -> int:
 
         ngrok = start_process(
             "ngrok",
-            ["ngrok", "http", str(PORT), f"--url={DOMAIN}"],
+            ["ngrok", "http", str(PORT), f"--url={PUBLIC_ROOT}"],
             "ngrok.log",
         )
         if not wait_until_healthy(ngrok, PUBLIC_HEALTH, 30):
@@ -259,7 +260,7 @@ def run() -> int:
                 ngrok.stop()
                 ngrok = start_process(
                     "ngrok",
-                    ["ngrok", "http", str(PORT), f"--url={DOMAIN}"],
+                    ["ngrok", "http", str(PORT), f"--url={PUBLIC_ROOT}"],
                     "ngrok.log",
                 )
                 if not wait_until_healthy(ngrok, PUBLIC_HEALTH, 30):
