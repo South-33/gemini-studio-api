@@ -7,3 +7,4 @@ This is the project's AGENTS.md
 - Preserve Windows anti-throttle Chromium flags and capture diagnostics before recreating a failed page.
 - `launcher.py` must remain the foreground owner of API/ngrok/Chromium; detached children break close-to-cleanup behavior.
 - `.browser_session`, `.env`, prompts, screenshots, and runtime logs are private local state and must not be committed.
+- `SOUTH33` / this DevSpace workspace is the development laptop only. Never treat its OS state, processes, Startup folder, scheduled tasks, browser profile, logs, or ports as production evidence. Production is the Windows 10 host reached through SSH alias `southserver`; make code changes on the laptop, commit/push them, then pull and run deployment/runtime checks on `southserver`. Sync code only through Git, never by copying working files between machines.

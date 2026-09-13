@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import os
 import signal
+import shutil
 import subprocess
 import sys
 import time
@@ -18,6 +19,8 @@ from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parent
 LOGS = ROOT / "logs"
+LAUNCHER_LOG = LOGS / "launcher.log"
+MAX_PROCESS_LOG_BYTES = 10 * 1024 * 1024
 PORT = 8000
 DOMAIN = "believable-unplagiarised-josette.ngrok-free.dev"
 LOCAL_HEALTH = f"http://127.0.0.1:{PORT}/health"
@@ -25,7 +28,26 @@ PUBLIC_HEALTH = f"https://{DOMAIN}/health"
 
 
 def log(message: str) -> None:
-    print(f"[{time.strftime('%H:%M:%S')}] {message}", flush=True)
+    line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}"
+    print(line, flush=True)
+    try:
+        LOGS.mkdir(exist_ok=True)
+        with LAUNCHER_LOG.open("a", encoding="utf-8") as output:
+            output.write(line + "\n")
+    except OSError:
+        pass
+
+
+def rotate_log(path: Path) -> None:
+    """Keep long-running process logs bounded without touching request records."""
+    try:
+        if not path.exists() or path.stat().st_size < MAX_PROCESS_LOG_BYTES:
+            return
+        backup = path.with_suffix(path.suffix + ".1")
+        backup.unlink(missing_ok=True)
+        path.replace(backup)
+    except OSError:
+        pass
 
 
 def enable_kill_on_close_job() -> object | None:
@@ -126,7 +148,9 @@ class ManagedProcess:
 
 def start_process(name: str, command: list[str], log_name: str) -> ManagedProcess:
     LOGS.mkdir(exist_ok=True)
-    output = (LOGS / log_name).open("a", encoding="utf-8")
+    log_path = LOGS / log_name
+    rotate_log(log_path)
+    output = log_path.open("a", encoding="utf-8")
     output.write(f"\n{'=' * 60}\n{name} launch {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
     output.flush()
     flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
@@ -189,6 +213,13 @@ def stop_existing_service_processes() -> None:
 
 def run() -> int:
     load_dotenv(ROOT / ".env")
+    log("Launcher starting")
+    if shutil.which("ngrok") is None:
+        log("ngrok was not found on PATH; install/configure ngrok before starting the server")
+        return 1
+    if not (ROOT / ".browser_session").exists():
+        log("No .browser_session profile found; Chromium will require a first-time Gemini sign-in")
+
     job = enable_kill_on_close_job()
     if job:
         log("Process-tree cleanup enabled; closing this terminal stops everything")
@@ -204,7 +235,7 @@ def run() -> int:
 
         ngrok = start_process(
             "ngrok",
-            ["ngrok", "http", str(PORT), f"--domain={DOMAIN}"],
+            ["ngrok", "http", str(PORT), f"--url={DOMAIN}"],
             "ngrok.log",
         )
         if not wait_until_healthy(ngrok, PUBLIC_HEALTH, 30):
@@ -228,7 +259,7 @@ def run() -> int:
                 ngrok.stop()
                 ngrok = start_process(
                     "ngrok",
-                    ["ngrok", "http", str(PORT), f"--domain={DOMAIN}"],
+                    ["ngrok", "http", str(PORT), f"--url={DOMAIN}"],
                     "ngrok.log",
                 )
                 if not wait_until_healthy(ngrok, PUBLIC_HEALTH, 30):

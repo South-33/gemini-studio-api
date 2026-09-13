@@ -14,15 +14,27 @@ transport/browser failures are returned instead of silently resending prompts.
    playwright install chromium
    ```
 
-2. Run `python main.py` and sign in to Gemini in the opened browser. Copy
-   `.env.example` to `.env` only if Discord failure alerts are wanted.
+2. On the Windows server, run `python main.py` once and sign in to Gemini in the
+   opened browser. Copy `.env.example` to `.env` only if Discord failure alerts
+   are wanted. The login profile is stored in `.browser_session/` and must never
+   be committed.
 
-3. On the Windows server, run `autostart.bat`. Its foreground supervisor owns
-   the API, Chromium, and ngrok as one process tree. Press Ctrl+C once or close
-   the terminal to stop all of them. Output is written to `logs\server.log`
-   and `logs\ngrok.log`.
+3. Install the server auto-start task once:
 
-The login profile is stored in `.browser_session/` and must never be committed.
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\ops\windows\install_autostart.ps1
+   ```
+
+   The task runs `autostart.bat` whenever the server user signs in and restarts
+   the supervisor if it crashes. `launcher.py` owns the API, Chromium, and ngrok
+   as one process tree. The installer removes the old Startup-folder shortcut so
+   there is only one startup owner. Manual runs can still use `autostart.bat`
+   directly.
+
+Headed Chromium needs an interactive Windows desktop, so auto-start happens at
+sign-in rather than in a SYSTEM boot task. For a completely unattended reboot,
+Windows must also be configured to sign the server account in automatically.
+No Windows credentials belong in this repository.
 
 ## API
 
@@ -75,8 +87,12 @@ or used.
 
 - `tools\stress_test.html` submits concurrent queue checks. It remembers the last API
   root and is preloaded with the production tunnel.
+- `Get-ScheduledTask -TaskName 'Gemini Studio API'` shows the installed startup
+  task. Re-run `ops\windows\install_autostart.ps1` after moving the repository.
+- Check `logs\launcher.log` for supervisor startup/restart failures.
 - Check `logs\server.log` for the live API/browser stream and `logs\ngrok.log`
-  for tunnel events.
+  for tunnel events. Process logs rotate at 10 MiB; structured request records
+  have their own retention policy below.
 - `logs\requests\request_*.json` is the canonical diagnostic history. Every
   browser attempt stores the complete caller prompt and Gemini response, caller
   project/client metadata, model/thinking settings, whether Search was requested
@@ -91,7 +107,7 @@ or used.
   transaction bundle under `logs\`; these are supporting artifacts, while the
   structured request-attempt record remains the primary history.
 - If disconnecting RDP suspends Chromium, run `ops\windows\disconnect_rdp.bat`
-  or use `ops\windows\install_virtual_display.ps1`.
+  before closing the RDP client so the session is transferred to the console.
 - Healthy idle tabs are never refreshed because of age or request count.
 
 Gemini's maintained UI inventory is [GEMINI_WEBSITE.md](GEMINI_WEBSITE.md).
