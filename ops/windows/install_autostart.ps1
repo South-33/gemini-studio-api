@@ -19,6 +19,20 @@ if ($existingTask) {
     Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
 }
 
+# A previously detached launcher can outlive the scheduled-task registration
+# long enough to keep the single-instance mutex.  Stop any launcher that owns
+# this repo before registering the new task so the replacement can start cleanly.
+$launcherPattern = [Regex]::Escape($launcher)
+Get-CimInstance Win32_Process |
+    Where-Object {
+        $_.Name -match '^python(w)?\.exe$' -and
+        $_.CommandLine -match $launcherPattern
+    } |
+    ForEach-Object {
+        Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+Start-Sleep -Milliseconds 750
+
 # Gemini uses headed Chromium, so this task must run inside the signed-in user's
 # interactive desktop session. A machine-startup/SYSTEM task would launch the
 # browser in session 0 where it cannot be used by the automation.
