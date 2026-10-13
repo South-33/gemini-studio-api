@@ -795,8 +795,8 @@ class GeminiWebAutomation:
                         'div[role="textbox"][contenteditable="true"], ' +
                         '.ql-editor[role="textbox"], .ql-editor'
                     )).find(isVisible) || null;
-                    const inputPlaceholder = inputBox ((inputBox.getAttribute('data-placeholder') || '').trim()) : '';
-                    const inputText = inputBox ((inputBox.innerText || inputBox.textContent || '').trim()) : '';
+                    const inputPlaceholder = inputBox ? ((inputBox.getAttribute('data-placeholder') || '').trim()) : '';
+                    const inputText = inputBox ? ((inputBox.innerText || inputBox.textContent || '').trim()) : '';
 
                     let responses = document.querySelectorAll('[data-content-type="response"]');
                     if (!responses.length) responses = document.querySelectorAll('model-response, assistant-message-content');
@@ -804,10 +804,10 @@ class GeminiWebAutomation:
                     const emptyChat = document.querySelector('modular-zero-state, zero-state, bard-zero-state');
                     const overlay = document.querySelector('.cdk-overlay-backdrop');
                     const activeElement = document.activeElement;
-                    const last = responses.length responses[responses.length - 1] : null;
-                    const lastText = last (last.innerText || '') : '';
+                    const last = responses.length ? responses[responses.length - 1] : null;
+                    const lastText = last ? (last.innerText || '') : '';
                     const responseCopyButtons = last
-                        Array.from(last.querySelectorAll('button[aria-label="Copy"]')).filter(isVisible)
+                        ? Array.from(last.querySelectorAll('button[aria-label="Copy"]')).filter(isVisible)
                         : [];
                     const inputCopyButtons = Array.from(document.querySelectorAll('button[aria-label="Copy prompt"]')).filter(isVisible);
                     const thinkingOverlay = (last && last.querySelector('thinking-overlay')) || document.querySelector('thinking-overlay');
@@ -815,13 +815,13 @@ class GeminiWebAutomation:
                     const thinkingActive = thinkingMounted && !!(
                         thinkingOverlay.querySelector('thinking-dots-animation, .thinking-dots-animation, .thinking-container')
                     );
-                    const thinkingLabel = thinkingOverlay (thinkingOverlay.innerText || '').trim().slice(0, 120) : '';
+                    const thinkingLabel = thinkingOverlay ? (thinkingOverlay.innerText || '').trim().slice(0, 120) : '';
                     const thinkingVisible = thinkingActive || thinkingLabel.length > 0;
                     const thinkingLen = thinkingLabel.length;
 
                     // Extract actual response body text (ignoring thinking status overlay)
-                    const msgContentEl = last last.querySelector('message-content') : null;
-                    const responseBodyText = msgContentEl (msgContentEl.innerText || msgContentEl.textContent || '') : '';
+                    const msgContentEl = last ? last.querySelector('message-content') : null;
+                    const responseBodyText = msgContentEl ? (msgContentEl.innerText || msgContentEl.textContent || '') : '';
                     
                     let responseBodyLen = 0;
                     if (msgContentEl) {
@@ -842,7 +842,7 @@ class GeminiWebAutomation:
                     if (responseCopyButtons.length > 0) {
                         phase = 'response_copyable_postprocessing';
                     } else if (stopBtn) {
-                        phase = thinkingVisible && responseBodyLen < 120 'thinking_only' : 'response_streaming';
+                        phase = thinkingVisible && responseBodyLen < 120 ? 'thinking_only' : 'response_streaming';
                     } else if (responseVisible) {
                         phase = 'response_complete_postprocessing';
                     }
