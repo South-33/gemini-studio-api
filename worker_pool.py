@@ -144,7 +144,7 @@ class WorkerPool:
             return success
 
     async def _recreate_browser_context(self, reason: str) -> bool:
-        """Restart the single persistent Chromium context while preserving its profile."""
+        """Restart Playwright + the single persistent Chromium context, preserving the profile."""
         async with self._recovery_lock:
             success = False
             try:
@@ -163,6 +163,19 @@ class WorkerPool:
                     finally:
                         self.context = None
 
+                if self.playwright:
+                    try:
+                        await self.playwright.stop()
+                    except Exception as exc:
+                        log(f"Old Playwright close warning: {exc}", "Worker")
+                    finally:
+                        self.playwright = None
+
+                # Windows can hold the persistent-profile lock briefly after
+                # Chromium exits. Give it a moment before reopening the same
+                # profile under a fresh Playwright driver connection.
+                await asyncio.sleep(1.0)
+                self.playwright = await async_playwright().start()
                 self.context = await self._launch_browser_context()
                 page = await self._replace_restored_pages()
                 new_worker = await self._initialize_page(page)
