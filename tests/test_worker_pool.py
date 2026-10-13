@@ -209,6 +209,7 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
     def test_known_gemini_error_replies_are_transient(self):
         for response in (
             "I'm having a hard time fulfilling your request. Can I help with something else instead?",
+            "I'm having a hard time fulfilling your request. Can I help you with something else instead?",
             "I encountered an error doing what you asked. Could you try again?",
             "I seem to be encountering an error. Can I try something else for you?",
         ):

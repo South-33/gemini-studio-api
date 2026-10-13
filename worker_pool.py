@@ -181,8 +181,10 @@ class WorkerPool:
     @staticmethod
     def _is_transient_gemini_refusal(response: str) -> bool:
         normalized = " ".join((response or "").strip().lower().split())
-        return normalized in {
-            "i'm having a hard time fulfilling your request. can i help with something else instead?",
+        return (
+            normalized.startswith("i'm having a hard time fulfilling your request.")
+            and "something else instead?" in normalized
+        ) or normalized in {
             "i encountered an error doing what you asked. could you try again?",
             "i seem to be encountering an error. can i try something else for you?",
         }
