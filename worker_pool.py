@@ -150,14 +150,9 @@ class WorkerPool:
 
     @staticmethod
     def _is_retryable_response_rejection(result: Dict) -> bool:
-        """Retry once only when Gemini answered but did not confirm a usable response."""
-        error = str(result.get("error") or "").strip().lower()
+        """Retry once only for Gemini's concrete transient refusal."""
         response = str(result.get("response") or "")
-        return (
-            "missing response=good marker" in error
-            or "returned only the response marker" in error
-            or WorkerPool._is_transient_gemini_refusal(response)
-        )
+        return WorkerPool._is_transient_gemini_refusal(response)
 
     async def send_message(
         self,

@@ -92,27 +92,6 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(worker.calls, 1)
         pool._recreate_worker.assert_not_awaited()
 
-    async def test_missing_response_marker_is_retried_once(self):
-        pool = WorkerPool()
-        worker = FakeWorker([
-            {
-                "success": False,
-                "error": "Gemini response missing response=good marker",
-                "response": "```json\n{\"probe\":\"ok\"}\n```",
-            },
-            {"success": True, "response": "expected"},
-        ])
-        pool.workers = [worker]
-        pool._initialized = True
-
-        result = await pool.send_message("hello", request_id="marker-retry")
-
-        self.assertTrue(result["success"])
-        self.assertEqual(result["response"], "expected")
-        self.assertEqual(result["attempts"], 2)
-        self.assertEqual(worker.calls, 2)
-        self.assertEqual(worker.prepare_calls, 2)
-
     async def test_unrecoverable_ready_reset_marks_pool_unavailable(self):
         pool = WorkerPool()
         worker = FakeWorker(prepare_ok=False)

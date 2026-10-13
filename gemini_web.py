@@ -65,9 +65,6 @@ SCROLL_NUDGE_MIN_INTERVAL_SECONDS = 4
 STALL_RECREATE_THRESHOLD = 1
 NETWORK_OUTAGE_PROBE_TIMEOUT_SECONDS = 2.0
 
-# A copied response is usable only when Gemini explicitly confirms it could
-# answer the request. The marker is stripped before returning to callers.
-RESPONSE_MARKER = "response=good"
 DEAD_RESPONSE_SHELL_SECONDS = 5.0
 
 
@@ -121,18 +118,6 @@ class GeminiWebAutomation:
         if cls._clipboard_lock is None:
             cls._clipboard_lock = asyncio.Lock()
         return cls._clipboard_lock
-
-    @staticmethod
-    def _strip_response_marker(response: str) -> str:
-        """Require and remove the success marker without changing response formatting."""
-        normalized = (response or "").strip()
-        first_line, separator, remainder = normalized.partition("\n")
-        if first_line.strip().lower() != RESPONSE_MARKER:
-            raise ValueError(f"Gemini response missing {RESPONSE_MARKER} marker")
-        cleaned = remainder.lstrip("\r\n") if separator else ""
-        if not cleaned.strip():
-            raise ValueError("Gemini returned only the response marker")
-        return cleaned.strip()
 
     @staticmethod
     def _submission_start_signal(
@@ -1202,22 +1187,6 @@ class GeminiWebAutomation:
         if not self._initialized: 
             return {"success": False, "error": "Not initialized"}
 
-        # Prepend instruction to prevent accidental image generation on text-only prompts
-        if not images:
-            anti_image_inst = (
-                "IMPORTANT: Do NOT generate or create any images. "
-                "Respond ONLY with text/data. Do not attempt to draw, paint, or generate any visual output.\n\n"
-            )
-            if not prompt.strip().startswith("IMPORTANT: Do NOT generate or create any images"):
-                prompt = anti_image_inst + prompt
-
-        marker_inst = (
-            f"If you can answer, first line exactly {RESPONSE_MARKER}, then one blank line, then answer normally "
-            "in the requested format. If you cannot answer, do not write response=good.\n\n"
-        )
-        if not prompt.lstrip().lower().startswith("if you can answer, first line exactly response=good"):
-            prompt = marker_inst + prompt
-
         log_buffer = []
         self._request_log_lines = log_buffer
         token = current_request_log_buffer.set(log_buffer)
@@ -1816,30 +1785,12 @@ class GeminiWebAutomation:
                             pre_send_count,
                         )
                         if recovered_text:
-                            try:
-                                cleaned_recovered = self._strip_response_marker(recovered_text)
-                            except ValueError as marker_error:
-                                marker_error_text = str(marker_error)
-                                self._track_error(
-                                    marker_error_text,
-                                    "copy_btn",
-                                    "validate_recovered_response_marker",
-                                    snap,
-                                )
-                                return {
-                                    "success": False,
-                                    "error": marker_error_text,
-                                    "response": recovered_text,
-                                    "raw_response": recovered_text,
-                                    "response_marker_ok": False,
-                                }
                             log("Recovered stalled generation via finalize path", f"Worker {self.worker_id}")
                             self._last_request_success = True
                             return {
                                 "success": True,
-                                "response": cleaned_recovered,
+                                "response": recovered_text.strip(),
                                 "raw_response": recovered_text,
-                                "response_marker_ok": True,
                             }
 
                         error_snapshot = dict(snap)
@@ -1901,26 +1852,11 @@ class GeminiWebAutomation:
                 f"✅ Response: chars={out_chars}, tokens_est={out_tokens_est}",
                 f"Worker {self.worker_id}",
             )
-            raw_markdown = markdown
-            try:
-                markdown = self._strip_response_marker(raw_markdown)
-            except ValueError as marker_error:
-                marker_error_text = str(marker_error)
-                snapshot = await self._capture_state_snapshot()
-                self._track_error(marker_error_text, "copy_btn", "validate_response_marker", snapshot)
-                return {
-                    "success": False,
-                    "error": marker_error_text,
-                    "response": raw_markdown,
-                    "raw_response": raw_markdown,
-                    "response_marker_ok": False,
-                }
             self._last_request_success = True
             return {
                 "success": True,
                 "response": markdown.strip(),
-                "raw_response": raw_markdown,
-                "response_marker_ok": True,
+                "raw_response": markdown,
             }
 
         except Exception as e:

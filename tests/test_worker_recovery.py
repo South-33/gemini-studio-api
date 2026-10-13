@@ -54,22 +54,6 @@ class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
             ['button[aria-label="Copy"]'],
         )
 
-    def test_response_marker_is_required_and_removed_without_changing_format(self):
-        self.assertEqual(
-            GeminiWebAutomation._strip_response_marker("response=good\n\nanswer"),
-            "answer",
-        )
-        self.assertEqual(
-            GeminiWebAutomation._strip_response_marker(
-                'response=good\n```json\n{"probe":"ok"}\n```'
-            ),
-            '```json\n{"probe":"ok"}\n```',
-        )
-        with self.assertRaisesRegex(ValueError, "response=good"):
-            GeminiWebAutomation._strip_response_marker('```json\n{"probe":"ok"}\n```')
-        with self.assertRaisesRegex(ValueError, "response=good"):
-            GeminiWebAutomation._strip_response_marker("Sorry, please try again")
-
     def test_submission_signal_accepts_late_ui_evidence_after_click_timeout(self):
         helper = GeminiWebAutomation._submission_start_signal
         self.assertEqual(

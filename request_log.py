@@ -108,7 +108,6 @@ def write_request_log(
             "response": response,
             "raw_response_chars": len(raw_response),
             "raw_response": raw_response,
-            "response_marker_ok": result.get("response_marker_ok"),
             "retryable_response_rejection": bool(retryable),
             "will_retry": bool(will_retry),
             "ready_for_next_request": ready_for_next_request,

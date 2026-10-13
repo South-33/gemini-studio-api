@@ -49,10 +49,10 @@ Last validated on 2026-10-13.
 
 Each request starts from a verified clean `/app` chat. Long prompts (1,500+
 characters) are attached as `prompt.txt` to avoid freezing the editor.
-`use_search: true` adds an explicit Search instruction. The worker asks Gemini
-to begin usable answers with `response=good`, strips that marker before return,
-and retries once only when Gemini produced an unusable response. Browser or
-transport failures are not silently resent.
+`use_search: true` adds an explicit Search instruction. Caller prompts are sent
+without hidden marker or anti-image instructions. The worker retries once only
+for Gemini's known transient refusal message. Browser or transport failures are
+not silently resent.
 
 ## Install and production startup
 

@@ -73,8 +73,8 @@ class RequestLogTests(unittest.TestCase):
 
     def test_failure_and_retry_decision_are_recorded(self):
         path = self.save(
-            "markerless",
-            result={"success": False, "error": "Gemini response missing response=good marker", "response": "markerless"},
+            "temporary refusal",
+            result={"success": False, "error": "Transient Gemini refusal", "response": "temporary refusal"},
             retryable=True,
             will_retry=True,
             ready_for_next_request=True,
@@ -83,7 +83,7 @@ class RequestLogTests(unittest.TestCase):
         self.assertFalse(saved["outcome"]["automation_success"])
         self.assertTrue(saved["outcome"]["retryable_response_rejection"])
         self.assertTrue(saved["outcome"]["will_retry"])
-        self.assertEqual(saved["outcome"]["response"], "markerless")
+        self.assertEqual(saved["outcome"]["response"], "temporary refusal")
 
     def test_retention_keeps_newest_complete_records(self):
         with patch.object(request_log, "MAX_FILES", 2):
