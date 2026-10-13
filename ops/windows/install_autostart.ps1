@@ -35,9 +35,11 @@ $settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
     -ExecutionTimeLimit ([TimeSpan]::Zero) `
-    -RestartCount 999 `
-    -RestartInterval (New-TimeSpan -Minutes 1) `
     -MultipleInstances IgnoreNew
+
+# Task Scheduler only bootstraps the foreground launcher at sign-in. The
+# launcher itself owns API/ngrok health and restarts; a second task-level
+# restart policy can tear down an in-flight Gemini request.
 
 Register-ScheduledTask `
     -TaskName $taskName `
