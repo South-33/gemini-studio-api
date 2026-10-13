@@ -81,8 +81,7 @@ class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("attempt_same_page_resend", source)
         self.assertNotIn("retrying send", source.lower())
         self.assertIn("submit_once", source)
-        self.assertIn('input_area.press("Enter")', source)
-        self.assertIn('thinking_level or "Medium"', source)
+        self.assertIn("use_enter = False", source)
 
     def test_short_prompt_path_uses_clipboard_paste_not_fill(self):
         source = inspect.getsource(GeminiWebAutomation._prepare_and_enter_prompt)

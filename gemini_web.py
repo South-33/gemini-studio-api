@@ -1356,10 +1356,7 @@ class GeminiWebAutomation:
             
             async def submit_once() -> bool:
                 """Submit exactly once using the interaction proven for this model family."""
-                use_enter = (
-                    (model or "").strip().lower() == "flash"
-                    and (thinking_level or "Medium").strip().lower() != "high"
-                )
+                use_enter = False
                 log(
                     f"Attempting single {'Enter-key' if use_enter else 'Send-button'} submission",
                     f"Worker {self.worker_id}",
@@ -1379,9 +1376,7 @@ class GeminiWebAutomation:
 
                 try:
                     # Verify Gemini considers the request sendable, then submit
-                    # exactly once. Flash Medium is reliable through composer
-                    # Enter; Flash High, Flash-Lite, and Pro use the visible
-                    # Send control.
+                    # exactly once through Gemini's visible Send control.
                     for selector in self._selector_candidates("send_btn"):
                         send_btn = self.page.locator(selector).first
                         if await send_btn.is_visible():
