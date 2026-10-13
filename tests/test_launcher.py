@@ -29,6 +29,29 @@ class LauncherLogTests(unittest.TestCase):
 
 @unittest.skipUnless(os.name == "nt", "Windows Job Objects are Windows-only")
 class LauncherTests(unittest.TestCase):
+    def test_tunnel_monitor_defers_probe_failures_during_active_request(self):
+        self.assertFalse(
+            launcher.should_restart_tunnel(
+                process_exited=False,
+                failures=launcher.PUBLIC_HEALTH_FAILURE_LIMIT,
+                active_request=True,
+            )
+        )
+        self.assertTrue(
+            launcher.should_restart_tunnel(
+                process_exited=False,
+                failures=launcher.PUBLIC_HEALTH_FAILURE_LIMIT,
+                active_request=False,
+            )
+        )
+        self.assertTrue(
+            launcher.should_restart_tunnel(
+                process_exited=True,
+                failures=0,
+                active_request=True,
+            )
+        )
+
     def test_launcher_mutex_allows_only_one_owner(self):
         mutex_name = rf"Local\GeminiStudioAPITest-{uuid.uuid4()}"
         owner_code = (

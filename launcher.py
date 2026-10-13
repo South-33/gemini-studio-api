@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import json
 import os
 import signal
 import shutil
@@ -25,6 +26,7 @@ LOCAL_HEALTH = f"http://127.0.0.1:{PORT}/health"
 PUBLIC_HEALTH = f"{PUBLIC_ROOT}/health"
 LAUNCHER_MUTEX_NAME = r"Local\GeminiStudioAPILauncher"
 LOCAL_HEALTH_FAILURE_LIMIT = 3
+PUBLIC_HEALTH_FAILURE_LIMIT = 3
 
 
 def log(message: str) -> None:
@@ -203,6 +205,26 @@ def healthy(url: str, timeout: float = 4) -> bool:
         return False
 
 
+def health_payload(url: str, timeout: float = 4) -> dict | None:
+    """Return a successful JSON health payload, or None when unavailable."""
+    try:
+        request = urllib.request.Request(url, headers={"ngrok-skip-browser-warning": "1"})
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            if response.status != 200:
+                return None
+            payload = json.load(response)
+            return payload if isinstance(payload, dict) else None
+    except Exception:
+        return None
+
+
+def should_restart_tunnel(process_exited: bool, failures: int, active_request: bool) -> bool:
+    """Never tear down a live tunnel merely because probes fail during a request."""
+    return process_exited or (
+        not active_request and failures >= PUBLIC_HEALTH_FAILURE_LIMIT
+    )
+
+
 def wait_until_healthy(process: ManagedProcess, url: str, seconds: int) -> bool:
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
@@ -280,10 +302,13 @@ def run() -> int:
         log("Press Ctrl+C once, or close this window, to stop all services")
 
         local_health_failures = 0
+        public_health_failures = 0
         while True:
             time.sleep(10)
             api_exited = api.process.poll() is not None
-            local_ok = False if api_exited else healthy(LOCAL_HEALTH)
+            local_payload = None if api_exited else health_payload(LOCAL_HEALTH)
+            local_ok = local_payload is not None
+            active_request = bool(local_payload and local_payload.get("active_request"))
             local_health_failures = 0 if local_ok else local_health_failures + 1
             if api_exited or local_health_failures >= LOCAL_HEALTH_FAILURE_LIMIT:
                 log("API or Gemini worker unhealthy; restarting API...")
@@ -292,7 +317,20 @@ def run() -> int:
                 if not wait_until_healthy(api, LOCAL_HEALTH, 120):
                     log("API restart failed; retrying on the next monitor cycle")
                 local_health_failures = 0
-            if ngrok.process.poll() is not None or not healthy(PUBLIC_HEALTH):
+
+            ngrok_exited = ngrok.process.poll() is not None
+            if ngrok_exited:
+                public_health_failures = PUBLIC_HEALTH_FAILURE_LIMIT
+            elif active_request:
+                # A public probe can transiently fail while ngrok is carrying a
+                # long completion. Do not make the monitor compete with the
+                # caller for the same tunnel or tear down that connection.
+                public_health_failures = 0
+            else:
+                public_ok = healthy(PUBLIC_HEALTH)
+                public_health_failures = 0 if public_ok else public_health_failures + 1
+
+            if should_restart_tunnel(ngrok_exited, public_health_failures, active_request):
                 log("Tunnel unhealthy; restarting ngrok...")
                 ngrok.stop()
                 ngrok = start_process(
@@ -302,6 +340,7 @@ def run() -> int:
                 )
                 if not wait_until_healthy(ngrok, PUBLIC_HEALTH, 30):
                     log("Tunnel restart failed; retrying on the next monitor cycle")
+                public_health_failures = 0
     except KeyboardInterrupt:
         log("Shutdown requested")
         return 0
