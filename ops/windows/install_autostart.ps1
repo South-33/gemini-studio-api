@@ -1,12 +1,23 @@
 $ErrorActionPreference = 'Stop'
 
 $taskName = 'Gemini Studio API'
+$legacyTaskNames = @('GeminiStudioAPI')
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $autostart = Join-Path $repoRoot 'autostart.bat'
 $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 
 if (-not (Test-Path $autostart)) {
     throw "Could not find $autostart"
+}
+
+# Older installs used a second task name. If it remains registered, both tasks
+# launch at sign-in and race over the same API port/browser profile.
+foreach ($legacyTaskName in $legacyTaskNames) {
+    $legacyTask = Get-ScheduledTask -TaskName $legacyTaskName -ErrorAction SilentlyContinue
+    if ($legacyTask) {
+        Stop-ScheduledTask -TaskName $legacyTaskName -ErrorAction SilentlyContinue
+        Unregister-ScheduledTask -TaskName $legacyTaskName -Confirm:$false
+    }
 }
 
 # Gemini uses headed Chromium, so this task must run inside the signed-in user's

@@ -26,6 +26,7 @@ DOMAIN = "believable-unplagiarised-josette.ngrok-free.dev"
 PUBLIC_ROOT = f"https://{DOMAIN}"
 LOCAL_HEALTH = f"http://127.0.0.1:{PORT}/health"
 PUBLIC_HEALTH = f"{PUBLIC_ROOT}/health"
+LAUNCHER_MUTEX_NAME = r"Local\GeminiStudioAPILauncher"
 
 
 def log(message: str) -> None:
@@ -49,6 +50,35 @@ def rotate_log(path: Path) -> None:
         path.replace(backup)
     except OSError:
         pass
+
+
+def acquire_launcher_mutex(name: str = LAUNCHER_MUTEX_NAME) -> object | None:
+    """Acquire the per-session Windows launcher mutex, or return None if owned."""
+    if os.name != "nt":
+        return object()
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+    kernel32.CreateMutexW.restype = ctypes.c_void_p
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+
+    handle = kernel32.CreateMutexW(None, False, name)
+    if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+        kernel32.CloseHandle(ctypes.c_void_p(handle))
+        return None
+    return handle
+
+
+def close_launcher_mutex(handle: object | None) -> None:
+    if os.name != "nt" or not handle:
+        return
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    kernel32.CloseHandle(ctypes.c_void_p(handle))
 
 
 def enable_kill_on_close_job() -> object | None:
@@ -215,8 +245,13 @@ def stop_existing_service_processes() -> None:
 def run() -> int:
     load_dotenv(ROOT / ".env")
     log("Launcher starting")
+    launcher_mutex = acquire_launcher_mutex()
+    if launcher_mutex is None:
+        log("Another launcher already owns this desktop session; exiting")
+        return 0
     if shutil.which("ngrok") is None:
         log("ngrok was not found on PATH; install/configure ngrok before starting the server")
+        close_launcher_mutex(launcher_mutex)
         return 1
     if not (ROOT / ".browser_session").exists():
         log("No .browser_session profile found; Chromium will require a first-time Gemini sign-in")
@@ -273,6 +308,7 @@ def run() -> int:
             ngrok.stop()
         if api:
             api.stop()
+        close_launcher_mutex(launcher_mutex)
 
 
 if __name__ == "__main__":

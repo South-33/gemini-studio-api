@@ -4,6 +4,7 @@ import sys
 import tempfile
 import time
 import unittest
+import uuid
 from pathlib import Path
 from unittest.mock import patch
 
@@ -28,6 +29,42 @@ class LauncherLogTests(unittest.TestCase):
 
 @unittest.skipUnless(os.name == "nt", "Windows Job Objects are Windows-only")
 class LauncherTests(unittest.TestCase):
+    def test_launcher_mutex_allows_only_one_owner(self):
+        mutex_name = rf"Local\GeminiStudioAPITest-{uuid.uuid4()}"
+        owner_code = (
+            "import launcher, sys, time; "
+            "handle = launcher.acquire_launcher_mutex(sys.argv[1]); "
+            "print('owned' if handle else 'blocked', flush=True); "
+            "time.sleep(30)"
+        )
+        owner = subprocess.Popen(
+            [sys.executable, "-c", owner_code, mutex_name],
+            cwd=os.path.dirname(os.path.dirname(__file__)),
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            self.assertEqual(owner.stdout.readline().strip(), "owned")
+            contender = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import launcher, sys; print('owned' if launcher.acquire_launcher_mutex(sys.argv[1]) else 'blocked')",
+                    mutex_name,
+                ],
+                cwd=os.path.dirname(os.path.dirname(__file__)),
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=True,
+            )
+            self.assertEqual(contender.stdout.strip(), "blocked")
+        finally:
+            owner.kill()
+            owner.wait(timeout=5)
+            if owner.stdout:
+                owner.stdout.close()
+
     def test_job_owner_exit_kills_descendant_process(self):
         owner_code = (
             "import launcher, subprocess, sys, time; "
