@@ -1061,10 +1061,14 @@ class GeminiWebAutomation:
             and not snap.get("error_page_500")
         )
 
-    async def _ensure_fresh_chat(self) -> bool:
+    async def _ensure_fresh_chat(self, force_navigation: bool = False) -> bool:
         """Ensure the page is the current Gemini /app with an empty composer."""
         baseline = await self._capture_state_snapshot()
-        if self._is_fresh_chat_ready(baseline) and self.page.url.rstrip("/").endswith("gemini.google.com/app"):
+        if (
+            not force_navigation
+            and self._is_fresh_chat_ready(baseline)
+            and self.page.url.rstrip("/").endswith("gemini.google.com/app")
+        ):
             return True
 
         try:
@@ -1259,6 +1263,7 @@ class GeminiWebAutomation:
 
             # 2. Select Model and Thinking Level
             if model or thinking_level:
+                configuration_changed = False
                 # First check the current active UI configuration
                 ui_model, ui_thinking = await self._get_current_ui_model_and_thinking()
                 
@@ -1266,6 +1271,7 @@ class GeminiWebAutomation:
                 # stable families (Pro/Flash/Lite), not changing version text.
                 if model and (not ui_model or not self._matches_model(ui_model, model)):
                     selected = await self._select_model(model)
+                    configuration_changed = bool(selected)
                     # Selecting a model can also reset reasoning; re-read both.
                     ui_model, ui_thinking = await self._get_current_ui_model_and_thinking()
                     if not selected or not ui_model or not self._matches_model(ui_model, model):
@@ -1285,6 +1291,7 @@ class GeminiWebAutomation:
                 target_thinking = thinking_level or "Medium"
                 if target_thinking and ui_thinking != target_thinking:
                     await self._set_thinking_level(target_thinking)
+                    configuration_changed = True
                     _, verified_thinking = await self._get_current_ui_model_and_thinking()
                     if verified_thinking != target_thinking:
                         err = f"Requested thinking {target_thinking!r} but Gemini UI is {verified_thinking or 'unknown'!r}"
@@ -1293,6 +1300,26 @@ class GeminiWebAutomation:
                     ui_thinking = verified_thinking
                 if ui_thinking:
                     self._current_selected_thinking_level = ui_thinking
+
+                # Gemini can visually switch model/reasoning on an already-open
+                # blank chat while the underlying generation session remains
+                # bound to the previous configuration.  After any picker change,
+                # create a new /app chat and verify the requested configuration
+                # persisted before entering the prompt.
+                if configuration_changed:
+                    if not await self._ensure_fresh_chat(force_navigation=True):
+                        return {"success": False, "error": "Fresh chat after model/thinking change not confirmed"}
+                    settled_model, settled_thinking = await self._get_current_ui_model_and_thinking()
+                    if model and (not settled_model or not self._matches_model(settled_model, model)):
+                        err = f"Requested model {model!r} did not persist after fresh chat"
+                        self._track_error(err, "model_btn", "send_message")
+                        return {"success": False, "error": err}
+                    if target_thinking and settled_thinking != target_thinking:
+                        err = f"Requested thinking {target_thinking!r} did not persist after fresh chat"
+                        self._track_error(err, "thinking_level", "send_message")
+                        return {"success": False, "error": err}
+                    ui_model = settled_model
+                    ui_thinking = settled_thinking
 
             # 3. Enter Prompt
             input_selector = await self._resolve_selector("input", require_visible=True, timeout_ms=2000)
