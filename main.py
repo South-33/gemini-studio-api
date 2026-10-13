@@ -395,13 +395,15 @@ def public_request_trace(trace: Dict) -> Dict:
 @app.get("/health")
 async def health(response: Response):
     ready_workers = ready_worker_count()
-    is_ready = ready_workers > 0
+    active_request = bool(worker_pool and worker_pool._initialized and worker_pool._active_request)
+    is_ready = ready_workers > 0 or active_request
     response.status_code = 200 if is_ready else 503
     return {
-        "status": "ok" if is_ready else "degraded",
+        "status": "busy" if active_request and ready_workers == 0 else ("ok" if is_ready else "degraded"),
         "ready": is_ready,
         "workers": 1,
         "ready_workers": ready_workers,
+        "active_request": active_request,
     }
 
 

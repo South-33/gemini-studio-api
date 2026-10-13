@@ -20,9 +20,10 @@ class FakeWorker:
 
 
 class FakePool:
-    def __init__(self, initialized, workers):
+    def __init__(self, initialized, workers, active_request=False):
         self._initialized = initialized
         self.workers = workers
+        self._active_request = active_request
 
 
 class ApiStatusTests(unittest.TestCase):
@@ -90,6 +91,21 @@ class HealthEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertTrue(payload["ready"])
         self.assertEqual(payload["ready_workers"], 1)
+
+    async def test_health_stays_ready_while_request_is_active(self):
+        main.worker_pool = FakePool(
+            True,
+            [FakeWorker(initialized=False)],
+            active_request=True,
+        )
+        response = Response()
+
+        payload = await main.health(response)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["ready"])
+        self.assertTrue(payload["active_request"])
+        self.assertEqual(payload["status"], "busy")
 
 
 if __name__ == "__main__":

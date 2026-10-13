@@ -24,6 +24,7 @@ PUBLIC_ROOT = f"https://{DOMAIN}"
 LOCAL_HEALTH = f"http://127.0.0.1:{PORT}/health"
 PUBLIC_HEALTH = f"{PUBLIC_ROOT}/health"
 LAUNCHER_MUTEX_NAME = r"Local\GeminiStudioAPILauncher"
+LOCAL_HEALTH_FAILURE_LIMIT = 3
 
 
 def log(message: str) -> None:
@@ -278,14 +279,19 @@ def run() -> int:
         log(f"Tunnel: https://{DOMAIN}")
         log("Press Ctrl+C once, or close this window, to stop all services")
 
+        local_health_failures = 0
         while True:
             time.sleep(10)
-            if api.process.poll() is not None or not healthy(LOCAL_HEALTH):
+            api_exited = api.process.poll() is not None
+            local_ok = False if api_exited else healthy(LOCAL_HEALTH)
+            local_health_failures = 0 if local_ok else local_health_failures + 1
+            if api_exited or local_health_failures >= LOCAL_HEALTH_FAILURE_LIMIT:
                 log("API or Gemini worker unhealthy; restarting API...")
                 api.stop()
                 api = start_process("API", [sys.executable, "-u", "main.py"], "server.log")
                 if not wait_until_healthy(api, LOCAL_HEALTH, 120):
                     log("API restart failed; retrying on the next monitor cycle")
+                local_health_failures = 0
             if ngrok.process.poll() is not None or not healthy(PUBLIC_HEALTH):
                 log("Tunnel unhealthy; restarting ngrok...")
                 ngrok.stop()
