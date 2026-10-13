@@ -3,11 +3,14 @@ $ErrorActionPreference = 'Stop'
 $taskName = 'Gemini Studio API'
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $launcher = Join-Path $repoRoot 'launcher.py'
-$python = (Get-Command python -ErrorAction Stop).Source
+$python = (& python -c 'import sys; print(sys.executable)').Trim()
 $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 
 if (-not (Test-Path $launcher)) {
     throw "Could not find $launcher"
+}
+if (-not $python -or -not (Test-Path $python)) {
+    throw "Could not resolve the real Python interpreter"
 }
 
 $existingTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
