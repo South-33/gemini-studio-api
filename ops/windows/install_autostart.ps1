@@ -10,6 +10,12 @@ if (-not (Test-Path $launcher)) {
     throw "Could not find $launcher"
 }
 
+$existingTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+if ($existingTask) {
+    Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
+}
+
 # Gemini uses headed Chromium, so this task must run inside the signed-in user's
 # interactive desktop session. A machine-startup/SYSTEM task would launch the
 # browser in session 0 where it cannot be used by the automation.
