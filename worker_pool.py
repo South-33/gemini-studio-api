@@ -17,6 +17,18 @@ from request_log import write_request_log
 class WorkerPool:
     """Serialize requests through one tab and recreate it after concrete failures."""
 
+    BROWSER_ARGS = [
+        "--disable-blink-features=AutomationControlled",
+        "--start-maximized",
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-setuid-sandbox",
+        "--disable-background-timer-throttling",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
+        "--disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling,BatterySaverModeAvailability",
+    ]
+
     def __init__(self):
         self.playwright = None
         self.context = None
@@ -40,30 +52,11 @@ class WorkerPool:
         """Launch the persistent browser profile and initialize one managed tab."""
         try:
             self.playwright = await async_playwright().start()
-            args = [
-                "--disable-blink-features=AutomationControlled",
-                "--start-maximized",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-setuid-sandbox",
-                "--disable-background-timer-throttling",
-                "--disable-backgrounding-occluded-windows",
-                "--disable-renderer-backgrounding",
-                "--disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling,BatterySaverModeAvailability",
-            ]
             log(
                 "Launching maximized Chromium with native viewport and background throttling disabled",
                 "Worker",
             )
-
-            profile_dir = os.path.join(os.path.dirname(__file__), ".browser_session")
-            self.context = await self.playwright.chromium.launch_persistent_context(
-                profile_dir,
-                headless=False,
-                args=args,
-                permissions=["clipboard-read", "clipboard-write"],
-                no_viewport=True,
-            )
+            self.context = await self._launch_browser_context()
             page = await self._replace_restored_pages()
             worker = await self._initialize_page(page)
             if not worker:
@@ -78,6 +71,16 @@ class WorkerPool:
             log(f"Startup failed: {exc}", "Worker")
             await self.close()
             return False
+
+    async def _launch_browser_context(self):
+        profile_dir = os.path.join(os.path.dirname(__file__), ".browser_session")
+        return await self.playwright.chromium.launch_persistent_context(
+            profile_dir,
+            headless=False,
+            args=self.BROWSER_ARGS,
+            permissions=["clipboard-read", "clipboard-write"],
+            no_viewport=True,
+        )
 
     async def _replace_restored_pages(self) -> Page:
         """Create the managed page before closing pages restored by Chromium."""
@@ -140,6 +143,44 @@ class WorkerPool:
             log(f"Worker recreation {'succeeded' if success else 'failed'}: {reason}", "Worker")
             return success
 
+    async def _recreate_browser_context(self, reason: str) -> bool:
+        """Restart the single persistent Chromium context while preserving its profile."""
+        async with self._recovery_lock:
+            success = False
+            try:
+                old_worker = self.worker
+                self.workers.clear()
+                if old_worker:
+                    try:
+                        await old_worker.close()
+                    except Exception as exc:
+                        log(f"Old worker close warning: {exc}", "Worker")
+                if self.context:
+                    try:
+                        await self.context.close()
+                    except Exception as exc:
+                        log(f"Old browser context close warning: {exc}", "Worker")
+                    finally:
+                        self.context = None
+
+                self.context = await self._launch_browser_context()
+                page = await self._replace_restored_pages()
+                new_worker = await self._initialize_page(page)
+                success = new_worker is not None
+                if success:
+                    self.workers = [new_worker]
+                    self._worker_recreation_count += 1
+            except Exception as exc:
+                log(f"Browser context recreation error: {exc}", "Worker")
+
+            self._last_worker_recreation = {
+                "ok": success,
+                "reason": reason,
+                "at_unix": int(time.time()),
+            }
+            log(f"Browser context recreation {'succeeded' if success else 'failed'}: {reason}", "Worker")
+            return success
+
     async def _prepare_request_configuration(
         self,
         model: str | None,
@@ -166,8 +207,8 @@ class WorkerPool:
 
         log(f"[{request_id}] Model family changed; recreating managed Gemini tab", "Worker")
         await asyncio.sleep(1.5)
-        if not await self._recreate_worker(f"model family change for request {request_id}"):
-            return False, "Gemini tab recreation after model-family change failed"
+        if not await self._recreate_browser_context(f"model family change for request {request_id}"):
+            return False, "Gemini browser restart after model-family change failed"
 
         worker = self.worker
         if not worker:
@@ -181,10 +222,11 @@ class WorkerPool:
     @staticmethod
     def _is_transient_gemini_refusal(response: str) -> bool:
         normalized = " ".join((response or "").strip().lower().split())
-        return normalized == (
-            "i'm having a hard time fulfilling your request. "
-            "can i help with something else instead?"
-        )
+        return normalized in {
+            "i'm having a hard time fulfilling your request. can i help with something else instead?",
+            "i encountered an error doing what you asked. could you try again?",
+            "i seem to be encountering an error. can i try something else for you?",
+        }
 
     @staticmethod
     def _is_retryable_response_rejection(result: Dict) -> bool:

@@ -179,7 +179,7 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("attempt_started_at", kwargs)
         self.assertIn("attempt_finished_at", kwargs)
 
-    async def test_model_family_change_recreates_tab_before_send(self):
+    async def test_model_family_change_recreates_browser_context_before_send(self):
         pool = WorkerPool()
         first = FakeWorker()
         second = FakeWorker()
@@ -192,7 +192,7 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
             pool.workers = [second]
             return True
 
-        pool._recreate_worker = AsyncMock(side_effect=recreate)
+        pool._recreate_browser_context = AsyncMock(side_effect=recreate)
 
         result = await pool.send_message(
             "hello",
@@ -204,7 +204,15 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["success"])
         self.assertEqual(first.calls, 0)
         self.assertEqual(second.calls, 1)
-        pool._recreate_worker.assert_awaited_once()
+        pool._recreate_browser_context.assert_awaited_once()
+
+    def test_known_gemini_error_replies_are_transient(self):
+        for response in (
+            "I'm having a hard time fulfilling your request. Can I help with something else instead?",
+            "I encountered an error doing what you asked. Could you try again?",
+            "I seem to be encountering an error. Can I try something else for you?",
+        ):
+            self.assertTrue(WorkerPool._is_transient_gemini_refusal(response))
 
 
 if __name__ == "__main__":
