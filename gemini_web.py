@@ -1304,11 +1304,15 @@ class GeminiWebAutomation:
                 # Gemini can visually switch model/reasoning on an already-open
                 # blank chat while the underlying generation session remains
                 # bound to the previous configuration.  After any picker change,
-                # create a new /app chat and verify the requested configuration
-                # persisted before entering the prompt.
+                # allow Gemini's async preference update to settle, create a new
+                # /app chat, and verify the requested configuration persisted
+                # before entering the prompt.
                 if configuration_changed:
+                    log("Waiting for Gemini mode change to settle before starting a new chat", f"Worker {self.worker_id}")
+                    await asyncio.sleep(2.5)
                     if not await self._ensure_fresh_chat(force_navigation=True):
                         return {"success": False, "error": "Fresh chat after model/thinking change not confirmed"}
+                    await self._human_delay(700, 1000)
                     settled_model, settled_thinking = await self._get_current_ui_model_and_thinking()
                     if model and (not settled_model or not self._matches_model(settled_model, model)):
                         err = f"Requested model {model!r} did not persist after fresh chat"
