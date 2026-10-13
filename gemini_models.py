@@ -5,14 +5,15 @@ from __future__ import annotations
 import re
 
 
-MODEL_FAMILIES = ("flash", "flash-lite", "pro")
-THINKING_LEVELS = ("low", "medium", "high")
+MODEL_FAMILIES = ("flash",)
+THINKING_LEVELS = ("medium", "high")
+UI_THINKING_LEVELS = ("low", "medium", "high")
 
 
 def normalize_model(value: str) -> str:
     normalized = (value or "").strip().lower()
     if normalized not in MODEL_FAMILIES:
-        raise ValueError(f"Unsupported model {value!r}; use flash, flash-lite, or pro")
+        raise ValueError(f"Unsupported model {value!r}; use flash")
     return normalized
 
 
@@ -29,17 +30,17 @@ def model_family_from_ui(value: str) -> str | None:
 
 
 def normalize_thinking_level(value: str) -> str:
-    """Normalize Gemini's current Low/Medium/High thinking levels."""
+    """Normalize the public Medium/High thinking contract."""
     normalized = (value or "").strip().lower()
     if normalized in THINKING_LEVELS:
         return normalized.capitalize()
-    raise ValueError(f"Unsupported thinking level {value!r}; use Low, Medium, or High")
+    raise ValueError(f"Unsupported thinking level {value!r}; use Medium or High")
 
 
 def thinking_level_from_picker_text(value: str) -> str | None:
     """Read the current thinking level from the closed Gemini model picker."""
     tokens = set(re.findall(r"[a-z]+", (value or "").strip().lower()))
-    for level in THINKING_LEVELS:
+    for level in UI_THINKING_LEVELS:
         if level in tokens:
             return level.capitalize()
     # Gemini omits the word "Low" from the closed picker. For example, after
