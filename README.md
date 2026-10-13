@@ -5,11 +5,11 @@ production Windows server. Requests are serialized through one browser worker.
 
 ## Contract
 
-- Models: `flash-lite`, `pro`
+- Models: `flash`, `flash-lite`, `pro`
 - Thinking: `Low`, `Medium`, `High`; default `Medium`
 - Only these model and thinking values are accepted
 - `POST /v1/chat/completions` accepts OpenAI-style `messages`
-- `GET /v1/models` lists the two supported model families
+- `GET /v1/models` lists the three supported model families
 - `GET /health` returns 200 only while the worker is on a usable Gemini `/app`
 - `GET /v1/diagnostics` exposes current browser/queue/recovery state
 
@@ -30,10 +30,6 @@ Invoke-RestMethod -Method Post `
 
 Gemini can change numeric model versions in the web UI. The automation matches
 the visible family text and does not expose numeric versions through the API.
-Gemini 3.8 Flash is intentionally not exposed: on 2026-10-13 it remained stuck
-on "Gemini is typing" for more than 180 seconds even when tested directly in the
-headed Gemini browser with the API bypassed. Flash-Lite and Pro both passed all
-three thinking levels.
 
 ## Current Gemini UI contract
 

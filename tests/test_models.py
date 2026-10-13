@@ -10,9 +10,9 @@ from gemini_models import (
 
 class ModelTests(unittest.TestCase):
     def test_api_models_are_exact_current_families(self):
-        for model in ("flash-lite", "pro"):
+        for model in ("flash", "flash-lite", "pro"):
             self.assertEqual(normalize_model(model), model)
-        for unsupported in ("flash", "thinking", "fast", "gemini-flash", "gemini-3.5-flash-lite"):
+        for unsupported in ("thinking", "fast", "gemini-flash", "gemini-3.5-flash-lite"):
             with self.assertRaises(ValueError):
                 normalize_model(unsupported)
 

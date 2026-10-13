@@ -5,14 +5,14 @@ from __future__ import annotations
 import re
 
 
-MODEL_FAMILIES = ("flash-lite", "pro")
+MODEL_FAMILIES = ("flash", "flash-lite", "pro")
 THINKING_LEVELS = ("low", "medium", "high")
 
 
 def normalize_model(value: str) -> str:
     normalized = (value or "").strip().lower()
     if normalized not in MODEL_FAMILIES:
-        raise ValueError(f"Unsupported model {value!r}; use flash-lite or pro")
+        raise ValueError(f"Unsupported model {value!r}; use flash, flash-lite, or pro")
     return normalized
 
 
