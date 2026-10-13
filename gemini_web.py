@@ -666,6 +666,47 @@ class GeminiWebAutomation:
             print(f"[Worker {self.worker_id}] Failed to read current model/thinking level from button: {e}")
             return None, None
 
+    async def ensure_configuration(
+        self,
+        model: Optional[str],
+        thinking_level: Optional[str],
+    ) -> Tuple[bool, bool]:
+        """Select and verify Gemini model/thinking. Returns (ok, model_family_changed)."""
+        ui_model, ui_thinking = await self._get_current_ui_model_and_thinking()
+        model_family_changed = False
+
+        if model and (not ui_model or not self._matches_model(ui_model, model)):
+            selected = await self._select_model(model)
+            model_family_changed = bool(selected)
+            ui_model, ui_thinking = await self._get_current_ui_model_and_thinking()
+            if not selected or not ui_model or not self._matches_model(ui_model, model):
+                self._track_error(
+                    f"Requested model {model!r} but Gemini UI is {ui_model or 'unknown'!r}",
+                    "model_btn",
+                    "ensure_configuration",
+                    {"requested_model": model, "ui_model": ui_model, "selection_ok": bool(selected)},
+                )
+                return False, model_family_changed
+
+        target_thinking = thinking_level or "Medium"
+        if target_thinking and ui_thinking != target_thinking:
+            await self._set_thinking_level(target_thinking)
+            ui_model, ui_thinking = await self._get_current_ui_model_and_thinking()
+            if ui_thinking != target_thinking:
+                self._track_error(
+                    f"Requested thinking {target_thinking!r} but Gemini UI is {ui_thinking or 'unknown'!r}",
+                    "thinking_level",
+                    "ensure_configuration",
+                )
+                return False, model_family_changed
+
+        if model and (not ui_model or not self._matches_model(ui_model, model)):
+            return False, model_family_changed
+
+        self._current_selected_model = ui_model
+        self._current_selected_thinking_level = ui_thinking
+        return True, model_family_changed
+
     @staticmethod
     def _estimate_tokens(text: str) -> int:
         """Rough token estimate for logging only."""
@@ -1061,14 +1102,10 @@ class GeminiWebAutomation:
             and not snap.get("error_page_500")
         )
 
-    async def _ensure_fresh_chat(self, force_navigation: bool = False) -> bool:
+    async def _ensure_fresh_chat(self) -> bool:
         """Ensure the page is the current Gemini /app with an empty composer."""
         baseline = await self._capture_state_snapshot()
-        if (
-            not force_navigation
-            and self._is_fresh_chat_ready(baseline)
-            and self.page.url.rstrip("/").endswith("gemini.google.com/app")
-        ):
+        if self._is_fresh_chat_ready(baseline) and self.page.url.rstrip("/").endswith("gemini.google.com/app"):
             return True
 
         try:
@@ -1261,69 +1298,10 @@ class GeminiWebAutomation:
 
             await self._human_delay()
 
-            # 2. Select Model and Thinking Level
-            if model or thinking_level:
-                configuration_changed = False
-                # First check the current active UI configuration
-                ui_model, ui_thinking = await self._get_current_ui_model_and_thinking()
-                
-                # The visible picker is authoritative on every request. Match
-                # stable families (Pro/Flash/Lite), not changing version text.
-                if model and (not ui_model or not self._matches_model(ui_model, model)):
-                    selected = await self._select_model(model)
-                    configuration_changed = bool(selected)
-                    # Selecting a model can also reset reasoning; re-read both.
-                    ui_model, ui_thinking = await self._get_current_ui_model_and_thinking()
-                    if not selected or not ui_model or not self._matches_model(ui_model, model):
-                        err = f"Requested model {model!r} but Gemini UI is {ui_model or 'unknown'!r}"
-                        self._track_error(
-                            err,
-                            "model_btn",
-                            "send_message",
-                            {"requested_model": model, "ui_model": ui_model, "selection_ok": bool(selected)},
-                        )
-                        return {"success": False, "error": err}
-                if ui_model:
-                    self._current_selected_model = ui_model
-
-                # Select and verify reasoning from the current UI, never from
-                # state left by the previous request.
-                target_thinking = thinking_level or "Medium"
-                if target_thinking and ui_thinking != target_thinking:
-                    await self._set_thinking_level(target_thinking)
-                    configuration_changed = True
-                    _, verified_thinking = await self._get_current_ui_model_and_thinking()
-                    if verified_thinking != target_thinking:
-                        err = f"Requested thinking {target_thinking!r} but Gemini UI is {verified_thinking or 'unknown'!r}"
-                        self._track_error(err, "thinking_level", "send_message")
-                        return {"success": False, "error": err}
-                    ui_thinking = verified_thinking
-                if ui_thinking:
-                    self._current_selected_thinking_level = ui_thinking
-
-                # Gemini can visually switch model/reasoning on an already-open
-                # blank chat while the underlying generation session remains
-                # bound to the previous configuration.  After any picker change,
-                # allow Gemini's async preference update to settle, create a new
-                # /app chat, and verify the requested configuration persisted
-                # before entering the prompt.
-                if configuration_changed:
-                    log("Waiting for Gemini mode change to settle before starting a new chat", f"Worker {self.worker_id}")
-                    await asyncio.sleep(2.5)
-                    if not await self._ensure_fresh_chat(force_navigation=True):
-                        return {"success": False, "error": "Fresh chat after model/thinking change not confirmed"}
-                    await self._human_delay(700, 1000)
-                    settled_model, settled_thinking = await self._get_current_ui_model_and_thinking()
-                    if model and (not settled_model or not self._matches_model(settled_model, model)):
-                        err = f"Requested model {model!r} did not persist after fresh chat"
-                        self._track_error(err, "model_btn", "send_message")
-                        return {"success": False, "error": err}
-                    if target_thinking and settled_thinking != target_thinking:
-                        err = f"Requested thinking {target_thinking!r} did not persist after fresh chat"
-                        self._track_error(err, "thinking_level", "send_message")
-                        return {"success": False, "error": err}
-                    ui_model = settled_model
-                    ui_thinking = settled_thinking
+            # 2. Model/thinking should already be preconfigured by WorkerPool.
+            configured, _ = await self.ensure_configuration(model, thinking_level)
+            if not configured:
+                return {"success": False, "error": "Requested Gemini configuration could not be confirmed"}
 
             # 3. Enter Prompt
             input_selector = await self._resolve_selector("input", require_visible=True, timeout_ms=2000)
@@ -1377,8 +1355,12 @@ class GeminiWebAutomation:
                     return ""
             
             async def submit_once() -> bool:
-                """Submit once with Enter from Gemini's focused composer."""
-                log("Attempting single Enter-key submission", f"Worker {self.worker_id}")
+                """Submit exactly once using the interaction proven for this model family."""
+                use_enter = (model or "").strip().lower() == "flash"
+                log(
+                    f"Attempting single {'Enter-key' if use_enter else 'Send-button'} submission",
+                    f"Worker {self.worker_id}",
+                )
                 try:
                     await self.page.bring_to_front()
                 except:
@@ -1394,7 +1376,8 @@ class GeminiWebAutomation:
 
                 try:
                     # Verify Gemini considers the request sendable, then submit
-                    # from the composer exactly as a normal keyboard interaction.
+                    # exactly once. Flash currently requires composer Enter;
+                    # Flash-Lite and Pro are reliable through the visible Send control.
                     for selector in self._selector_candidates("send_btn"):
                         send_btn = self.page.locator(selector).first
                         if await send_btn.is_visible():
@@ -1403,8 +1386,12 @@ class GeminiWebAutomation:
                                 continue
                             if await send_btn.is_disabled():
                                 continue
-                            await input_area.press("Enter")
-                            log("Single Enter-key submission dispatched", f"Worker {self.worker_id}")
+                            if use_enter:
+                                await input_area.press("Enter")
+                                log("Single Enter-key submission dispatched", f"Worker {self.worker_id}")
+                            else:
+                                await send_btn.click()
+                                log("Single Send-button click dispatched", f"Worker {self.worker_id}")
                             return True
                 except:
                     pass
@@ -1423,7 +1410,7 @@ class GeminiWebAutomation:
                 self._track_error("Composer submission failed before dispatch", "send_btn", "send_message", snapshot)
                 return {"success": False, "error": "Composer submission failed before dispatch"}
 
-            # 4.5 Observe only. Never submit again from this tab after Enter:
+            # 4.5 Observe only. Never submit again from this tab after dispatch:
             # Gemini can morph Send into Stop immediately, so a second click can
             # cancel the generation that just started.
             start_observe_seconds = 6.0

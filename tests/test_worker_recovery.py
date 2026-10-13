@@ -173,28 +173,6 @@ class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(ready)
         self.assertEqual(worker.page.visited, ["https://gemini.google.com/app"])
 
-    async def test_forced_fresh_chat_navigates_even_when_page_is_already_clean(self):
-        worker = GeminiWebAutomation(worker_id=1)
-        worker.page = FakeNavigationPage(url="https://gemini.google.com/app")
-        clean = {
-            "input_visible": True,
-            "user_query_count": 0,
-            "response_count": 0,
-            "error_page_500": False,
-            "sign_in_visible": False,
-        }
-        worker._capture_state_snapshot = AsyncMock(side_effect=[clean, clean])
-
-        ready = await worker._ensure_fresh_chat(force_navigation=True)
-
-        self.assertTrue(ready)
-        self.assertEqual(worker.page.visited, ["https://gemini.google.com/app"])
-
-    def test_send_path_restarts_chat_after_picker_changes(self):
-        source = inspect.getsource(GeminiWebAutomation.send_message)
-        self.assertIn("configuration_changed", source)
-        self.assertIn("_ensure_fresh_chat(force_navigation=True)", source)
-
     async def test_retained_prompt_is_cleared_only_after_acceptance(self):
         worker = GeminiWebAutomation(worker_id=1)
         locator = FakeLocator()

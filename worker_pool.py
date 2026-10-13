@@ -140,6 +140,44 @@ class WorkerPool:
             log(f"Worker recreation {'succeeded' if success else 'failed'}: {reason}", "Worker")
             return success
 
+    async def _prepare_request_configuration(
+        self,
+        model: str | None,
+        thinking_level: str | None,
+        request_id: str | None,
+    ) -> tuple[bool, str | None]:
+        """Apply Gemini UI configuration before request execution.
+
+        Gemini's current web app can leave a newly selected model attached to
+        the old tab's generation session. Treat a model-family change as a tab
+        boundary: persist the selection, replace the managed tab, then verify
+        the requested configuration on the new tab before sending anything.
+        """
+        worker = self.worker
+        if not worker:
+            return False, "Gemini worker disappeared"
+
+        ok, model_family_changed = await worker.ensure_configuration(model, thinking_level)
+        if not ok:
+            return False, "Requested Gemini configuration could not be confirmed"
+
+        if not model_family_changed:
+            return True, None
+
+        log(f"[{request_id}] Model family changed; recreating managed Gemini tab", "Worker")
+        await asyncio.sleep(1.5)
+        if not await self._recreate_worker(f"model family change for request {request_id}"):
+            return False, "Gemini tab recreation after model-family change failed"
+
+        worker = self.worker
+        if not worker:
+            return False, "Gemini worker disappeared after model-family change"
+
+        ok, changed_again = await worker.ensure_configuration(model, thinking_level)
+        if not ok or changed_again:
+            return False, "Requested Gemini configuration did not persist across tab recreation"
+        return True, None
+
     @staticmethod
     def _is_transient_gemini_refusal(response: str) -> bool:
         normalized = " ".join((response or "").strip().lower().split())
@@ -180,6 +218,19 @@ class WorkerPool:
                     log(f"[{request_id}] Queue wait: {wait_ms}ms", "Worker")
 
                 self._active_request = True
+                configured, configuration_error = await self._prepare_request_configuration(
+                    model,
+                    thinking_level,
+                    request_id,
+                )
+                if not configured:
+                    return {
+                        "success": False,
+                        "error": f"Gemini request failed: {configuration_error}",
+                        "queue_wait_ms": wait_ms,
+                        "attempts": 0,
+                    }
+
                 attempt_logs: List[str] = []
                 request_log_files: List[str] = []
                 last_error = "unknown"

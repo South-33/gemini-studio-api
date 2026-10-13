@@ -17,6 +17,12 @@ class FakeWorker:
         self.ready = True
         self.started_ready = []
         self.prepare_ok = prepare_ok
+        self.configuration_results = []
+
+    async def ensure_configuration(self, *_args, **_kwargs):
+        if self.configuration_results:
+            return self.configuration_results.pop(0)
+        return True, False
 
     async def send_message(self, *_args, **_kwargs):
         self.started_ready.append(self.ready)
@@ -172,6 +178,33 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(kwargs["attempt_duration_ms"], 0)
         self.assertIn("attempt_started_at", kwargs)
         self.assertIn("attempt_finished_at", kwargs)
+
+    async def test_model_family_change_recreates_tab_before_send(self):
+        pool = WorkerPool()
+        first = FakeWorker()
+        second = FakeWorker()
+        first.configuration_results = [(True, True)]
+        second.configuration_results = [(True, False), (True, False)]
+        pool.workers = [first]
+        pool._initialized = True
+
+        async def recreate(_reason):
+            pool.workers = [second]
+            return True
+
+        pool._recreate_worker = AsyncMock(side_effect=recreate)
+
+        result = await pool.send_message(
+            "hello",
+            model="flash",
+            thinking_level="Medium",
+            request_id="switch-model",
+        )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(first.calls, 0)
+        self.assertEqual(second.calls, 1)
+        pool._recreate_worker.assert_awaited_once()
 
 
 if __name__ == "__main__":
