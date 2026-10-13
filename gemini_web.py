@@ -41,8 +41,8 @@ SEND_VERIFY_POLL_SECONDS = 0.1
 CLIPBOARD_POLL_SECONDS = 0.05
 NEW_CHAT_CONTROL_CONFIRM_SECONDS = 0.8
 WAIT_LOG_INTERVAL_SECONDS = 10
-STALL_EMPTY_SECONDS = 180
-STALL_EMPTY_SECONDS_WITH_ACTIVITY = 300
+STALL_EMPTY_SECONDS = 420
+STALL_EMPTY_SECONDS_WITH_ACTIVITY = 450
 # Extra grace for large prompts (>15k tokens) where backend prefill can take 5+ minutes
 STALL_EMPTY_SECONDS_LARGE_PROMPT = 360
 LARGE_PROMPT_TOKEN_THRESHOLD = 15000
@@ -1718,7 +1718,7 @@ class GeminiWebAutomation:
 
                     # Cooked check for thinking models:
                     # High thinking can take longer to begin returning visible output.
-                    cooked_threshold = 300
+                    cooked_threshold = 420
                     if self._current_prompt_tokens_est and self._current_prompt_tokens_est >= LARGE_PROMPT_TOKEN_THRESHOLD:
                         cooked_threshold = STALL_EMPTY_SECONDS_LARGE_PROMPT
 

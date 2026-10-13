@@ -44,8 +44,9 @@ class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
     def test_active_generation_grace_is_longer_than_one_minute(self):
         import gemini_web
 
-        self.assertGreaterEqual(gemini_web.STALL_EMPTY_SECONDS, 180)
-        self.assertGreaterEqual(gemini_web.STALL_EMPTY_SECONDS_WITH_ACTIVITY, 300)
+        self.assertGreaterEqual(gemini_web.STALL_EMPTY_SECONDS, 420)
+        self.assertGreaterEqual(gemini_web.STALL_EMPTY_SECONDS_WITH_ACTIVITY, 450)
+        self.assertLess(gemini_web.STALL_EMPTY_SECONDS_WITH_ACTIVITY, gemini_web.BROWSER_TIMEOUT_SECONDS)
 
     def test_model_picker_prefers_semantic_label_then_test_id(self):
         selectors = GeminiWebAutomation.SELECTORS["model_btn"]
