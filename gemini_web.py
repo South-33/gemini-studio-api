@@ -1352,7 +1352,7 @@ class GeminiWebAutomation:
             pre_send_user_query_count = int(pre_send_snapshot.get("user_query_count") or 0)
             prompt_len = len((filled_text or "").strip())
 
-            # 4. Click Send - VERIFIED
+            # 4. Submit once from the focused composer.
 
             def start_signal_from_snapshot(snap: Dict[str, Any], input_text_len: Optional[int] = None) -> str:
                 send_now = bool(snap.get("send_visible"))
@@ -1377,8 +1377,8 @@ class GeminiWebAutomation:
                     return ""
             
             async def submit_once() -> bool:
-                """Click Gemini's Send control exactly once for this request."""
-                log("Attempting single send submission", f"Worker {self.worker_id}")
+                """Submit once with Enter from Gemini's focused composer."""
+                log("Attempting single Enter-key submission", f"Worker {self.worker_id}")
                 try:
                     await self.page.bring_to_front()
                 except:
@@ -1393,14 +1393,18 @@ class GeminiWebAutomation:
                     pass
 
                 try:
+                    # Verify Gemini considers the request sendable, then submit
+                    # from the composer exactly as a normal keyboard interaction.
                     for selector in self._selector_candidates("send_btn"):
                         send_btn = self.page.locator(selector).first
                         if await send_btn.is_visible():
                             aria_label = (await send_btn.get_attribute("aria-label") or "").lower()
                             if "stop" in aria_label:
                                 continue
-                            await send_btn.click()
-                            log("Single send click dispatched", f"Worker {self.worker_id}")
+                            if await send_btn.is_disabled():
+                                continue
+                            await input_area.press("Enter")
+                            log("Single Enter-key submission dispatched", f"Worker {self.worker_id}")
                             return True
                 except:
                     pass
@@ -1408,7 +1412,7 @@ class GeminiWebAutomation:
                 return False
 
             if not await submit_once():
-                log("Send button click failed before dispatch", f"Worker {self.worker_id}")
+                log("Composer submission failed before dispatch", f"Worker {self.worker_id}")
                 snapshot = await self._capture_state_snapshot()
                 outage = self._get_active_network_outage()
                 if outage:
@@ -1416,10 +1420,10 @@ class GeminiWebAutomation:
                     snapshot.update(outage_diag)
                     self._track_error(outage_error, "send_btn", "send_message", snapshot)
                     return {"success": False, "error": outage_error}
-                self._track_error("Send button click failed before dispatch", "send_btn", "send_message", snapshot)
-                return {"success": False, "error": "Send button click failed before dispatch"}
+                self._track_error("Composer submission failed before dispatch", "send_btn", "send_message", snapshot)
+                return {"success": False, "error": "Composer submission failed before dispatch"}
 
-            # 4.5 Observe only. Never submit again from this tab after the click:
+            # 4.5 Observe only. Never submit again from this tab after Enter:
             # Gemini can morph Send into Stop immediately, so a second click can
             # cancel the generation that just started.
             start_observe_seconds = 6.0

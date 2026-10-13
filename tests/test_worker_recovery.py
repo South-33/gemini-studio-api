@@ -81,6 +81,7 @@ class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("attempt_same_page_resend", source)
         self.assertNotIn("retrying send", source.lower())
         self.assertIn("submit_once", source)
+        self.assertIn('input_area.press("Enter")', source)
 
     async def test_ready_reset_refuses_to_navigate_active_generation(self):
         worker = GeminiWebAutomation(worker_id=1)
