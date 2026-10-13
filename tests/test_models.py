@@ -28,7 +28,9 @@ class ModelTests(unittest.TestCase):
     def test_picker_text_reports_current_thinking_level(self):
         self.assertEqual(thinking_level_from_picker_text("Flash\nMedium"), "Medium")
         self.assertEqual(thinking_level_from_picker_text("Open mode picker, currently Flash High"), "High")
-        self.assertIsNone(thinking_level_from_picker_text("Flash-Lite"))
+        self.assertEqual(thinking_level_from_picker_text("Flash"), "Low")
+        self.assertEqual(thinking_level_from_picker_text("Flash-Lite"), "Low")
+        self.assertEqual(thinking_level_from_picker_text("Pro"), "Low")
 
 if __name__ == "__main__":
     unittest.main()

@@ -37,9 +37,13 @@ def normalize_thinking_level(value: str) -> str:
 
 
 def thinking_level_from_picker_text(value: str) -> str | None:
-    """Read Low/Medium/High from the visible model-picker text or aria label."""
+    """Read the current thinking level from the closed Gemini model picker."""
     tokens = set(re.findall(r"[a-z]+", (value or "").strip().lower()))
     for level in THINKING_LEVELS:
         if level in tokens:
             return level.capitalize()
+    # Gemini omits the word "Low" from the closed picker. For example, after
+    # choosing Low the button reads just "Flash" instead of "Flash Low".
+    if "flash" in tokens or "pro" in tokens:
+        return "Low"
     return None
