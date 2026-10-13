@@ -1,10 +1,14 @@
-This is the project's AGENTS.md
+# Project instructions
 
-- `GEMINI_WEBSITE.md` is the source of truth for production UI behavior; update it with focused selector/behavior tests when Gemini changes.
-- Production uses one queued Gemini Web worker. Do not reintroduce provider abstractions, round-robin workers, or time/count-based page refreshes.
-- Match model families by visible `Flash`, `Lite`, and `Pro` text; never select models/reasoning by hashed IDs or menu position.
-- Return responses only through Gemini's Copy control/clipboard; DOM text is diagnostic state, not response content.
-- Preserve Windows anti-throttle Chromium flags and capture diagnostics before recreating a failed page.
-- `launcher.py` must remain the foreground owner of API/ngrok/Chromium; detached children break close-to-cleanup behavior.
-- `.browser_session`, `.env`, prompts, screenshots, and runtime logs are private local state and must not be committed.
-- `SOUTH33` / this DevSpace workspace is the development laptop only. Never treat its OS state, processes, Startup folder, scheduled tasks, browser profile, logs, or ports as production evidence. Production is the Windows 10 host reached through SSH alias `southserver`; make code changes on the laptop, commit/push them, then pull and run deployment/runtime checks on `southserver`. Sync code only through Git, never by copying working files between machines.
+- Production is the Windows host reached through SSH alias `southserver`.
+- Develop locally, commit and push, then deploy on production with Git only.
+- The API has one queued Gemini Web worker. Do not add provider abstractions or
+  multiple workers.
+- API models are exactly `flash`, `flash-lite`, and `pro`. Thinking levels are
+  exactly `Low`, `Medium`, and `High`. Do not add aliases.
+- Match Gemini's visible model family text and exact thinking labels; never use
+  generated class names or menu positions.
+- Return model output only through Gemini's Copy control/clipboard.
+- Keep the headed-Chromium anti-throttling flags and launcher process ownership.
+- `.browser_session/` and `logs/` are private runtime state and must not be
+  committed.

@@ -11,7 +11,6 @@ from typing import Any, Dict, List, Optional
 from playwright.async_api import Page, async_playwright
 
 from gemini_web import GeminiWebAutomation, log
-from notifier import notify_error
 from request_log import write_request_log
 
 
@@ -103,7 +102,7 @@ class WorkerPool:
             try:
                 if await asyncio.wait_for(worker.prepare_next_request(), timeout=20):
                     return worker
-                log("New Gemini page did not reach ready Temporary Chat state", "Worker")
+                log("New Gemini page did not reach a clean /app state", "Worker")
             except Exception as exc:
                 log(f"New Gemini page readiness failed: {exc}", "Worker")
         try:
@@ -140,10 +139,6 @@ class WorkerPool:
             }
             log(f"Worker recreation {'succeeded' if success else 'failed'}: {reason}", "Worker")
             return success
-
-    @staticmethod
-    def _is_network_outage(error: str) -> bool:
-        return (error or "").strip().lower().startswith("network outage:")
 
     @staticmethod
     def _is_transient_gemini_refusal(response: str) -> bool:
@@ -332,7 +327,6 @@ class WorkerPool:
                     break
 
                 log(f"[{request_id}] Request failed: {last_error}", "Worker")
-                await self._notify_final_failure(last_error)
                 return {
                     "success": False,
                     "error": f"Gemini request failed: {last_error}",
@@ -382,19 +376,6 @@ class WorkerPool:
         log(f"Next-request state {'ready' if ok else 'unavailable'}: {reason}", "Worker")
         return ok
 
-    async def _notify_final_failure(self, error: str) -> None:
-        try:
-            tracked = GeminiWebAutomation.get_all_errors().get(1) or {}
-            await notify_error(
-                error=f"Gemini request failed after retry: {error}",
-                selector_key=tracked.get("selector_key") or "worker",
-                action=tracked.get("action") or "final_failure",
-                worker_id=1,
-                diagnostics=tracked.get("diagnostics") or {"error": error},
-            )
-        except Exception as exc:
-            log(f"Failure notification failed: {exc}", "Worker")
-
     def get_diagnostics(self) -> Dict[str, Any]:
         worker = self.worker
         return {
@@ -428,14 +409,12 @@ class WorkerPool:
             keys = (
                 "page_title", "url", "phase", "stop_visible", "send_visible",
                 "input_visible", "input_text_len", "user_query_count", "response_count",
-                "thinking_label", "thinking_active", "error_page_500", "chat_mode_active",
-                "spark_mode_active", "model_button_text", "model_button_aria_label",
+                "thinking_label", "thinking_active", "error_page_500",
+                "model_button_text", "model_button_aria_label",
                 "model_picker_count", "sign_in_visible", "ui_state_hint",
             )
             info["current_state"] = {key: snapshot.get(key) for key in keys}
             violations = []
-            if snapshot.get("spark_mode_active"):
-                violations.append("spark_mode_active")
             if snapshot.get("stop_visible") and not info["generation_in_progress"]:
                 violations.append("stop_visible_while_worker_idle")
             if (

@@ -1,10 +1,6 @@
 import sys
 import os
 
-# Force unbuffered output (critical for Windows/ngrok)
-# Method 1: Set environment variable (for subprocesses)
-os.environ['PYTHONUNBUFFERED'] = '1'
-# Method 2: Reconfigure stdout/stderr with utf-8 encoding
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(line_buffering=True, encoding='utf-8')
 if hasattr(sys.stderr, 'reconfigure'):
@@ -17,14 +13,12 @@ import tempfile
 import time
 import uuid
 import math
-import pathlib
 from collections import deque
 from datetime import datetime, timezone
-from typing import List, Optional, Dict
+from typing import Optional, Dict
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
-from dotenv import load_dotenv
 
 # --- Timestamped Logging (use stderr - always unbuffered) ---
 def log(msg: str, tag: str = "Server"):
@@ -33,10 +27,7 @@ def log(msg: str, tag: str = "Server"):
     # Use stderr (unbuffered) instead of stdout
     print(f"[{ts}] [{tag}] {msg}", file=sys.stderr, flush=True)
 
-# Load .env file
-load_dotenv()
-
-from gemini_models import MODEL_FAMILIES, normalize_thinking_level, parse_model_and_thinking
+from gemini_models import MODEL_FAMILIES, normalize_model, normalize_thinking_level
 from worker_pool import WorkerPool
 
 # Configuration
@@ -142,180 +133,6 @@ def estimate_text_tokens(text: str) -> int:
     return max(by_chars, by_words)
 
 
-ERROR_LOG_DIR = pathlib.Path(__file__).parent / "logs" / "errors"
-ERROR_LOG_MAX_FILES = 200
-
-
-def _classify_error(error_str: str) -> str:
-    """Return a short error class label for the failure summary header."""
-    text = (error_str or "").lower()
-    if any(k in text for k in ("target page", "page has been closed", "browser has been closed",
-                               "context has been closed", "target closed")):
-        return "DEAD_PAGE"
-    if any(k in text for k in ("err_name_not_resolved", "err_internet_disconnected",
-                               "getaddrinfo failed", "network outage",
-                               "err_network_changed", "err_address_unreachable")):
-        return "NETWORK_OUTAGE"
-    if any(k in text for k in ("stalled generation", "unsent stuck", "copy timeout",
-                               "clipboard extraction failed", "waiting for response")):
-        return "STALL"
-    if any(k in text for k in ("selector", "timeout", "locator", "element", "not found",
-                               "not visible")):
-        return "SELECTOR"
-    return "UNKNOWN"
-
-
-def write_error_transaction_log(
-    trace: Dict,
-    result: Dict,
-    recent_req_snapshot: List[Dict],
-) -> None:
-    """Write a structured error report for a failed request to disk.
-
-    Files are named:  {timestamp}_{request_id}.log
-    Capped at ERROR_LOG_MAX_FILES; oldest files are deleted when the cap is hit.
-    """
-    try:
-        ERROR_LOG_DIR.mkdir(parents=True, exist_ok=True)
-
-        # Rotate: delete oldest files if over cap
-        existing = sorted(ERROR_LOG_DIR.glob("*.log"), key=lambda p: p.stat().st_mtime)
-        while len(existing) >= ERROR_LOG_MAX_FILES:
-            old_log = existing.pop(0)
-            prefix = old_log.stem
-            old_log.unlink(missing_ok=True)
-            # Delete any HTML or PNG files associated with this transaction ID
-            for related in ERROR_LOG_DIR.glob(f"{prefix}*"):
-                try:
-                    related.unlink(missing_ok=True)
-                except Exception as rotate_err:
-                    log(f"Failed to delete related diagnostic file {related.name}: {rotate_err}", "API")
-
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        req_id = trace.get("request_id", "unknown")
-        filename = ERROR_LOG_DIR / f"{ts}_{req_id}.log"
-
-        raw_error = result.get('error', 'unknown')
-        error_class = _classify_error(raw_error)
-        raw_model = trace.get('model', '')
-        resolved_model = trace.get('resolved_model', '') or raw_model
-        thinking_level = trace.get('thinking_level', '')
-        model_note = (
-            f"{resolved_model} ({thinking_level})"
-            + (f"  [raw: {raw_model}]" if raw_model != resolved_model else "")
-        )
-
-        lines = []
-        sep = "=" * 72
-        thin = "-" * 72
-
-        lines.append(sep)
-        lines.append("GEMINI-STUDIO-API  ERROR TRANSACTION REPORT")
-        lines.append(sep)
-        lines.append(f"Request ID  : {req_id}")
-        lines.append(f"Started     : {trace.get('started_at', '')}")
-        lines.append(f"Finished    : {trace.get('finished_at', '')}")
-        lines.append(f"Source      : project={trace.get('project','')} client={trace.get('client','')} ip={trace.get('ip','')}")
-        lines.append(f"Model       : {model_note}")
-        lines.append(f"Prompt      : chars={trace.get('prompt_chars', 0)} tokens_est={trace.get('prompt_tokens_est', 0)} images={trace.get('image_count', 0)}")
-        lines.append("")
-        lines.append(thin)
-        lines.append("FAILURE SUMMARY")
-        lines.append(thin)
-        lines.append(f"  Class  : {error_class}")
-        lines.append(f"  Error  : {raw_error[:300]}")
-        lines.append(sep)
-
-        # Prompt preview (first 3000 chars) — enough to identify what failed
-        prompt_preview = trace.get("prompt_preview", "")
-        if prompt_preview:
-            lines.append(thin)
-            lines.append("PROMPT PREVIEW (first 3000 chars)")
-            lines.append(thin)
-            lines.append(prompt_preview)
-            lines.append("")
-
-        # Save full prompt as a sidecar .prompt.txt so it can be replayed
-        prompt_full = trace.get("prompt_full", "")
-        if prompt_full:
-            prompt_path = ERROR_LOG_DIR / f"{ts}_{req_id}.prompt.txt"
-            try:
-                prompt_path.write_text(prompt_full, encoding="utf-8")
-                lines.append(f"Full prompt saved to: {prompt_path.name}")
-                lines.append("")
-            except Exception as pe:
-                lines.append(f"(Failed to save full prompt: {pe})")
-                lines.append("")
-
-        # Search for related files (screenshots, diagnostic text extracts, etc.) containing the req_id
-        related_files = []
-        if req_id and req_id != "unknown":
-            try:
-                # Find all files with the req_id, excluding the .log file itself
-                related_files = sorted(
-                    [p for p in ERROR_LOG_DIR.glob(f"*{req_id}*") if p.suffix != ".log"],
-                    key=lambda p: p.stat().st_mtime
-                )
-            except Exception as glob_err:
-                log(f"Failed to scan related diagnostic files: {glob_err}", "API")
-
-        if related_files:
-            lines.append(thin)
-            lines.append("DIAGNOSTIC ARTIFACTS")
-            lines.append(thin)
-            for f in related_files:
-                lines.append(f"  Artifact: {f.name} ({f.stat().st_size} bytes)")
-            lines.append("")
-
-            # Find any diagnostic text extracts and embed their contents
-            for f in related_files:
-                if f.name.endswith(".diag.txt"):
-                    lines.append(thin)
-                    lines.append(f"EMBEDDED DIAGNOSTIC EXTRACT ({f.name})")
-                    lines.append(thin)
-                    try:
-                        diag_content = f.read_text(encoding="utf-8")
-                        lines.append(diag_content)
-                    except Exception as diag_read_err:
-                        lines.append(f"(Failed to read diagnostic extract: {diag_read_err})")
-                    lines.append("")
-
-        attempt_logs = result.get("attempt_logs") or []
-        if attempt_logs:
-            lines.append(thin)
-            lines.append("WORKER ATTEMPT LOGS (all retry attempts)")
-            lines.append(thin)
-            lines.extend(attempt_logs)
-            lines.append("")
-        else:
-            lines.append("[No per-attempt logs captured]")
-            lines.append("")
-
-        lines.append(thin)
-        lines.append("RECENT REQUEST CONTEXT (last 6 requests before/including this one)")
-        lines.append(thin)
-        for r in recent_req_snapshot[-6:]:
-            status = r.get("status", "?")
-            marker = ">>> FAILED <<<" if r.get("request_id") == req_id else (
-                "  OK" if status == "ok" else f"  {status.upper()}"
-            )
-            lines.append(
-                f"  {marker}  [{r.get('request_id','?')}] "
-                f"model={r.get('model','?')} "
-                f"chars={r.get('prompt_chars','?')} "
-                f"tokens={r.get('prompt_tokens_est','?')} "
-                f"status={status} "
-                f"started={r.get('started_at','')} "
-                f"finished={r.get('finished_at','')}"
-            )
-        lines.append("")
-        lines.append(sep)
-
-        filename.write_text("\n".join(lines), encoding="utf-8")
-        log(f"Error transaction log written: {filename.name}", "API")
-    except Exception as exc:
-        log(f"Failed to write error transaction log: {exc}", "API")
-
 # --- Endpoints ---
 
 @app.get("/v1/models")
@@ -357,16 +174,11 @@ async def openai_chat(request: Request):
     if not isinstance(use_search, bool):
         raise HTTPException(status_code=400, detail="use_search must be a boolean")
 
-    # Parse thinking level from model name
     try:
-        base_model, thinking_level = parse_model_and_thinking(model)
+        base_model = normalize_model(model)
+        thinking_level = normalize_thinking_level(thinking_level_explicit or "medium")
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if thinking_level_explicit:
-        try:
-            thinking_level = normalize_thinking_level(thinking_level_explicit)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     # Combine messages and extract images
     prompt = ""
@@ -452,9 +264,6 @@ async def openai_chat(request: Request):
     trace["prompt_chars"] = prompt_chars
     trace["prompt_tokens_est"] = prompt_tokens_est
     trace["image_count"] = len(image_paths)
-    # Store prompt for error log / retry — full prompt so we can replay it if needed
-    trace["prompt_preview"] = prompt[:3000]
-    trace["prompt_full"] = prompt
 
     log(
         f"Prompt stats: chars={prompt_chars} tokens_est={prompt_tokens_est} images={len(image_paths)}",
@@ -517,7 +326,6 @@ async def openai_chat(request: Request):
         trace["attempts"] = result.get("attempts")
         trace["request_logs"] = result.get("request_logs") or []
         trace["finished_at"] = datetime.now(timezone.utc).isoformat()
-        write_error_transaction_log(trace, result, list(recent_requests))
         raise HTTPException(status_code=500, detail=result.get("error"))
 
     content = result["response"] or ""
@@ -562,7 +370,13 @@ def ready_worker_count() -> int:
     ready = 0
     for worker in worker_pool.workers:
         try:
-            if worker and worker._initialized and worker.page and not worker.page.is_closed():
+            if (
+                worker
+                and worker._initialized
+                and worker.page
+                and not worker.page.is_closed()
+                and str(worker.page.url).startswith("https://gemini.google.com/app")
+            ):
                 ready += 1
         except Exception:
             continue
@@ -570,11 +384,11 @@ def ready_worker_count() -> int:
 
 
 def public_request_trace(trace: Dict) -> Dict:
-    """Return operational metadata without exposing large prompt bodies."""
+    """Return operational metadata without exposing the caller IP."""
     return {
         key: value
         for key, value in trace.items()
-        if key not in {"prompt_full", "prompt_preview", "ip"}
+        if key != "ip"
     }
 
 

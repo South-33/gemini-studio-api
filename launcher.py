@@ -14,9 +14,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Optional
 
-from dotenv import load_dotenv
-
-
 ROOT = Path(__file__).resolve().parent
 LOGS = ROOT / "logs"
 LAUNCHER_LOG = LOGS / "launcher.log"
@@ -243,7 +240,6 @@ def stop_existing_service_processes() -> None:
 
 
 def run() -> int:
-    load_dotenv(ROOT / ".env")
     log("Launcher starting")
     launcher_mutex = acquire_launcher_mutex()
     if launcher_mutex is None:

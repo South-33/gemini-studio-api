@@ -4,7 +4,6 @@ import math
 import os
 import sys
 import random
-import re
 import socket
 import tempfile
 import time
@@ -14,7 +13,7 @@ from datetime import datetime
 from typing import Any, List, Dict, Optional, Tuple
 from urllib.parse import urlparse
 from playwright.async_api import BrowserContext, Page
-from gemini_models import model_family
+from gemini_models import model_family_from_ui, normalize_thinking_level, thinking_level_from_picker_text
 import contextvars
 
 # ContextVar to hold current request's log lines buffer
@@ -184,28 +183,6 @@ class GeminiWebAutomation:
             'button[aria-label^="Open mode picker" i]',
             'button[data-test-id="bard-mode-menu-button"]',
             'button[aria-label*="model" i][aria-label*="picker" i]',
-        ],
-        "new_chat": [
-            'a[aria-label="New chat"]',
-            'button[aria-label="New chat"]',
-            'a[href="/app"]',
-            '[data-test-id="new-chat-button"]',
-        ],
-        "temp_chat": [
-            'button[aria-label="Temporary chat"]',
-            '[data-test-id="temp-chat-button"]',
-        ],
-        "sidebar_toggle": [
-            'button[aria-label="Open sidebar"]',
-            'button[aria-label="Close sidebar"]',
-            'button[aria-label*="sidebar" i]',
-            'button[aria-label="Main menu"]',
-        ],
-        # These test ids are present on the Gemini mode switcher and are more
-        # reliable than the Ctrl+Shift+S shortcut, which merely toggles from
-        # whichever mode happened to be selected last.
-        "chat_tab": [
-            'button[data-test-id="app-tab-chat"]',
         ],
         "copy_btn": [
             'button[aria-label="Copy"]',
@@ -538,7 +515,6 @@ class GeminiWebAutomation:
                 lines = [
                     f"URL        : {dom_info.get('url', '')}",
                     f"Title      : {dom_info.get('title', '')}",
-                    f"Mode       : chat_active={snapshot.get('chat_mode_active')} spark_active={snapshot.get('spark_mode_active')}",
                     f"Stop btn   : {dom_info.get('stopVisible')}  Send btn: {dom_info.get('sendVisible')}",
                     f"Phase      : {snapshot.get('phase')}  Visibility: {snapshot.get('visibility')}",
                     f"Counts     : users={snapshot.get('user_query_count')} responses={snapshot.get('response_count')} copy={snapshot.get('copy_count')} response_copy={snapshot.get('response_copy_count')} input_copy={snapshot.get('input_copy_count')}",
@@ -673,16 +649,10 @@ class GeminiWebAutomation:
 
         return ""
 
-    async def _resolve_locator(self, key: str, require_visible: bool = False, timeout_ms: int = 900):
-        selector = await self._resolve_selector(key, require_visible=require_visible, timeout_ms=timeout_ms)
-        if not selector:
-            return None
-        return self.page.locator(selector).first
-
     def _matches_model(self, item_text: str, model_name: str) -> bool:
         """Match stable model families while ignoring Gemini version changes."""
-        requested_family = model_family(model_name)
-        visible_family = model_family(item_text)
+        requested_family = model_name
+        visible_family = model_family_from_ui(item_text)
         return bool(requested_family and requested_family == visible_family)
 
     async def _get_current_ui_model_and_thinking(self) -> Tuple[Optional[str], Optional[str]]:
@@ -699,11 +669,12 @@ class GeminiWebAutomation:
             if not text:
                 return None, None
 
-            # Detect thinking level
-            ui_thinking = "Extended" if "extended" in text else "Standard"
+            # Current Gemini UI includes the thinking level in the picker label,
+            # for example "Flash Medium".
+            ui_thinking = thinking_level_from_picker_text(text)
 
             # Detect model
-            ui_model = model_family(text)
+            ui_model = model_family_from_ui(text)
 
             return ui_model, ui_thinking
         except Exception as e:
@@ -733,8 +704,6 @@ class GeminiWebAutomation:
             "input_placeholder": "",
             "input_text_len": 0,
             "input_text_head": "",
-            "new_chat_visible": False,
-            "sidebar_expanded": False,
             "copy_count": 0,
             "send_btn_disabled": False,
             "send_btn_aria_disabled": None,
@@ -752,10 +721,6 @@ class GeminiWebAutomation:
             "input_copy_count": 0,
             "user_query_count": 0,
             "empty_chat_visible": False,
-            "temp_chat_landing_visible": False,
-            "temp_chat_button_visible": False,
-            "temp_chat_active": False,
-            "temp_chat_button_classes": [],
             "transition_state": False,
             "thinking_visible": False,
             "thinking_active": False,
@@ -767,9 +732,6 @@ class GeminiWebAutomation:
             "visibility": "unknown",
             "network_events": [],
             "network_outage": None,
-            "chat_tab_visible": False,
-            "chat_mode_active": False,
-            "spark_mode_active": False,
             "model_button_text": "",
             "model_button_aria_label": "",
             "model_picker_count": 0,
@@ -802,37 +764,21 @@ class GeminiWebAutomation:
                         pageTitle.toLowerCase().includes('500') ||
                         bodyText.includes("500. that's an error") ||
                         bodyText.includes("there was an error. please try again later. that's all we know.");
-                    const tempBtn = document.querySelector('[data-test-id="temp-chat-button"], button[aria-label="Temporary chat"]');
-                    const chatTab = document.querySelector('button[data-test-id="app-tab-chat"]');
-                    const sparkTab = document.querySelector('button[data-test-id="app-tab-agent"]');
                     const modelPickers = Array.from(document.querySelectorAll(
                         'button[data-test-id="bard-mode-menu-button"], button[aria-label^="Open mode picker" i]'
                     )).filter(isVisible);
                     const modelPicker = modelPickers[0] || null;
-                    const signInVisible = Array.from(document.querySelectorAll('a, button')).some((el) => {
+                    const authPage = window.location.hostname === 'accounts.google.com' ||
+                        window.location.pathname.toLowerCase().includes('/signin');
+                    const signInVisible = authPage || Array.from(document.querySelectorAll('a, button')).some((el) => {
                         if (!isVisible(el)) return false;
                         const text = (el.innerText || el.textContent || '').trim().toLowerCase();
                         const label = (el.getAttribute('aria-label') || '').trim().toLowerCase();
                         return text === 'sign in' || label === 'sign in';
                     });
-                    const isActiveModeTab = (el) => !!(el && (
-                        el.classList.contains('app-tab--active') ||
-                        el.getAttribute('aria-selected') === 'true' ||
-                        el.getAttribute('aria-current') === 'page'
-                    ));
                     const transitionSpinner = document.querySelector('.loading-content-spinner-container');
 
                     const buttons = Array.from(document.querySelectorAll('button')).filter(isVisible);
-                    const newChatLink = Array.from(document.querySelectorAll('a[aria-label="New chat"], button[aria-label="New chat"], [data-test-id="new-chat-button"] a, [data-test-id="new-chat-button"], a[href="/app"]')).find(isVisible) || null;
-                    const sidebarEl = document.querySelector('bard-sidenav');
-                    const closeSidebarBtn = document.querySelector('button[aria-label="Close sidebar"]');
-                    const sidebarExpanded = !!(sidebarEl && !sidebarEl.classList.contains('collapsed')) || !!closeSidebarBtn || Array.from(document.querySelectorAll('a, button, div, span')).some((el) => {
-                        if (!isVisible(el)) return false;
-                        const text = (el.innerText || '').trim();
-                        return text === 'Scheduled actions' || text === 'Gems' || text === 'My stuff' ||
-                            text === 'Search chats' || text === 'Library' || text === 'New notebook' ||
-                            text === 'All notebooks' || text === 'Recents';
-                    });
                     const stopBtn = buttons.find((b) => {
                         const label = (b.getAttribute('aria-label') || '').toLowerCase();
                         const text = (b.innerText || '').toLowerCase();
@@ -849,12 +795,8 @@ class GeminiWebAutomation:
                         'div[role="textbox"][contenteditable="true"], ' +
                         '.ql-editor[role="textbox"], .ql-editor'
                     )).find(isVisible) || null;
-                    const inputPlaceholder = inputBox ? ((inputBox.getAttribute('data-placeholder') || '').trim()) : '';
-                    const inputText = inputBox ? ((inputBox.innerText || inputBox.textContent || '').trim()) : '';
-                    const tempChatLandingVisible =
-                        inputPlaceholder.toLowerCase().includes('temporary') ||
-                        bodyText.includes("temporary chats don't appear in recent chats") ||
-                        bodyText.includes('temporary chats are saved for 72 hours');
+                    const inputPlaceholder = inputBox ((inputBox.getAttribute('data-placeholder') || '').trim()) : '';
+                    const inputText = inputBox ((inputBox.innerText || inputBox.textContent || '').trim()) : '';
 
                     let responses = document.querySelectorAll('[data-content-type="response"]');
                     if (!responses.length) responses = document.querySelectorAll('model-response, assistant-message-content');
@@ -862,48 +804,24 @@ class GeminiWebAutomation:
                     const emptyChat = document.querySelector('modular-zero-state, zero-state, bard-zero-state');
                     const overlay = document.querySelector('.cdk-overlay-backdrop');
                     const activeElement = document.activeElement;
-                    const last = responses.length ? responses[responses.length - 1] : null;
-                    const lastText = last ? (last.innerText || '') : '';
+                    const last = responses.length responses[responses.length - 1] : null;
+                    const lastText = last (last.innerText || '') : '';
                     const responseCopyButtons = last
-                        ? Array.from(last.querySelectorAll('button[aria-label="Copy"]')).filter(isVisible)
+                        Array.from(last.querySelectorAll('button[aria-label="Copy"]')).filter(isVisible)
                         : [];
                     const inputCopyButtons = Array.from(document.querySelectorAll('button[aria-label="Copy prompt"]')).filter(isVisible);
-                    const legacyThinkingBtn = last
-                        ? Array.from(last.querySelectorAll('button.thoughts-header-button')).find(isVisible) || null
-                        : Array.from(document.querySelectorAll('button.thoughts-header-button')).find(isVisible) || null;
-                    const legacyThinkingLabel = (legacyThinkingBtn?.innerText || legacyThinkingBtn?.textContent || '').trim().slice(0, 120);
-                    const legacyThinkingDoneLabels = new Set(['Show thinking', 'Hide thinking']);
-                    const legacyThinkingActive = !!legacyThinkingBtn && !legacyThinkingDoneLabels.has(legacyThinkingLabel);
-
-                    let legacyThoughtContainer = null;
-                    if (legacyThinkingBtn) {
-                        legacyThoughtContainer =
-                            (last && (last.querySelector('.thought-container') || last.querySelector('[class*="thought-container"]'))) ||
-                            legacyThinkingBtn.closest('[class*="thought-container"]');
-                    }
-                    const legacyThinkingText = legacyThoughtContainer ? (legacyThoughtContainer.innerText || legacyThoughtContainer.textContent || '') : '';
-
-                    // Check for new 2026 thinking overlay
                     const thinkingOverlay = (last && last.querySelector('thinking-overlay')) || document.querySelector('thinking-overlay');
-                    const newThinkingMounted = !!(thinkingOverlay && isVisible(thinkingOverlay));
-                    const newThinkingActive = newThinkingMounted && !!(
+                    const thinkingMounted = !!(thinkingOverlay && isVisible(thinkingOverlay));
+                    const thinkingActive = thinkingMounted && !!(
                         thinkingOverlay.querySelector('thinking-dots-animation, .thinking-dots-animation, .thinking-container')
                     );
-                    const newThinkingLabel = thinkingOverlay ? (thinkingOverlay.innerText || '').trim().slice(0, 120) : '';
-                    // Gemini keeps an empty thinking-overlay mounted after a response.
-                    // Treat only its animation or non-empty summary as liveness.
-                    const newThinkingVisible = newThinkingActive || newThinkingLabel.length > 0;
-
-                    // Resolve final values
-                    const thinkingVisible = legacyThinkingActive || newThinkingVisible;
-                    const thinkingActive = legacyThinkingActive || newThinkingActive;
-                    const thinkingLabel = legacyThinkingActive ? legacyThinkingLabel : newThinkingLabel;
-                    const thinkingText = legacyThinkingActive ? legacyThinkingText : newThinkingLabel;
-                    const thinkingLen = thinkingText.trim().length;
+                    const thinkingLabel = thinkingOverlay (thinkingOverlay.innerText || '').trim().slice(0, 120) : '';
+                    const thinkingVisible = thinkingActive || thinkingLabel.length > 0;
+                    const thinkingLen = thinkingLabel.length;
 
                     // Extract actual response body text (ignoring thinking status overlay)
-                    const msgContentEl = last ? last.querySelector('message-content') : null;
-                    const responseBodyText = msgContentEl ? (msgContentEl.innerText || msgContentEl.textContent || '') : '';
+                    const msgContentEl = last last.querySelector('message-content') : null;
+                    const responseBodyText = msgContentEl (msgContentEl.innerText || msgContentEl.textContent || '') : '';
                     
                     let responseBodyLen = 0;
                     if (msgContentEl) {
@@ -924,7 +842,7 @@ class GeminiWebAutomation:
                     if (responseCopyButtons.length > 0) {
                         phase = 'response_copyable_postprocessing';
                     } else if (stopBtn) {
-                        phase = thinkingVisible && responseBodyLen < 120 ? 'thinking_only' : 'response_streaming';
+                        phase = thinkingVisible && responseBodyLen < 120 'thinking_only' : 'response_streaming';
                     } else if (responseVisible) {
                         phase = 'response_complete_postprocessing';
                     }
@@ -937,8 +855,6 @@ class GeminiWebAutomation:
                         input_placeholder: inputPlaceholder.slice(0, 160),
                         input_text_len: inputText.length,
                         input_text_head: inputText.slice(0, 160),
-                        new_chat_visible: !!newChatLink,
-                        sidebar_expanded: sidebarExpanded,
                         active_button: (stopBtn?.getAttribute('aria-label') || stopBtn?.innerText || sendBtn?.getAttribute('aria-label') || sendBtn?.innerText || '').trim().slice(0, 80),
                         send_btn_disabled: !!(sendBtn && (sendBtn.disabled || sendBtn.getAttribute('disabled') !== null)),
                         send_btn_aria_disabled: sendBtn?.getAttribute('aria-disabled') || null,
@@ -951,13 +867,6 @@ class GeminiWebAutomation:
                         input_copy_count: inputCopyButtons.length,
                         user_query_count: userQueries.length,
                         empty_chat_visible: !!emptyChat,
-                        temp_chat_landing_visible: tempChatLandingVisible,
-                        temp_chat_button_visible: !!(tempBtn && isVisible(tempBtn)),
-                        temp_chat_active: !!(tempBtn && (
-                            tempBtn.classList.contains('temp-chat-on') ||
-                            tempBtn.querySelector('mat-icon[data-mat-icon-name="close"], mat-icon[fonticon="close"]')
-                        )),
-                        temp_chat_button_classes: tempBtn ? Array.from(tempBtn.classList).slice(0, 20) : [],
                         transition_state: !!(transitionSpinner && isVisible(transitionSpinner)),
                         response_count: responses.length,
                         last_response_len: lastText.length,
@@ -972,9 +881,6 @@ class GeminiWebAutomation:
                         phase,
                         error_page_500: isGoogle500,
                         visibility: document.visibilityState || 'unknown',
-                        chat_tab_visible: !!(chatTab && isVisible(chatTab)),
-                        chat_mode_active: isActiveModeTab(chatTab),
-                        spark_mode_active: isActiveModeTab(sparkTab),
                         model_button_text: (modelPicker?.innerText || modelPicker?.textContent || '').trim().slice(0, 160),
                         model_button_aria_label: (modelPicker?.getAttribute('aria-label') || '').trim().slice(0, 160),
                         model_picker_count: modelPickers.length,
@@ -1075,7 +981,7 @@ class GeminiWebAutomation:
             await self.page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
             return
         except Exception as kbd_err:
-            log(f"Keyboard hard refresh failed: {kbd_err}, falling back to standard page.reload...", f"Worker {self.worker_id}")
+            log(f"Keyboard hard refresh failed: {kbd_err}, falling back to page.reload...", f"Worker {self.worker_id}")
 
         await self.page.reload(wait_until="domcontentloaded", timeout=timeout_ms)
 
@@ -1161,383 +1067,42 @@ class GeminiWebAutomation:
             pass
 
     @staticmethod
-    def _classify_new_chat_state(snapshot: Optional[Dict[str, Any]]) -> str:
+    def _is_fresh_chat_ready(snapshot: Optional[Dict[str, Any]]) -> bool:
         snap = snapshot or {}
-        response_count = int(snap.get("response_count") or 0)
-        user_query_count = int(snap.get("user_query_count") or 0)
-        empty_chat_visible = bool(snap.get("empty_chat_visible"))
-        temp_chat_landing_visible = bool(snap.get("temp_chat_landing_visible"))
-        stop_visible = bool(snap.get("stop_visible"))
-        input_visible = bool(snap.get("input_visible"))
-        error_page_500 = bool(snap.get("error_page_500"))
-
-        if (
-            response_count == 0
-            and user_query_count == 0
-            and not stop_visible
-            and not error_page_500
-            and (input_visible or empty_chat_visible or temp_chat_landing_visible)
-        ):
-            return "confirmed_cleared"
-        if response_count > 0 or user_query_count > 0 or stop_visible:
-            return "definitely_not_cleared"
-        if (empty_chat_visible or temp_chat_landing_visible) and not stop_visible and not error_page_500:
-            return "confirmed_cleared"
-        return "transitional_or_uncertain"
-
-    @staticmethod
-    def _is_fresh_temp_chat_ready(snapshot: Optional[Dict[str, Any]]) -> bool:
-        snap = snapshot or {}
-        placeholder = str(snap.get("input_placeholder") or "").lower()
         return bool(
             int(snap.get("user_query_count") or 0) == 0
             and int(snap.get("response_count") or 0) == 0
             and snap.get("input_visible")
-            and (snap.get("temp_chat_active") or "temporary" in placeholder)
             and not snap.get("error_page_500")
         )
-
-    @staticmethod
-    def _is_fresh_regular_chat_ready(snapshot: Optional[Dict[str, Any]]) -> bool:
-        snap = snapshot or {}
-        placeholder = str(snap.get("input_placeholder") or "").lower()
-        return bool(
-            int(snap.get("user_query_count") or 0) == 0
-            and int(snap.get("response_count") or 0) == 0
-            and snap.get("input_visible")
-            and snap.get("new_chat_visible")
-            and not snap.get("error_page_500")
-            and not snap.get("temp_chat_active")
-            and "temporary" not in placeholder
-        )
-
-    @staticmethod
-    def _is_chat_mode(snapshot: Optional[Dict[str, Any]]) -> bool:
-        """Return true only when Gemini's Chat tab is the active mode."""
-        snap = snapshot or {}
-        return bool(snap.get("chat_mode_active") and not snap.get("spark_mode_active"))
-
-    @staticmethod
-    def _is_implicit_chat_mode(snapshot: Optional[Dict[str, Any]]) -> bool:
-        """Accept a ready /app composer when mode selection is not explicit.
-
-        Some accounts/layouts omit the switcher; others render it without a
-        stable active attribute. A visible composer on /app is still an
-        authoritative Chat signal, while Spark uses /spark or an active tab.
-        """
-        snap = snapshot or {}
-        try:
-            path = urlparse(str(snap.get("url") or "")).path.rstrip("/")
-        except Exception:
-            path = ""
-        return bool(
-            path == "/app"
-            and snap.get("input_visible")
-            and not snap.get("spark_mode_active")
-            and not snap.get("error_page_500")
-        )
-
-    async def _ensure_chat_mode(self, timeout_seconds: float = 8.0) -> bool:
-        """Select Gemini Chat explicitly before using Chat-only selectors.
-
-        Gemini persists the Chat/Spark choice and Ctrl+Shift+S is a toggle, so
-        sending the shortcut is not idempotent.  The mode switcher exposes
-        stable test ids; click the Chat button only when it is not already
-        active, then verify the active class and Chat input before continuing.
-        """
-        snapshot = await self._capture_state_snapshot()
-        if self._is_chat_mode(snapshot):
-            return True
-        if self._is_implicit_chat_mode(snapshot):
-            log("Gemini Chat confirmed by ready /app composer", f"Worker {self.worker_id}")
-            return True
-
-        # The mode switcher lives in the side navigation in the current UI.
-        # Opening it is harmless when it is already visible.
-        await self._ensure_sidebar_open()
-        chat_tab = await self._resolve_locator("chat_tab", require_visible=True, timeout_ms=2000)
-
-        async def toggle_chat_with_shortcut() -> bool:
-            # Ctrl+Shift+S is a toggle, not an idempotent selector. Only use it
-            # as a last-resort fallback when the snapshot already proves Spark
-            # is active, and always verify the resulting mode below.
-            if not snapshot.get("spark_mode_active"):
-                return False
-            try:
-                await self.page.bring_to_front()
-                await self.page.keyboard.press("Control+Shift+S")
-                await self._human_delay(250, 400)
-                return True
-            except Exception as shortcut_error:
-                log(f"Chat mode shortcut failed: {shortcut_error}", f"Worker {self.worker_id}")
-                return False
-
-        if chat_tab is None:
-            deadline = time.time() + timeout_seconds
-            shortcut_attempted = False
-            while time.time() < deadline:
-                current = await self._capture_state_snapshot()
-                if (self._is_chat_mode(current) or self._is_implicit_chat_mode(current)) and current.get("input_visible"):
-                    log("Gemini Chat mode confirmed after UI became ready", f"Worker {self.worker_id}")
-                    return True
-                if current.get("spark_mode_active") and not shortcut_attempted:
-                    snapshot = current
-                    shortcut_attempted = await toggle_chat_with_shortcut()
-                await asyncio.sleep(0.2)
-
-            final_snapshot = await self._capture_state_snapshot()
-            log(
-                f"Chat mode unavailable after {timeout_seconds:.1f}s: state={final_snapshot.get('ui_state_hint')} "
-                f"url={final_snapshot.get('url')} input={final_snapshot.get('input_visible')} "
-                f"chat={final_snapshot.get('chat_mode_active')} spark={final_snapshot.get('spark_mode_active')}",
-                f"Worker {self.worker_id}",
-            )
-            self._track_error("Chat mode readiness timed out", "chat_tab", "ensure_chat_mode", final_snapshot)
-            return False
-
-        clicked = False
-        try:
-            await chat_tab.click(timeout=2500)
-            clicked = True
-        except Exception as click_error:
-            # Keep a DOM click fallback for transient overlay/focus issues.
-            try:
-                await self.page.evaluate(
-                    """
-                    () => {
-                        const button = document.querySelector('button[data-test-id="app-tab-chat"]');
-                        if (!button) throw new Error('Chat mode tab not found');
-                        button.click();
-                    }
-                    """
-                )
-                clicked = True
-            except Exception as dom_error:
-                log(
-                    f"Chat mode click failed: {click_error}; DOM fallback failed: {dom_error}",
-                    f"Worker {self.worker_id}",
-                )
-
-        if not clicked and not await toggle_chat_with_shortcut():
-            self._track_error("Chat mode click failed", "chat_tab", "ensure_chat_mode", snapshot)
-            return False
-
-        deadline = time.time() + timeout_seconds
-        while time.time() < deadline:
-            current = await self._capture_state_snapshot()
-            if (self._is_chat_mode(current) or self._is_implicit_chat_mode(current)) and current.get("input_visible"):
-                log("Gemini Chat mode confirmed", f"Worker {self.worker_id}")
-                return True
-            await asyncio.sleep(0.2)
-
-        final_snapshot = await self._capture_state_snapshot()
-        log(
-            f"Chat mode confirmation timed out: chat_active={final_snapshot.get('chat_mode_active')} "
-            f"spark_active={final_snapshot.get('spark_mode_active')} input={final_snapshot.get('input_visible')} "
-            f"url={final_snapshot.get('url')}",
-            f"Worker {self.worker_id}",
-        )
-        self._track_error("Chat mode confirmation timed out", "chat_tab", "ensure_chat_mode", final_snapshot)
-        return False
-
-    async def _ensure_sidebar_open(self) -> bool:
-        snapshot = await self._capture_state_snapshot()
-        if snapshot.get("sidebar_expanded"):
-            return True
-
-        sidebar_btn = await self._resolve_locator("sidebar_toggle")
-        if sidebar_btn is None:
-            return False
-
-        try:
-            if await sidebar_btn.is_visible():
-                await sidebar_btn.click(timeout=1500)
-                await self._human_delay(300, 500)
-        except Exception:
-            return False
-
-        deadline = time.time() + 3.0
-        while time.time() < deadline:
-            snap = await self._capture_state_snapshot()
-            if snap.get("sidebar_expanded"):
-                return True
-            await asyncio.sleep(0.2)
-        return False
-
-    async def _trigger_new_chat_shortcut(self) -> bool:
-        """Use Gemini's Chat-only new-conversation shortcut after mode guard."""
-        try:
-            await self.page.bring_to_front()
-            await self.page.keyboard.press("Control+Shift+O")
-            return True
-        except Exception as e:
-            log(f"New Chat shortcut failed: {e}", f"Worker {self.worker_id}")
-            return False
 
     async def _ensure_fresh_chat(self) -> bool:
-        """Ensure the worker is on a fresh Chat conversation before sending."""
-        if not await self._ensure_chat_mode():
-            return False
-
+        """Ensure the page is the current Gemini /app with an empty composer."""
         baseline = await self._capture_state_snapshot()
-        if self._classify_new_chat_state(baseline) == "confirmed_cleared":
+        if self._is_fresh_chat_ready(baseline) and self.page.url.rstrip("/").endswith("gemini.google.com/app"):
             return True
 
-        async def wait_until_clear(timeout_seconds: float = 4.0) -> bool:
-            deadline = time.time() + timeout_seconds
-            while time.time() < deadline:
-                snap = await self._capture_state_snapshot()
-                if self._classify_new_chat_state(snap) == "confirmed_cleared":
-                    return True
-                await asyncio.sleep(UI_POLL_SECONDS)
-            return False
-
-        # Prefer the labeled control. It is idempotent and was verified in the
-        # live UI; the keyboard shortcut remains a fallback for compact layouts.
-        new_chat = await self._resolve_locator("new_chat", require_visible=True, timeout_ms=1500)
-        if new_chat is not None:
-            try:
-                await new_chat.click(timeout=2000)
-                if await wait_until_clear(NEW_CHAT_CONTROL_CONFIRM_SECONDS):
-                    return True
-            except Exception as exc:
-                log(f"New chat control failed: {exc}", f"Worker {self.worker_id}")
-
-        if await self._trigger_new_chat_shortcut():
-            if await self._ensure_chat_mode() and await wait_until_clear():
-                return True
-
-        final_snapshot = await self._capture_state_snapshot()
-        final_state = self._classify_new_chat_state(final_snapshot)
-        log(f"New chat reset not confirmed ({final_state})", f"Worker {self.worker_id}")
-        self._track_error("New chat reset not confirmed", "new_chat", "ensure_fresh_chat", final_snapshot)
-        return False
-
-    async def _get_temp_chat_button(self):
-        temp_btn = await self._resolve_locator("temp_chat")
-        if temp_btn is None:
-            return None
-
         try:
-            if not await temp_btn.is_visible():
-                sidebar_btn = await self._resolve_locator("sidebar_toggle")
-                if sidebar_btn is not None and await sidebar_btn.is_visible():
-                    await sidebar_btn.click()
-                    await self._human_delay(300, 500)
-        except:
-            pass
-
-        try:
-            if await temp_btn.is_visible():
-                return temp_btn
-        except:
-            pass
-        return None
-
-    async def _click_temp_chat_toggle(self) -> bool:
-        btn = await self._get_temp_chat_button()
-        if btn is None:
+            await self.page.goto("https://gemini.google.com/app", wait_until="domcontentloaded", timeout=30000)
+        except Exception as exc:
+            log(f"Fresh chat navigation failed: {exc}", f"Worker {self.worker_id}")
             return False
 
-        try:
-            await btn.click(timeout=1500)
-            return True
-        except Exception:
-            try:
-                selector = await self._resolve_selector("temp_chat")
-                if not selector:
-                    return False
-                safe_selector = selector.replace("'", "\\'")
-                await self.page.evaluate(
-                    f"""
-                    () => {{
-                        const el = document.querySelector('{safe_selector}');
-                        if (el) el.click();
-                    }}
-                    """
-                )
-                return True
-            except:
-                return False
-
-    async def _ensure_fresh_temp_chat(self) -> bool:
-        """Ensure each request starts from a fresh regular page, then enters temp chat."""
-        if not await self._ensure_chat_mode():
-            self._track_error("Chat mode is not active", "chat_tab", "ensure_fresh_temp_chat")
-            return False
-
-        if not await self._ensure_sidebar_open():
-            self._track_error("Sidebar did not open", "sidebar_toggle", "ensure_fresh_temp_chat")
-            return False
-
-        baseline = await self._capture_state_snapshot()
-        log(
-            f"Temp baseline: input={baseline.get('input_visible')} placeholder={baseline.get('input_placeholder')!r} "
-            f"resp={baseline.get('response_count')} user={baseline.get('user_query_count')} "
-            f"new_chat={baseline.get('new_chat_visible')} temp_btn={baseline.get('temp_chat_button_visible')} "
-            f"landing={baseline.get('temp_chat_landing_visible')} temp_active={baseline.get('temp_chat_active')} 500={baseline.get('error_page_500')}",
-            f"Worker {self.worker_id}",
-        )
-
-        if self._is_fresh_temp_chat_ready(baseline):
-            log("Temp reset path: already on fresh temporary chat", f"Worker {self.worker_id}")
-            return True
-
-        if not self._is_fresh_regular_chat_ready(baseline):
-            if not await self._ensure_fresh_chat():
-                final_snapshot = await self._capture_state_snapshot()
-                self._track_error("Fresh regular chat reset not confirmed", "new_chat", "ensure_fresh_temp_chat", final_snapshot)
-                return False
-            log("Temp reset path: stale chat -> fresh regular via New Chat", f"Worker {self.worker_id}")
-        else:
-            log("Temp reset path: fresh regular -> entering temporary chat", f"Worker {self.worker_id}")
-
-        temp_btn = await self._get_temp_chat_button()
-        if temp_btn is None:
-            log("Temp chat button not found on current Gemini UI layout - checking clean chat fallback", f"Worker {self.worker_id}")
-            snap = await self._capture_state_snapshot()
-            if snap.get("input_visible") and snap.get("response_count", 0) == 0:
-                log("Temp reset path: clean regular chat ready as fallback", f"Worker {self.worker_id}")
-                return True
-            if await self._ensure_fresh_chat():
-                return True
-            final_snapshot = await self._capture_state_snapshot()
-            self._track_error("Clean chat fallback failed", "new_chat", "ensure_fresh_temp_chat", final_snapshot)
-            return False
-
-        if not await self._click_temp_chat_toggle():
-            log("⚠️ Temp Chat toggle click failed - proceeding with fresh chat session", f"Worker {self.worker_id}")
-            snap = await self._capture_state_snapshot()
-            if snap.get("input_visible"):
-                return True
-            return False
-
-        deadline = time.time() + 8.0
+        deadline = time.time() + 12.0
         while time.time() < deadline:
-            snap = await self._capture_state_snapshot()
-            if self._is_fresh_temp_chat_ready(snap):
-                log("Temp reset path: fresh temporary chat ready", f"Worker {self.worker_id}")
+            snapshot = await self._capture_state_snapshot()
+            if self._is_fresh_chat_ready(snapshot) and self.page.url.rstrip("/").endswith("gemini.google.com/app"):
                 return True
+            if snapshot.get("sign_in_visible"):
+                break
             await asyncio.sleep(UI_POLL_SECONDS)
 
         final_snapshot = await self._capture_state_snapshot()
-        log(
-            f"⚠️ Temp Chat reset not confirmed ({self._classify_new_chat_state(final_snapshot)})",
-            f"Worker {self.worker_id}",
-        )
-        log(
-            f"Temp final: input={final_snapshot.get('input_visible')} placeholder={final_snapshot.get('input_placeholder')!r} "
-            f"resp={final_snapshot.get('response_count')} user={final_snapshot.get('user_query_count')} "
-            f"new_chat={final_snapshot.get('new_chat_visible')} temp_btn={final_snapshot.get('temp_chat_button_visible')} "
-            f"landing={final_snapshot.get('temp_chat_landing_visible')} temp_active={final_snapshot.get('temp_chat_active')} 500={final_snapshot.get('error_page_500')}",
-            f"Worker {self.worker_id}",
-        )
-        self._track_error("Temp chat reset not confirmed", "temp_chat", "ensure_fresh_temp_chat", final_snapshot)
-
+        self._track_error("Fresh chat reset not confirmed", "input", "ensure_fresh_chat", final_snapshot)
         return False
 
     async def prepare_next_request(self) -> bool:
-        """Leave the worker in a clean Temporary Chat for the next request."""
+        """Leave the worker in a clean chat for the next request."""
         if not self._initialized or self._generation_in_progress:
             return False
         previous_request_id = self._request_id
@@ -1547,7 +1112,7 @@ class GeminiWebAutomation:
             if snapshot.get("stop_visible"):
                 log("Ready reset refused: generation is still active", f"Worker {self.worker_id}")
                 return False
-            return await self._ensure_fresh_temp_chat()
+            return await self._ensure_fresh_chat()
         finally:
             self._request_id = previous_request_id
 
@@ -1568,10 +1133,6 @@ class GeminiWebAutomation:
     def get_all_errors(cls) -> Dict[int, Dict[str, Any]]:
         return dict(cls._last_errors)
 
-    @classmethod
-    def clear_errors(cls):
-        cls._last_errors.clear()
-
     async def init_with_page(self, page: Page, context: BrowserContext) -> bool:
         self.page = page
         self.context = context
@@ -1586,11 +1147,8 @@ class GeminiWebAutomation:
                             continue
                     raise Exception(f"Google 500 error page during init: {snapshot.get('page_title') or self.page.url}")
 
-                # Do this before resolving the prompt selector: Spark has a
-                # different composer and can look superficially healthy while
-                # all Chat generation/reset selectors are unavailable.
-                if not await self._ensure_chat_mode():
-                    raise Exception("Gemini Chat mode could not be selected")
+                if not await self._ensure_fresh_chat():
+                    raise Exception("Gemini /app composer is not ready")
 
                 # Wait for input to be ready (login check)
                 input_selector = await self._resolve_selector("input", require_visible=True, timeout_ms=12000)
@@ -1607,7 +1165,6 @@ class GeminiWebAutomation:
                     print("[GeminiWeb] ✅ Logged in and ready")
                     
                     self._attach_network_logging()
-                    await self._ensure_sidebar_open()
                     
                     self._initialized = True
                     return True
@@ -1626,8 +1183,7 @@ class GeminiWebAutomation:
             log(
                 f"Init failed: {e}; state={snapshot.get('ui_state_hint', 'unknown')} "
                 f"url={snapshot.get('url', '')} title={snapshot.get('page_title', '')!r} "
-                f"input={snapshot.get('input_visible')} chat={snapshot.get('chat_mode_active')} "
-                f"spark={snapshot.get('spark_mode_active')} sign_in={snapshot.get('sign_in_visible')} "
+                f"input={snapshot.get('input_visible')} sign_in={snapshot.get('sign_in_visible')} "
                 f"model={snapshot.get('model_button_text', '')!r}",
                 f"Worker {self.worker_id}",
             )
@@ -1671,7 +1227,7 @@ class GeminiWebAutomation:
         temp_prompt_file = None
 
         try:
-            self._thinking_requested = bool(thinking_level and thinking_level.lower() in {"extended", "high", "deep"})
+            self._thinking_requested = bool(thinking_level and thinking_level.lower() == "high")
             self._generation_in_progress = True
             self._request_id = (request_id or "").strip() or uuid.uuid4().hex[:8]
             self._recent_network_events.clear()
@@ -1683,13 +1239,6 @@ class GeminiWebAutomation:
             self._log(
                 f"[{self._request_id}] Request: model={model}, prompt_chars={prompt_chars}, prompt_tokens_est={prompt_tokens_est}"
             )
-
-            # A user/browser session can switch modes after worker init.  Make
-            # the Chat requirement idempotent at the request boundary too.
-            if not await self._ensure_chat_mode():
-                err = "Gemini Chat mode is not active"
-                self._track_error(err, "chat_tab", "send_message")
-                return {"success": False, "error": err}
 
             copy_candidates = self._selector_candidates("copy_btn")
             if not copy_candidates:
@@ -1733,9 +1282,9 @@ class GeminiWebAutomation:
             except:
                 pass
             
-            # 1. Fresh temp chat
-            if not await self._ensure_fresh_temp_chat():
-                return {"success": False, "error": "Fresh temp chat reset not confirmed"}
+            # 1. Fresh chat
+            if not await self._ensure_fresh_chat():
+                return {"success": False, "error": "Fresh chat reset not confirmed"}
 
             await self._human_delay()
 
@@ -1763,8 +1312,8 @@ class GeminiWebAutomation:
                     self._current_selected_model = ui_model
 
                 # Select and verify reasoning from the current UI, never from
-                # cached state left by the previous Temporary Chat.
-                target_thinking = thinking_level or "Standard"
+                # state left by the previous request.
+                target_thinking = thinking_level or "Medium"
                 if target_thinking and ui_thinking != target_thinking:
                     await self._set_thinking_level(target_thinking)
                     _, verified_thinking = await self._get_current_ui_model_and_thinking()
@@ -2154,7 +1703,7 @@ class GeminiWebAutomation:
                         )
                         if broader_live and not backend_activity_live:
                             # Broader traffic is alive even though generation URL is stale —
-                            # use the extended threshold so we don't kill a healthy slow prefill.
+                            # use the longer threshold so we don't kill a healthy slow prefill.
                             empty_threshold = max(empty_threshold, STALL_EMPTY_SECONDS_WITH_ACTIVITY)
                             log(
                                 f"[{self._request_id}] Broader liveness active (broad_net_age={int(broader_age)}s); "
@@ -2178,7 +1727,7 @@ class GeminiWebAutomation:
                     is_new_thinking = snap.get("thinking_visible", False) and not snap.get("thinking_label", "").lower().startswith("show thinking")
 
                     # Cooked check for thinking models:
-                    # Extended thinking can take up to 120s to begin returning visible output.
+                    # High thinking can take longer to begin returning visible output.
                     cooked_threshold = 120
                     if self._current_prompt_tokens_est and self._current_prompt_tokens_est >= LARGE_PROMPT_TOKEN_THRESHOLD:
                         cooked_threshold = STALL_EMPTY_SECONDS_LARGE_PROMPT
@@ -2475,15 +2024,7 @@ class GeminiWebAutomation:
 
     async def _set_thinking_level(self, level: str):
         """Set Gemini Web thinking level when explicitly requested."""
-        normalized = (level or "").strip().lower()
-        if not normalized:
-            return
-        if normalized in {"high", "extended", "deep"}:
-            target_text = "Extended"
-        elif normalized in {"standard", "medium", "low", "minimal"}:
-            target_text = "Standard"
-        else:
-            return
+        target_text = normalize_thinking_level(level)
 
         try:
             model_selector = await self._resolve_selector("model_btn", require_visible=True, timeout_ms=1500)
@@ -2494,82 +2035,19 @@ class GeminiWebAutomation:
             await self.page.locator(model_selector).first.click()
             await self._human_delay(300, 450)
 
-            # Check if new UI style (Extended thinking toggle directly in main dropdown menu) is active
-            extended_thinking_item = self.page.locator(
-                'gem-menu-item:has-text("Extended thinking"), [role="menuitem"]:has-text("Extended thinking")'
-            ).first
+            # Low/Medium/High are visible labeled controls in the current picker.
+            # Select by exact text, never by position or generated class names.
+            option = self.page.get_by_text(target_text, exact=True)
+            count = await option.count()
+            for i in range(count):
+                candidate = option.nth(i)
+                if await candidate.is_visible():
+                    await candidate.click(timeout=2000)
+                    log(f"Selected thinking level: {target_text}", f"Worker {self.worker_id}")
+                    await self._human_delay(250, 400)
+                    return
 
-            is_new_ui = False
-            try:
-                await extended_thinking_item.wait_for(state="visible", timeout=1200)
-                is_new_ui = True
-            except Exception:
-                pass
-
-            if is_new_ui:
-                # Read selected state of "Extended thinking" toggle
-                class_attr = await extended_thinking_item.get_attribute("class") or ""
-                content_item = extended_thinking_item.locator('gem-menu-item-content, [class*="content"]').first
-                content_class_attr = ""
-                if await content_item.count() > 0:
-                    content_class_attr = await content_item.get_attribute("class") or ""
-                
-                has_checkmark = await extended_thinking_item.locator(
-                    'gem-icon[aria-label="Selected"], mat-icon:has-text("check"), [class*="selected"]'
-                ).count() > 0
-
-                is_currently_extended = (
-                    "selected" in class_attr.lower() or 
-                    "selected" in content_class_attr.lower() or 
-                    has_checkmark
-                )
-
-                log(f"Detected thinking level via toggle state: is_currently_extended={is_currently_extended}", f"Worker {self.worker_id}")
-
-                if target_text == "Extended":
-                    if not is_currently_extended:
-                        log("Extended thinking is currently OFF, clicking to toggle ON", f"Worker {self.worker_id}")
-                        await extended_thinking_item.click()
-                        await self._human_delay(300, 500)
-                    else:
-                        log("Extended thinking is already ON, closing menu", f"Worker {self.worker_id}")
-                        await self.page.keyboard.press("Escape")
-                        await self._human_delay(150, 300)
-                else:  # target_text == "Standard"
-                    if is_currently_extended:
-                        log("Extended thinking is currently ON, clicking to toggle OFF", f"Worker {self.worker_id}")
-                        await extended_thinking_item.click()
-                        await self._human_delay(300, 500)
-                    else:
-                        log("Extended thinking is already OFF (Standard), closing menu", f"Worker {self.worker_id}")
-                        await self.page.keyboard.press("Escape")
-                        await self._human_delay(150, 300)
-                return
-
-            # Legacy sub-menu thinking level selection fallback. Match labels,
-            # never positions: menu order can change without warning.
-            log("Extended thinking toggle not found in main menu, falling back to legacy sub-menu", f"Worker {self.worker_id}")
-            trigger = self.page.locator('gem-menu-item[value="thinking_level"]').first
-            await trigger.wait_for(state="visible", timeout=1500)
-            await trigger.click(timeout=1500)
-            await self._human_delay(300, 450)
-
-            # Try to match by text first
-            option = self.page.locator(f'gem-menu-item:has-text("{target_text}")').filter(has_not_text="Thinking level").first
-            try:
-                await option.wait_for(state="visible", timeout=1500)
-                await option.click(timeout=1500)
-                log(f"Selected thinking level (legacy): {target_text}", f"Worker {self.worker_id}")
-                await self._human_delay(250, 400)
-                return
-            except Exception as text_error:
-                log(
-                    f"Thinking level label {target_text!r} was not found: {text_error}",
-                    f"Worker {self.worker_id}",
-                )
-
-            item_count = await self.page.locator('gem-menu-item, [role="menuitem"]').count()
-            raise Exception(f"No labeled submenu option found for thinking level {target_text} (count={item_count})")
+            raise Exception(f"No visible thinking level control found for {target_text}")
         except Exception as e:
             log(f"Thinking level selection failed: {e}", f"Worker {self.worker_id}")
             self._track_error(str(e), "thinking_level", "set_thinking_level")
@@ -2827,7 +2305,7 @@ class GeminiWebAutomation:
                         pass
                 temp_file_path = None
 
-        # Standard paste path (for short prompts or fallback)
+        # Direct editor path for short prompts or attachment fallback.
         if images:
             for img_path in images:
                 await self._paste_image(img_path)

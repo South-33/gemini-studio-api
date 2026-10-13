@@ -30,6 +30,16 @@ class FakeLocatorPage:
         return self._locator
 
 
+class FakeNavigationPage:
+    def __init__(self, url="https://gemini.google.com/app/old-chat"):
+        self.url = url
+        self.visited = []
+
+    async def goto(self, url, **_kwargs):
+        self.url = url
+        self.visited.append(url)
+
+
 class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
     def test_model_picker_prefers_semantic_label_then_test_id(self):
         selectors = GeminiWebAutomation.SELECTORS["model_btn"]
@@ -93,12 +103,12 @@ class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
         worker._initialized = True
         worker._generation_in_progress = False
         worker._capture_state_snapshot = AsyncMock(return_value={"stop_visible": True})
-        worker._ensure_fresh_temp_chat = AsyncMock(return_value=True)
+        worker._ensure_fresh_chat = AsyncMock(return_value=True)
 
         ready = await worker.prepare_next_request()
 
         self.assertFalse(ready)
-        worker._ensure_fresh_temp_chat.assert_not_awaited()
+        worker._ensure_fresh_chat.assert_not_awaited()
 
     def test_dead_response_shell_is_detected_without_waiting_for_full_timeout(self):
         helper = GeminiWebAutomation._is_dead_response_shell
@@ -123,7 +133,7 @@ class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
     def test_model_matching_tolerates_version_and_label_changes(self):
         matcher = GeminiWebAutomation(worker_id=1)._matches_model
-        self.assertTrue(matcher("Gemini 3.7 Flash", "gemini-3.6-flash"))
+        self.assertTrue(matcher("Gemini 3.8 Flash", "flash"))
         self.assertTrue(matcher("Flash Lite", "flash-lite"))
         self.assertTrue(matcher("Gemini 4 Pro", "pro"))
         self.assertFalse(matcher("Gemini 3.7 Flash", "flash-lite"))
@@ -159,129 +169,24 @@ class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(ready)
         self.assertEqual(worker._visible_attachment_file_names.await_count, 2)
 
-    def test_chat_mode_requires_chat_active_and_spark_inactive(self):
-        self.assertTrue(GeminiWebAutomation._is_chat_mode({
-            "chat_mode_active": True,
-            "spark_mode_active": False,
-        }))
-        self.assertFalse(GeminiWebAutomation._is_chat_mode({
-            "chat_mode_active": False,
-            "spark_mode_active": True,
-        }))
-        self.assertFalse(GeminiWebAutomation._is_chat_mode({
-            "chat_mode_active": True,
-            "spark_mode_active": True,
-        }))
-
-    async def test_chat_mode_clicks_chat_tab_when_spark_is_active(self):
+    async def test_dirty_chat_is_reset_by_navigating_to_app(self):
         worker = GeminiWebAutomation(worker_id=1)
-        chat_tab = FakeLocator()
-        worker._ensure_sidebar_open = AsyncMock(return_value=True)
-        worker._resolve_locator = AsyncMock(return_value=chat_tab)
-        worker._capture_state_snapshot = AsyncMock(side_effect=[
-            {"chat_mode_active": False, "spark_mode_active": True},
-            {"chat_mode_active": True, "spark_mode_active": False, "input_visible": True},
-        ])
-
-        selected = await worker._ensure_chat_mode(timeout_seconds=0.5)
-
-        self.assertTrue(selected)
-        self.assertEqual(chat_tab.clicked, 1)
-
-    async def test_chat_mode_waits_for_composer_when_tab_is_missing_during_load(self):
-        worker = GeminiWebAutomation(worker_id=1)
-        worker._ensure_sidebar_open = AsyncMock(return_value=False)
-        worker._resolve_locator = AsyncMock(return_value=None)
-        worker._capture_state_snapshot = AsyncMock(side_effect=[
-            {
-                "url": "https://gemini.google.com/app",
-                "input_visible": False,
-                "chat_mode_active": False,
-                "spark_mode_active": False,
-                "error_page_500": False,
-            },
-            {
-                "url": "https://gemini.google.com/app",
-                "input_visible": True,
-                "chat_mode_active": False,
-                "spark_mode_active": False,
-                "error_page_500": False,
-            },
-        ])
-
-        selected = await worker._ensure_chat_mode(timeout_seconds=0.5)
-
-        self.assertTrue(selected)
-
-    async def test_new_chat_control_is_preferred_over_keyboard_shortcut(self):
-        worker = GeminiWebAutomation(worker_id=1)
-        new_chat = FakeLocator()
-        worker._ensure_chat_mode = AsyncMock(return_value=True)
-        worker._resolve_locator = AsyncMock(return_value=new_chat)
-        worker._trigger_new_chat_shortcut = AsyncMock(return_value=True)
+        worker.page = FakeNavigationPage()
         worker._capture_state_snapshot = AsyncMock(side_effect=[
             {"input_visible": True, "user_query_count": 1, "response_count": 1},
-            {"input_visible": True, "user_query_count": 0, "response_count": 0},
+            {
+                "input_visible": True,
+                "user_query_count": 0,
+                "response_count": 0,
+                "error_page_500": False,
+                "sign_in_visible": False,
+            },
         ])
 
         ready = await worker._ensure_fresh_chat()
 
         self.assertTrue(ready)
-        self.assertEqual(new_chat.clicked, 1)
-        worker._trigger_new_chat_shortcut.assert_not_awaited()
-
-    async def test_temp_reset_uses_fresh_chat_confirmation_once(self):
-        worker = GeminiWebAutomation(worker_id=1)
-        temp_button = FakeLocator()
-        worker._ensure_chat_mode = AsyncMock(return_value=True)
-        worker._ensure_sidebar_open = AsyncMock(return_value=True)
-        worker._ensure_fresh_chat = AsyncMock(return_value=True)
-        worker._get_temp_chat_button = AsyncMock(return_value=temp_button)
-        worker._click_temp_chat_toggle = AsyncMock(return_value=True)
-        worker._capture_state_snapshot = AsyncMock(side_effect=[
-            {
-                "input_visible": True,
-                "user_query_count": 1,
-                "response_count": 1,
-                "new_chat_visible": True,
-            },
-            {
-                "input_visible": True,
-                "user_query_count": 0,
-                "response_count": 0,
-                "temp_chat_active": True,
-                "temp_chat_landing_visible": True,
-            },
-        ])
-
-        ready = await worker._ensure_fresh_temp_chat()
-
-        self.assertTrue(ready)
-        worker._ensure_fresh_chat.assert_awaited_once()
-        self.assertEqual(worker._capture_state_snapshot.await_count, 2)
-
-    def test_ready_app_without_explicit_mode_state_is_chat(self):
-        self.assertTrue(GeminiWebAutomation._is_implicit_chat_mode({
-            "url": "https://gemini.google.com/app",
-            "input_visible": True,
-            "chat_tab_visible": True,
-            "spark_mode_active": False,
-            "error_page_500": False,
-        }))
-        self.assertFalse(GeminiWebAutomation._is_implicit_chat_mode({
-            "url": "https://gemini.google.com/spark",
-            "input_visible": True,
-            "chat_tab_visible": False,
-            "spark_mode_active": False,
-            "error_page_500": False,
-        }))
-        self.assertFalse(GeminiWebAutomation._is_implicit_chat_mode({
-            "url": "https://gemini.google.com/app",
-            "input_visible": True,
-            "chat_tab_visible": True,
-            "spark_mode_active": True,
-            "error_page_500": False,
-        }))
+        self.assertEqual(worker.page.visited, ["https://gemini.google.com/app"])
 
     async def test_retained_prompt_is_cleared_only_after_acceptance(self):
         worker = GeminiWebAutomation(worker_id=1)

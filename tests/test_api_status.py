@@ -5,17 +5,18 @@ from fastapi import Response
 
 
 class FakePage:
-    def __init__(self, closed=False):
+    def __init__(self, closed=False, url="https://gemini.google.com/app"):
         self.closed = closed
+        self.url = url
 
     def is_closed(self):
         return self.closed
 
 
 class FakeWorker:
-    def __init__(self, initialized=True, closed=False):
+    def __init__(self, initialized=True, closed=False, url="https://gemini.google.com/app"):
         self._initialized = initialized
-        self.page = FakePage(closed=closed)
+        self.page = FakePage(closed=closed, url=url)
 
 
 class FakePool:
@@ -40,14 +41,20 @@ class ApiStatusTests(unittest.TestCase):
 
         self.assertEqual(main.ready_worker_count(), 1)
 
-    def test_public_trace_excludes_prompt_content(self):
+    def test_ready_worker_count_rejects_google_login_page(self):
+        main.worker_pool = FakePool(True, [
+            FakeWorker(initialized=True, url="https://accounts.google.com/v3/signin/identifier"),
+            FakeWorker(initialized=True, url="https://gemini.google.com/signin"),
+        ])
+
+        self.assertEqual(main.ready_worker_count(), 0)
+
+    def test_public_trace_excludes_caller_ip(self):
         public = main.public_request_trace({
             "request_id": "req-1",
             "ip": "127.0.0.1",
             "status": "failed",
             "prompt_chars": 1234,
-            "prompt_preview": "private preview",
-            "prompt_full": "private full prompt",
         })
 
         self.assertEqual(public, {

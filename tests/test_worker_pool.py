@@ -63,7 +63,7 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(worker.prepare_calls, 2)
         self.assertEqual(pool._queued_requests, 0)
 
-    async def test_success_prepares_next_temp_chat_before_returning(self):
+    async def test_success_prepares_next_clean_chat_before_returning(self):
         pool = WorkerPool()
         worker = FakeWorker()
         pool.workers = [worker]
@@ -85,14 +85,12 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
         pool.workers = [worker]
         pool._initialized = True
         pool._recreate_worker = AsyncMock(return_value=True)
-        pool._notify_final_failure = AsyncMock()
 
         result = await pool.send_message("hello", request_id="retry")
 
         self.assertFalse(result["success"])
         self.assertEqual(worker.calls, 1)
         pool._recreate_worker.assert_not_awaited()
-        pool._notify_final_failure.assert_awaited_once()
 
     async def test_missing_response_marker_is_retried_once(self):
         pool = WorkerPool()
@@ -128,7 +126,7 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["ready_for_next_request"])
         self.assertFalse(pool._initialized)
 
-    async def test_generic_gemini_refusal_is_retried_on_a_fresh_temp_chat(self):
+    async def test_generic_gemini_refusal_is_retried_on_a_fresh_chat(self):
         pool = WorkerPool()
         worker = FakeWorker([
             {
@@ -169,7 +167,7 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
         context = {
             "project": "borderclash",
             "client": "borderclash-convex",
-            "raw_model": "flash-standard",
+            "raw_model": "flash",
             "message_count": 1,
             "image_count": 0,
             "prompt_tokens_est": 12,
@@ -178,7 +176,7 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
         result = await pool.send_message(
             "full prompt",
             model="flash",
-            thinking_level="Standard",
+            thinking_level="Medium",
             use_search=True,
             request_id="trace-me",
             request_context=context,
@@ -189,7 +187,7 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["prompt"], "full prompt")
         self.assertEqual(kwargs["request_context"], context)
         self.assertEqual(kwargs["model"], "flash")
-        self.assertEqual(kwargs["thinking_level"], "Standard")
+        self.assertEqual(kwargs["thinking_level"], "Medium")
         self.assertTrue(kwargs["use_search"])
         self.assertTrue(kwargs["search_instruction_present"])
         self.assertGreaterEqual(kwargs["attempt_duration_ms"], 0)
