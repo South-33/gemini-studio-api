@@ -84,6 +84,12 @@ class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('input_area.press("Enter")', source)
         self.assertIn('thinking_level or "Medium"', source)
 
+    def test_short_prompt_path_uses_clipboard_paste_not_fill(self):
+        source = inspect.getsource(GeminiWebAutomation._prepare_and_enter_prompt)
+        direct_path = source.split("# Direct editor path for short prompts or attachment fallback.", 1)[1]
+        self.assertIn("_paste_text_into_input", direct_path)
+        self.assertNotIn("input_area.fill(entered_prompt)", direct_path)
+
     async def test_ready_reset_refuses_to_navigate_active_generation(self):
         worker = GeminiWebAutomation(worker_id=1)
         worker._initialized = True

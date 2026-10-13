@@ -2195,6 +2195,16 @@ class GeminiWebAutomation:
         """Only explicit caller intent may add a transport-level Search instruction."""
         return bool(use_search)
 
+    async def _paste_text_into_input(self, input_area, text: str) -> None:
+        """Enter text through Gemini's normal clipboard-paste interaction."""
+        await input_area.click()
+        await input_area.press("Control+a")
+        await input_area.press("Backspace")
+        async with GeminiWebAutomation._get_clipboard_lock():
+            await self.page.evaluate("text => navigator.clipboard.writeText(text)", text)
+            await input_area.press("Control+v")
+        await self._human_delay(120, 220)
+
     async def _prepare_and_enter_prompt(
         self,
         input_area,
@@ -2276,8 +2286,7 @@ class GeminiWebAutomation:
         entered_prompt = prompt_str
         if use_search:
             entered_prompt = f"Use Google Search for this request.\n\n{prompt_str}"
-        await input_area.fill(entered_prompt)
-        await self._human_delay(50, 100)
+        await self._paste_text_into_input(input_area, entered_prompt)
         return entered_prompt, None
 
     async def close(self):
