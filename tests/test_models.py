@@ -10,11 +10,11 @@ from gemini_models import (
 
 class ModelTests(unittest.TestCase):
     def test_api_models_are_exact_current_families(self):
-        for model in ("flash", "flash-lite", "pro"):
+        for model in ("flash-lite", "pro"):
             self.assertEqual(normalize_model(model), model)
-        for old_or_ambiguous in ("thinking", "fast", "gemini-flash", "gemini-3.5-flash-lite"):
+        for unsupported in ("flash", "thinking", "fast", "gemini-flash", "gemini-3.5-flash-lite"):
             with self.assertRaises(ValueError):
-                normalize_model(old_or_ambiguous)
+                normalize_model(unsupported)
 
     def test_ui_family_matching_ignores_visible_numeric_versions(self):
         self.assertEqual(model_family_from_ui("3.5 Flash-Lite Fastest answers"), "flash-lite")

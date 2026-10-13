@@ -1147,7 +1147,7 @@ class GeminiWebAutomation:
                 try:
                     await self.page.wait_for_selector(input_selector, timeout=30000)
                     await self._human_delay(500, 1000)
-                    print("[GeminiWeb] ✅ Logged in and ready")
+                    print("[GeminiWeb] Logged in and ready")
                     
                     self._attach_network_logging()
                     
@@ -1431,7 +1431,7 @@ class GeminiWebAutomation:
                 await asyncio.sleep(start_poll_seconds)
 
             if start_signal:
-                log(f"✅ Generation started (signal={start_signal})", f"Worker {self.worker_id}")
+                log(f"Generation started (signal={start_signal})", f"Worker {self.worker_id}")
                 generation_started = True
             else:
                 if last_snap is None:
@@ -1442,7 +1442,7 @@ class GeminiWebAutomation:
                 input_still_present = prompt_len > 0 and input_after_len >= max(1, prompt_len // 2)
                 confirmed_unsent = send_still_visible and input_still_present
                 if not confirmed_unsent:
-                    log("⚠️ Ambiguous start state; proceeding to response wait without resending", f"Worker {self.worker_id}")
+                    log("Ambiguous start state; proceeding to response wait without resending", f"Worker {self.worker_id}")
                     generation_started = True
 
             if not generation_started:
@@ -1483,7 +1483,7 @@ class GeminiWebAutomation:
                     snapshot = await self._capture_state_snapshot()
                     outage_error, outage_diag = await self._build_network_outage_error()
                     snapshot.update(outage_diag)
-                    log(f"⚠️ {outage_error}", f"Worker {self.worker_id}")
+                    log(f"{outage_error}", f"Worker {self.worker_id}")
                     self._track_error(outage_error, "copy_btn", "wait_for_response_network_outage", snapshot)
                     return {"success": False, "error": outage_error}
 
@@ -1521,12 +1521,12 @@ class GeminiWebAutomation:
                     self._track_error("Page evaluation hung in wait loop", "copy_btn", "wait_for_response_hung")
                     return {"success": False, "error": "Page evaluation hung in wait loop"}
                 except Exception as eval_err:
-                    log(f"⚠️ Page evaluation error in wait loop: {eval_err}", f"Worker {self.worker_id}")
+                    log(f"Page evaluation error in wait loop: {eval_err}", f"Worker {self.worker_id}")
                     await asyncio.sleep(0.5)
                     continue
 
                 if page_snapshot.get("error_page_500"):
-                    log("⚠️ Google 500 error page detected during response wait", f"Worker {self.worker_id}")
+                    log("Google 500 error page detected during response wait", f"Worker {self.worker_id}")
                     self._track_error("Google 500 error page", "input", "wait_for_response_500_page", page_snapshot)
                     return {"success": False, "error": "Google 500 error page"}
 
@@ -1542,7 +1542,7 @@ class GeminiWebAutomation:
                     and self._is_dead_response_shell(page_snapshot, pre_send_user_query_count)
                 ):
                     error = "Gemini entered a non-copyable terminal response state"
-                    log(f"❌ {error}", f"Worker {self.worker_id}")
+                    log(f"{error}", f"Worker {self.worker_id}")
                     self._track_error(error, "copy_btn", "wait_for_response_dead_shell", page_snapshot)
                     return {"success": False, "error": error}
 
@@ -1651,7 +1651,7 @@ class GeminiWebAutomation:
                             pre_send_count,
                         )
                         if finalized_text:
-                            log("✅ Finalized stable response during post-processing", f"Worker {self.worker_id}")
+                            log("Finalized stable response during post-processing", f"Worker {self.worker_id}")
                             self._last_request_success = True
                             return {"success": True, "response": finalized_text}
 
@@ -1764,7 +1764,7 @@ class GeminiWebAutomation:
                             )
 
                     if stall_reason:
-                        log(f"⚠️ {stall_reason}", f"Worker {self.worker_id}")
+                        log(f"{stall_reason}", f"Worker {self.worker_id}")
                         net_events = snap.get("network_events") or []
                         if net_events:
                             tail = []
@@ -1809,7 +1809,7 @@ class GeminiWebAutomation:
                 await asyncio.sleep(UI_POLL_SECONDS)
             
             if not copy_btn:
-                log(f"❌ Timeout after {max_wait}s waiting for response", f"Worker {self.worker_id}")
+                log(f"Timeout after {max_wait}s waiting for response", f"Worker {self.worker_id}")
                 snapshot = await self._capture_state_snapshot()
                 self._track_error(
                     f"Timeout after {max_wait}s waiting for response",
@@ -1841,7 +1841,7 @@ class GeminiWebAutomation:
             self._generation_in_progress = False
             
             if not markdown:
-                log("⚠️ Clipboard empty after copy", f"Worker {self.worker_id}")
+                log("Clipboard empty after copy", f"Worker {self.worker_id}")
                 snapshot = await self._capture_state_snapshot()
                 self._track_error("Clipboard empty", "copy_btn", "extract_response", snapshot)
                 return {"success": False, "error": "Clipboard extraction failed"}
@@ -1849,7 +1849,7 @@ class GeminiWebAutomation:
             out_chars = len(markdown)
             out_tokens_est = self._estimate_tokens(markdown)
             log(
-                f"✅ Response: chars={out_chars}, tokens_est={out_tokens_est}",
+                f"Response: chars={out_chars}, tokens_est={out_tokens_est}",
                 f"Worker {self.worker_id}",
             )
             self._last_request_success = True
@@ -1861,7 +1861,7 @@ class GeminiWebAutomation:
 
         except Exception as e:
             self._generation_in_progress = False
-            log(f"❌ Error: {e}", f"Worker {self.worker_id}")
+            log(f"Error: {e}", f"Worker {self.worker_id}")
             try:
                 snapshot = await self._capture_state_snapshot()
             except:
@@ -1931,7 +1931,7 @@ class GeminiWebAutomation:
                 text = await item.inner_text()
                 if self._matches_model(text, model_name):
                     await item.click()
-                    print(f"[Worker {self.worker_id}] ✅ Selected model: {model_name}")
+                    print(f"[Worker {self.worker_id}] Selected model: {model_name}")
                     await self._human_delay(300, 600)
                     return True
 
@@ -1948,7 +1948,7 @@ class GeminiWebAutomation:
             return False
 
         except Exception as e:
-            print(f"[Worker {self.worker_id}] ⚠️ Model selection failed: {e}")
+            print(f"[Worker {self.worker_id}] Model selection failed: {e}")
             self._track_error(str(e), "model_btn", "select_model")
             # Ensure menu is closed
             try:
@@ -2044,9 +2044,9 @@ class GeminiWebAutomation:
             
             await self.page.keyboard.press("Control+v")
             await asyncio.sleep(1.0)
-            print(f"[Worker {self.worker_id}] ✅ Image pasted")
+            print(f"[Worker {self.worker_id}] Image pasted")
         except Exception as e:
-            print(f"[Worker {self.worker_id}] ⚠️ Image paste warning: {e}")
+            print(f"[Worker {self.worker_id}] Image paste warning: {e}")
 
     async def _visible_attachment_file_names(self, file_paths: List[str]) -> List[str]:
         """Return expected attachment filenames that are visibly rendered in Gemini."""
@@ -2112,11 +2112,11 @@ class GeminiWebAutomation:
                             elapsed = round(time.time() - start, 2)
                             if expected_names:
                                 log(
-                                    f"✅ Attachment visible and Send button ready ({elapsed}s): {expected_names}",
+                                    f"Attachment visible and Send button ready ({elapsed}s): {expected_names}",
                                     f"Worker {self.worker_id}",
                                 )
                             else:
-                                log(f"✅ Send button enabled & ready ({elapsed}s)", f"Worker {self.worker_id}")
+                                log(f"Send button enabled & ready ({elapsed}s)", f"Worker {self.worker_id}")
                             return True
                     except Exception:
                         pass
@@ -2126,11 +2126,11 @@ class GeminiWebAutomation:
         elapsed = round(time.time() - start, 2)
         if expected_names:
             log(
-                f"⚠️ Attachment confirmation timed out ({elapsed}s): {expected_names}",
+                f"Attachment confirmation timed out ({elapsed}s): {expected_names}",
                 f"Worker {self.worker_id}",
             )
         else:
-            log(f"⚠️ Send button ready wait timeout ({elapsed}s), proceeding to send attempt", f"Worker {self.worker_id}")
+            log(f"Send button ready wait timeout ({elapsed}s), proceeding to send attempt", f"Worker {self.worker_id}")
         return False
 
     async def _upload_file_attachment(self, file_paths: List[str]) -> bool:
@@ -2161,7 +2161,7 @@ class GeminiWebAutomation:
 
             return await self._wait_for_attachment_upload_complete(30.0, file_paths)
         except Exception as e:
-            log(f"⚠️ Error uploading file attachments: {e}", f"Worker {self.worker_id}")
+            log(f"Error uploading file attachments: {e}", f"Worker {self.worker_id}")
             return False
 
     @staticmethod
@@ -2208,7 +2208,7 @@ class GeminiWebAutomation:
                 uploaded = await self._upload_file_attachment(file_paths)
 
                 if uploaded:
-                    log("✅ Prompt .txt file attached cleanly & ready to send.", f"Worker {self.worker_id}")
+                    log("Prompt .txt file attached cleanly & ready to send.", f"Worker {self.worker_id}")
                     short_input_text = ""
                     if needs_search_hint:
                         short_input_text = "Use Google Search for this request and read the attached prompt."
@@ -2225,7 +2225,7 @@ class GeminiWebAutomation:
                     await self._human_delay(200, 400)
                     return short_input_text, temp_file_path
                 else:
-                    log("⚠️ File upload failed, falling back to direct text fill...", f"Worker {self.worker_id}")
+                    log("File upload failed, falling back to direct text fill...", f"Worker {self.worker_id}")
                     if os.path.exists(temp_file_path):
                         try:
                             os.remove(temp_file_path)
@@ -2233,7 +2233,7 @@ class GeminiWebAutomation:
                             pass
                     temp_file_path = None
             except Exception as e:
-                log(f"⚠️ Prompt file attachment failed ({e}), falling back to direct text fill...", f"Worker {self.worker_id}")
+                log(f"Prompt file attachment failed ({e}), falling back to direct text fill...", f"Worker {self.worker_id}")
                 if temp_file_path and os.path.exists(temp_file_path):
                     try:
                         os.remove(temp_file_path)

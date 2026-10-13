@@ -309,7 +309,7 @@ async def openai_chat(request: Request):
             pass
         trace["status"] = "timeout"
         trace["finished_at"] = datetime.now(timezone.utc).isoformat()
-        log(f"❌ BROWSER TIMEOUT after {api_timeout}s - request stuck in browser thread", "API")
+        log(f"BROWSER TIMEOUT after {api_timeout}s - request stuck in browser thread", "API")
         raise HTTPException(status_code=504, detail=f"Browser operation timed out after {api_timeout}s")
     except Exception as e:
         trace["status"] = "error"
