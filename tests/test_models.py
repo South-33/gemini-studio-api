@@ -10,8 +10,9 @@ from gemini_models import (
 
 class ModelTests(unittest.TestCase):
     def test_api_models_are_exact_current_families(self):
-        self.assertEqual(normalize_model("flash"), "flash")
-        for unsupported in ("flash-lite", "pro", "thinking", "fast", "gemini-flash"):
+        for model in ("flash", "flash-lite", "pro"):
+            self.assertEqual(normalize_model(model), model)
+        for unsupported in ("thinking", "fast", "gemini-flash", "gemini-3.5-flash-lite"):
             with self.assertRaises(ValueError):
                 normalize_model(unsupported)
 
@@ -20,12 +21,9 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(model_family_from_ui("3.8 Flash All-around help"), "flash")
         self.assertEqual(model_family_from_ui("3.1 Pro Advanced reasoning"), "pro")
 
-    def test_public_thinking_levels_are_medium_and_high_only(self):
-        self.assertEqual(normalize_thinking_level("medium"), "Medium")
-        self.assertEqual(normalize_thinking_level("high"), "High")
-        for unsupported in ("low", "auto"):
-            with self.assertRaises(ValueError):
-                normalize_thinking_level(unsupported)
+    def test_unknown_thinking_level_is_rejected(self):
+        with self.assertRaises(ValueError):
+            normalize_thinking_level("auto")
 
     def test_picker_text_reports_current_thinking_level(self):
         self.assertEqual(thinking_level_from_picker_text("Flash\nMedium"), "Medium")

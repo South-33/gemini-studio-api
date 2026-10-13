@@ -5,11 +5,11 @@ production Windows server. Requests are serialized through one browser worker.
 
 ## Contract
 
-- Model: `flash`
-- Thinking: `Medium`, `High`; default `Medium`
+- Models: `flash`, `flash-lite`, `pro`
+- Thinking: `Low`, `Medium`, `High`; default `Medium`
 - Only these model and thinking values are accepted
 - `POST /v1/chat/completions` accepts OpenAI-style `messages`
-- `GET /v1/models` lists the single supported model family
+- `GET /v1/models` lists the three supported model families
 - `GET /health` returns 200 only while the worker is on a usable Gemini `/app`
 - `GET /v1/diagnostics` exposes current browser/queue/recovery state
 
@@ -40,8 +40,7 @@ Last validated on 2026-10-13.
   accessible label beginning with `Open mode picker`.
 - The closed picker includes the active thinking level when applicable, for
   example `Flash Medium`.
-- The API selects only `Medium` or `High`. The automation can still recognize
-  Gemini's `Low` UI state so it can switch away from it before a request.
+- Thinking is selected by the exact visible labels `Low`, `Medium`, and `High`.
 - Responses are returned only from Gemini's Copy control/clipboard. DOM text is
   used for state detection, not as the API response body.
 - A Google Accounts sign-in page is not healthy. If the session expires, sign
