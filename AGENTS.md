@@ -23,8 +23,8 @@ This is the project's AGENTS.md
   are context only, not UI authority. A copied browser profile is not valid UI
   evidence unless authentication and account state are confirmed unchanged.
 - Return model output only through Gemini's Copy control/clipboard.
-- Keep the headed-Chromium anti-throttling flags and launcher process ownership.
-- Do not enable Chromium memory-saver or other low-resource modes; Gemini can
-  render incompletely.
+- Keep the headed-Chromium anti-throttling flags while warm. Chromium closes
+  after five idle minutes and wakes on the next request; do not use memory-saver
+  or other low-resource modes because Gemini can render incompletely.
 - `.browser_session/` and `logs/` are private runtime state and must not be
   committed.
