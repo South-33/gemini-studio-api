@@ -396,14 +396,21 @@ def public_request_trace(trace: Dict) -> Dict:
 async def health(response: Response):
     ready_workers = ready_worker_count()
     active_request = bool(worker_pool and worker_pool._initialized and worker_pool._active_request)
-    is_ready = ready_workers > 0 or active_request
+    browser_state = getattr(worker_pool, "_browser_state", "unavailable") if worker_pool else "unavailable"
+    pool_ready = bool(worker_pool and worker_pool._initialized)
+    is_ready = pool_ready and (
+        ready_workers > 0
+        or active_request
+        or browser_state in {"cold", "starting"}
+    )
     response.status_code = 200 if is_ready else 503
     return {
-        "status": "busy" if active_request and ready_workers == 0 else ("ok" if is_ready else "degraded"),
+        "status": "busy" if active_request else ("ok" if is_ready else "degraded"),
         "ready": is_ready,
         "workers": 1,
         "ready_workers": ready_workers,
         "active_request": active_request,
+        "browser_state": browser_state,
     }
 
 
@@ -413,8 +420,18 @@ async def diagnostics():
         return {"status": "not_initialized"}
 
     pool_diag = await worker_pool.get_live_diagnostics()
+    ready_workers = ready_worker_count()
+    browser_state = pool_diag.get("browser_state")
+    is_ready = bool(
+        worker_pool._initialized
+        and (
+            ready_workers
+            or worker_pool._active_request
+            or browser_state in {"cold", "starting"}
+        )
+    )
     return {
-        "status": "ok" if ready_worker_count() else "degraded",
+        "status": "ok" if is_ready else "degraded",
         "pool": pool_diag,
         "recent_requests": [public_request_trace(trace) for trace in recent_requests],
     }

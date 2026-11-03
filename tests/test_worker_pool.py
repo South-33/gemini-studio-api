@@ -1,4 +1,5 @@
 import asyncio
+import time
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -43,6 +44,9 @@ class FakeWorker:
         self.prepare_calls += 1
         self.ready = self.prepare_ok
         return self.prepare_ok
+
+    async def close(self):
+        self._initialized = False
 
 
 class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
@@ -205,6 +209,88 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first.calls, 0)
         self.assertEqual(second.calls, 1)
         pool._recreate_worker.assert_awaited_once()
+
+    async def test_cold_browser_warms_before_next_request(self):
+        pool = WorkerPool()
+        pool._initialized = True
+        pool._browser_state = "cold"
+        worker = FakeWorker()
+
+        async def warm(_reason):
+            pool.workers = [worker]
+            pool._browser_state = "warm"
+            return True
+
+        pool._warm_browser = AsyncMock(side_effect=warm)
+
+        result = await pool.send_message("hello", request_id="wake")
+
+        self.assertTrue(result["success"])
+        self.assertEqual(worker.calls, 1)
+        pool._warm_browser.assert_awaited_once()
+
+    async def test_concurrent_cold_requests_share_one_browser_warmup(self):
+        pool = WorkerPool()
+        pool._initialized = True
+        pool._browser_state = "cold"
+        worker = FakeWorker()
+
+        async def warm(_reason):
+            await asyncio.sleep(0.01)
+            pool.workers = [worker]
+            pool._browser_state = "warm"
+            return True
+
+        pool._warm_browser = AsyncMock(side_effect=warm)
+
+        first, second = await asyncio.gather(
+            pool.send_message("one", request_id="cold-one"),
+            pool.send_message("two", request_id="cold-two"),
+        )
+
+        self.assertTrue(first["success"])
+        self.assertTrue(second["success"])
+        self.assertEqual(worker.max_active, 1)
+        self.assertEqual(pool._warm_browser.await_count, 1)
+
+    async def test_idle_watchdog_closes_browser_without_disabling_pool(self):
+        pool = WorkerPool(idle_browser_seconds=0.01, idle_poll_seconds=0.01)
+        pool._initialized = True
+        pool._browser_state = "warm"
+        pool.workers = [FakeWorker()]
+        context = AsyncMock()
+        pool.context = context
+        pool._last_activity = time.time() - 1
+
+        task = asyncio.create_task(pool._idle_watchdog())
+        await asyncio.sleep(0.12)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        self.assertTrue(pool._initialized)
+        self.assertEqual(pool._browser_state, "cold")
+        self.assertEqual(pool.workers, [])
+        context.close.assert_awaited_once()
+
+    async def test_idle_watchdog_does_not_close_with_a_queued_request(self):
+        pool = WorkerPool(idle_browser_seconds=0.01, idle_poll_seconds=0.01)
+        pool._initialized = True
+        pool._browser_state = "warm"
+        pool.workers = [FakeWorker()]
+        context = AsyncMock()
+        pool.context = context
+        pool._queued_requests = 1
+        pool._last_activity = time.time() - 1
+
+        task = asyncio.create_task(pool._idle_watchdog())
+        await asyncio.sleep(0.12)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        self.assertEqual(pool._browser_state, "warm")
+        context.close.assert_not_awaited()
 
     def test_known_gemini_error_replies_are_transient(self):
         for response in (

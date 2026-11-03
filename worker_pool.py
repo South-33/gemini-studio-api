@@ -17,16 +17,24 @@ from request_log import write_request_log
 class WorkerPool:
     """Serialize requests through one tab and recreate it after concrete failures."""
 
-    def __init__(self):
+    def __init__(self, idle_browser_seconds: float = 300, idle_poll_seconds: float = 10):
         self.playwright = None
         self.context = None
         self.workers: List[GeminiWebAutomation] = []
         self._request_lock = asyncio.Lock()
         self._recovery_lock = asyncio.Lock()
         self._initialized = False
+        self._browser_state = "stopped"
+        self._idle_browser_seconds = max(0.0, float(idle_browser_seconds))
+        self._idle_poll_seconds = max(0.05, float(idle_poll_seconds))
+        self._idle_task: Optional[asyncio.Task] = None
         self._active_request = False
         self._queued_requests = 0
         self._last_activity = time.time()
+        self._browser_start_count = 0
+        self._browser_stop_count = 0
+        self._last_browser_start: Optional[Dict[str, Any]] = None
+        self._last_browser_stop: Optional[Dict[str, Any]] = None
         self._startup_pages_closed = 0
         self._worker_recreation_count = 0
         self._last_worker_recreation: Optional[Dict[str, Any]] = None
@@ -37,48 +45,146 @@ class WorkerPool:
         return self.workers[0] if self.workers else None
 
     async def init(self) -> bool:
-        """Launch the persistent browser profile and initialize one managed tab."""
+        """Start Playwright, warm one browser, and begin idle browser lifecycle."""
         try:
             self.playwright = await async_playwright().start()
-            args = [
-                "--disable-blink-features=AutomationControlled",
-                "--start-maximized",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-setuid-sandbox",
-                "--disable-background-timer-throttling",
-                "--disable-backgrounding-occluded-windows",
-                "--disable-renderer-backgrounding",
-                "--disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling,BatterySaverModeAvailability",
-                "--force-prefers-reduced-motion",
-            ]
+            self._initialized = True
+            if not await self._warm_browser("startup"):
+                raise RuntimeError("Gemini browser failed to initialize")
+            self._last_activity = time.time()
+            self._idle_task = asyncio.create_task(self._idle_watchdog())
+            return True
+        except Exception as exc:
+            log(f"Startup failed: {exc}", "Worker")
+            await self.close()
+            return False
+
+    @staticmethod
+    def _browser_args() -> List[str]:
+        return [
+            "--disable-blink-features=AutomationControlled",
+            "--start-maximized",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-setuid-sandbox",
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
+            "--disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling,BatterySaverModeAvailability",
+        ]
+
+    async def _warm_browser(self, reason: str) -> bool:
+        """Launch Chromium on demand with the persistent authenticated profile."""
+        if self.worker and self.context and self._browser_state == "warm":
+            return True
+        if not self._initialized or not self.playwright:
+            return False
+
+        started = time.time()
+        self._browser_state = "starting"
+        try:
             log(
-                "Launching maximized Chromium with native viewport and background throttling disabled",
+                f"Launching Chromium ({reason}) with native viewport and background throttling disabled",
                 "Worker",
             )
-
             profile_dir = os.path.join(os.path.dirname(__file__), ".browser_session")
             self.context = await self.playwright.chromium.launch_persistent_context(
                 profile_dir,
                 headless=False,
-                args=args,
+                args=self._browser_args(),
                 permissions=["clipboard-read", "clipboard-write"],
                 no_viewport=True,
             )
             page = await self._replace_restored_pages()
             worker = await self._initialize_page(page)
             if not worker:
-                await self.close()
-                return False
+                raise RuntimeError("Gemini page did not become ready")
 
             self.workers = [worker]
-            self._initialized = True
+            self._browser_state = "warm"
+            self._browser_start_count += 1
+            self._last_browser_start = {
+                "ok": True,
+                "reason": reason,
+                "duration_ms": int((time.time() - started) * 1000),
+                "at_unix": int(time.time()),
+            }
             log("Gemini worker ready", "Worker")
             return True
         except Exception as exc:
-            log(f"Startup failed: {exc}", "Worker")
-            await self.close()
+            self._last_browser_start = {
+                "ok": False,
+                "reason": reason,
+                "error": str(exc),
+                "duration_ms": int((time.time() - started) * 1000),
+                "at_unix": int(time.time()),
+            }
+            log(f"Browser warm-up failed: {exc}", "Worker")
+            await self._close_browser_context("error", reason)
             return False
+
+    async def _ensure_browser_ready(self, reason: str) -> bool:
+        if self.worker and self._initialized and self._browser_state != "cold":
+            self._browser_state = "warm"
+            return True
+        return await self._warm_browser(reason)
+
+    async def _close_browser_context(self, state: str, reason: str) -> None:
+        worker = self.worker
+        self.workers.clear()
+        if worker:
+            try:
+                await worker.close()
+            except Exception as exc:
+                log(f"Worker close warning: {exc}", "Worker")
+        if self.context:
+            try:
+                await self.context.close()
+            except Exception as exc:
+                log(f"Browser context close warning: {exc}", "Worker")
+            finally:
+                self.context = None
+        self._browser_state = state
+        if state == "cold":
+            self._browser_stop_count += 1
+            self._last_browser_stop = {
+                "reason": reason,
+                "at_unix": int(time.time()),
+            }
+            log(f"Chromium stopped after idle period: {reason}", "Worker")
+
+    async def _idle_watchdog(self) -> None:
+        """Stop Chromium after a quiet period; requests wake it under the queue lock."""
+        if self._idle_browser_seconds <= 0:
+            return
+        try:
+            while self._initialized:
+                await asyncio.sleep(self._idle_poll_seconds)
+                idle_for = time.time() - self._last_activity
+                if (
+                    self._browser_state != "warm"
+                    or self._active_request
+                    or self._queued_requests
+                    or idle_for < self._idle_browser_seconds
+                    or self._request_lock.locked()
+                ):
+                    continue
+                async with self._request_lock:
+                    idle_for = time.time() - self._last_activity
+                    if (
+                        self._browser_state == "warm"
+                        and not self._active_request
+                        and not self._queued_requests
+                        and idle_for >= self._idle_browser_seconds
+                    ):
+                        await self._close_browser_context(
+                            "cold",
+                            f"{int(idle_for)}s without requests",
+                        )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log(f"Idle browser watchdog error: {exc}", "Worker")
 
     async def _replace_restored_pages(self) -> Page:
         """Create the managed page before closing pages restored by Chromium."""
@@ -206,8 +312,8 @@ class WorkerPool:
         request_id: str | None = None,
         request_context: Dict[str, Any] | None = None,
     ) -> Dict:
-        if not self.worker or not self._initialized:
-            return {"success": False, "error": "Gemini worker is not ready"}
+        if not self._initialized:
+            return {"success": False, "error": "Gemini worker pool is not ready"}
 
         queued_at = time.time()
         queued_at_iso = datetime.now(timezone.utc).isoformat()
@@ -222,6 +328,13 @@ class WorkerPool:
                     log(f"[{request_id}] Queue wait: {wait_ms}ms", "Worker")
 
                 self._active_request = True
+                if not await self._ensure_browser_ready(f"request {request_id}"):
+                    return {
+                        "success": False,
+                        "error": "Gemini request failed: browser could not be started",
+                        "queue_wait_ms": wait_ms,
+                        "attempts": 0,
+                    }
                 configured, configuration_error = await self._prepare_request_configuration(
                     model,
                     thinking_level,
@@ -428,11 +541,19 @@ class WorkerPool:
 
     def get_diagnostics(self) -> Dict[str, Any]:
         worker = self.worker
+        idle_for = max(0, int(time.time() - self._last_activity))
         return {
             "initialized": self._initialized,
             "parallel_capacity": 1,
             "active_request": self._active_request,
             "queued_requests": self._queued_requests,
+            "browser_state": self._browser_state,
+            "idle_browser_seconds": int(self._idle_browser_seconds),
+            "idle_for_seconds": idle_for,
+            "browser_start_count": self._browser_start_count,
+            "browser_stop_count": self._browser_stop_count,
+            "last_browser_start": self._last_browser_start,
+            "last_browser_stop": self._last_browser_stop,
             "browser_channel": "chromium",
             "startup_pages_closed": self._startup_pages_closed,
             "worker_recreation_count": self._worker_recreation_count,
@@ -482,20 +603,15 @@ class WorkerPool:
 
     async def close(self) -> None:
         self._initialized = False
-        worker = self.worker
-        self.workers.clear()
-        if worker:
+        if self._idle_task:
+            self._idle_task.cancel()
             try:
-                await worker.close()
-            except Exception as exc:
-                log(f"Worker close warning: {exc}", "Worker")
-        if self.context:
-            try:
-                await self.context.close()
-            except Exception as exc:
-                log(f"Browser context close warning: {exc}", "Worker")
+                await self._idle_task
+            except asyncio.CancelledError:
+                pass
             finally:
-                self.context = None
+                self._idle_task = None
+        await self._close_browser_context("stopped", "pool shutdown")
         if self.playwright:
             try:
                 await self.playwright.stop()

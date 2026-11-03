@@ -20,10 +20,11 @@ class FakeWorker:
 
 
 class FakePool:
-    def __init__(self, initialized, workers, active_request=False):
+    def __init__(self, initialized, workers, active_request=False, browser_state="warm"):
         self._initialized = initialized
         self.workers = workers
         self._active_request = active_request
+        self._browser_state = browser_state
 
 
 class ApiStatusTests(unittest.TestCase):
@@ -106,6 +107,23 @@ class HealthEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(payload["ready"])
         self.assertTrue(payload["active_request"])
         self.assertEqual(payload["status"], "busy")
+
+    async def test_health_is_ok_while_browser_is_intentionally_cold(self):
+        main.worker_pool = FakePool(
+            True,
+            [],
+            active_request=False,
+            browser_state="cold",
+        )
+        response = Response()
+
+        payload = await main.health(response)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["ready"])
+        self.assertEqual(payload["ready_workers"], 0)
+        self.assertEqual(payload["browser_state"], "cold")
+        self.assertEqual(payload["status"], "ok")
 
 
 if __name__ == "__main__":
