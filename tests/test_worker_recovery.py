@@ -10,6 +10,8 @@ class FakeLocator:
     def __init__(self):
         self.filled = []
         self.clicked = 0
+        self.visible = True
+        self.text = ""
 
     @property
     def first(self):
@@ -21,6 +23,18 @@ class FakeLocator:
     async def click(self, timeout=None):
         self.clicked += 1
 
+    async def count(self):
+        return 1
+
+    def nth(self, _index):
+        return self
+
+    async def is_visible(self):
+        return self.visible
+
+    async def inner_text(self):
+        return self.text
+
 
 class FakeLocatorPage:
     def __init__(self, locator):
@@ -28,6 +42,27 @@ class FakeLocatorPage:
 
     def locator(self, _selector):
         return self._locator
+
+
+class FakeThinkingPage:
+    def __init__(self):
+        self.model = FakeLocator()
+        self.picker = FakeLocator()
+        self.option = FakeLocator()
+        self.empty = FakeLocator()
+        self.empty.visible = False
+
+    def locator(self, selector):
+        if selector == "model":
+            return self.model
+        if selector == "thinking-level-picker":
+            return self.picker
+        return self.empty
+
+    def get_by_text(self, text, exact=False):
+        if text == "Low" and exact:
+            return self.option
+        return self.empty
 
 
 class FakeNavigationPage:
@@ -52,6 +87,18 @@ class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
         selectors = GeminiWebAutomation.SELECTORS["model_btn"]
         self.assertEqual(selectors[0], 'button[aria-label^="Open mode picker" i]')
         self.assertEqual(selectors[1], 'button[data-test-id="bard-mode-menu-button"]')
+
+    async def test_thinking_level_opens_nested_picker_before_exact_option(self):
+        worker = GeminiWebAutomation(worker_id=1)
+        worker.page = FakeThinkingPage()
+        worker._resolve_selector = AsyncMock(return_value="model")
+        worker._human_delay = AsyncMock()
+
+        await worker._set_thinking_level("Low")
+
+        self.assertEqual(worker.page.model.clicked, 1)
+        self.assertEqual(worker.page.picker.clicked, 1)
+        self.assertEqual(worker.page.option.clicked, 1)
 
     def test_copy_selector_can_be_used_before_a_copy_button_exists(self):
         worker = GeminiWebAutomation(worker_id=1)

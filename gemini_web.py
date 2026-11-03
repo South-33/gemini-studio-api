@@ -1992,8 +1992,41 @@ class GeminiWebAutomation:
             await self.page.locator(model_selector).first.click()
             await self._human_delay(300, 450)
 
-            # Low/Medium/High are visible labeled controls in the current picker.
-            # Select by exact text, never by position or generated class names.
+            # Gemini's current picker nests Low/Medium/High behind a semantic
+            # "Thinking level" control. Older layouts exposed the level labels
+            # directly, so keep that path as a fallback. Never depend on menu
+            # positions or generated class names.
+            thinking_picker = None
+            for selector in (
+                "thinking-level-picker",
+                '[data-test-id="thinking-level-picker-desktop"]',
+                'gem-menu-item[value="thinking_level"]',
+            ):
+                matches = self.page.locator(selector)
+                for i in range(await matches.count()):
+                    candidate = matches.nth(i)
+                    if await candidate.is_visible():
+                        thinking_picker = candidate
+                        break
+                if thinking_picker is not None:
+                    break
+
+            if thinking_picker is None:
+                menu_items = self.page.locator("gem-menu-item")
+                for i in range(await menu_items.count()):
+                    candidate = menu_items.nth(i)
+                    if not await candidate.is_visible():
+                        continue
+                    text = (await candidate.inner_text()).strip().lower()
+                    if "thinking level" in text:
+                        thinking_picker = candidate
+                        break
+
+            if thinking_picker is not None:
+                await thinking_picker.click(timeout=2000)
+                await self._human_delay(150, 300)
+
+            # Select by exact visible text, never by position.
             option = self.page.get_by_text(target_text, exact=True)
             count = await option.count()
             for i in range(count):
