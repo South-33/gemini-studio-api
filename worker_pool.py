@@ -50,6 +50,7 @@ class WorkerPool:
                 "--disable-backgrounding-occluded-windows",
                 "--disable-renderer-backgrounding",
                 "--disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling,BatterySaverModeAvailability",
+                "--force-prefers-reduced-motion",
             ]
             log(
                 "Launching maximized Chromium with native viewport and background throttling disabled",

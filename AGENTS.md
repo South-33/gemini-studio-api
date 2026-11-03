@@ -24,5 +24,7 @@ This is the project's AGENTS.md
   evidence unless authentication and account state are confirmed unchanged.
 - Return model output only through Gemini's Copy control/clipboard.
 - Keep the headed-Chromium anti-throttling flags and launcher process ownership.
+- Do not enable Chromium memory-saver or other low-resource modes; Gemini can
+  render incompletely. Reduced motion is allowed only after live UI verification.
 - `.browser_session/` and `logs/` are private runtime state and must not be
   committed.
