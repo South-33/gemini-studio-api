@@ -1,8 +1,11 @@
 import inspect
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
-from gemini_web import GeminiWebAutomation
+import gemini_web
+from gemini_web import GeminiWebAutomation, _rotate_error_artifacts
 from worker_pool import WorkerPool
 
 
@@ -76,6 +79,27 @@ class FakeNavigationPage:
 
 
 class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    def test_error_artifact_retention_keeps_newest_files(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            directory = Path(temp_dir)
+            old_max_files = gemini_web.ERROR_ARTIFACT_MAX_FILES
+            old_max_bytes = gemini_web.ERROR_ARTIFACT_MAX_BYTES
+            try:
+                gemini_web.ERROR_ARTIFACT_MAX_FILES = 2
+                gemini_web.ERROR_ARTIFACT_MAX_BYTES = 1024
+                for name in ("20260101_old.txt", "20260102_mid.txt", "20260103_new.txt"):
+                    (directory / name).write_text(name, encoding="utf-8")
+
+                _rotate_error_artifacts(directory)
+
+                self.assertEqual(
+                    sorted(path.name for path in directory.iterdir()),
+                    ["20260102_mid.txt", "20260103_new.txt"],
+                )
+            finally:
+                gemini_web.ERROR_ARTIFACT_MAX_FILES = old_max_files
+                gemini_web.ERROR_ARTIFACT_MAX_BYTES = old_max_bytes
+
     def test_active_generation_grace_is_longer_than_one_minute(self):
         import gemini_web
 

@@ -10,6 +10,7 @@ import time
 import uuid
 from collections import deque
 from datetime import datetime
+from pathlib import Path
 from typing import Any, List, Dict, Optional, Tuple
 from urllib.parse import urlparse
 from playwright.async_api import BrowserContext, Page
@@ -64,8 +65,38 @@ SCROLL_NUDGE_AFTER_NO_PROGRESS_SECONDS = 8
 SCROLL_NUDGE_MIN_INTERVAL_SECONDS = 4
 STALL_RECREATE_THRESHOLD = 1
 NETWORK_OUTAGE_PROBE_TIMEOUT_SECONDS = 2.0
+ERROR_ARTIFACT_MAX_FILES = 500
+ERROR_ARTIFACT_MAX_BYTES = 64 * 1024 * 1024
 
 DEAD_RESPONSE_SHELL_SECONDS = 5.0
+
+
+def _rotate_error_artifacts(directory: Path) -> None:
+    """Keep recent failure diagnostics bounded by count and total size."""
+    total_bytes = 0
+    kept = 0
+    try:
+        entries = sorted(
+            (entry for entry in directory.iterdir() if entry.is_file()),
+            key=lambda entry: entry.name,
+            reverse=True,
+        )
+    except OSError:
+        return
+
+    for entry in entries:
+        try:
+            size = entry.stat().st_size
+        except OSError:
+            continue
+        if kept >= ERROR_ARTIFACT_MAX_FILES or total_bytes + size > ERROR_ARTIFACT_MAX_BYTES:
+            try:
+                entry.unlink()
+            except OSError:
+                pass
+        else:
+            kept += 1
+            total_bytes += size
 
 
 class GeminiWebAutomation:
@@ -389,10 +420,9 @@ class GeminiWebAutomation:
             return
 
         try:
-            import pathlib
-            from datetime import datetime
-            diag_dir = pathlib.Path(__file__).parent / "logs" / "errors"
+            diag_dir = Path(__file__).parent / "logs" / "errors"
             diag_dir.mkdir(parents=True, exist_ok=True)
+            _rotate_error_artifacts(diag_dir)
 
             snapshot = await self._capture_state_snapshot()
             has_useful_final_state = any([
@@ -539,6 +569,8 @@ class GeminiWebAutomation:
                 log(f"Saved diagnostic text extract: {txt_path.name}", f"Worker {w_id}")
             except Exception as e:
                 log(f"Failed to save diagnostic text extract: {e}", f"Worker {w_id}")
+
+            _rotate_error_artifacts(diag_dir)
 
         except Exception as e:
             log(f"Error saving diagnostic artifacts: {e}", f"Worker {self.worker_id}")
