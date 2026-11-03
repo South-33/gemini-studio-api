@@ -3,6 +3,11 @@ This is the project's AGENTS.md
 # Project instructions
 
 - Production is the Windows host reached through SSH alias `southserver`.
+- The server's visible identity is `SouthServer`. The existing Windows login
+  name/profile path (`nyxy`, `C:\\Users\\nyxy`) is intentionally retained as
+  internal legacy state because the signed-in browser, SSH, RDP, and task state
+  already depend on that SID/profile. Do not rename or migrate the profile just
+  for cosmetic consistency.
 - Develop locally, commit and push, then deploy on production with Git only.
 - The API has one queued Gemini Web worker. Do not add provider abstractions or
   multiple workers.
