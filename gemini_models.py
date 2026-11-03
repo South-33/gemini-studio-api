@@ -5,24 +5,26 @@ from __future__ import annotations
 import re
 
 
-MODEL_FAMILIES = ("flash", "flash-lite", "pro")
+MODEL_FAMILIES = ("flash-lite", "flash", "pro", "argon")
 THINKING_LEVELS = ("low", "medium", "high")
 
 
 def normalize_model(value: str) -> str:
     normalized = (value or "").strip().lower()
     if normalized not in MODEL_FAMILIES:
-        raise ValueError(f"Unsupported model {value!r}; use flash, flash-lite, or pro")
+        raise ValueError(f"Unsupported model {value!r}; use flash-lite, flash, pro, or argon")
     return normalized
 
 
 def model_family_from_ui(value: str) -> str | None:
-    """Extract the stable family from Gemini's visible, versioned picker copy."""
+    """Extract the stable family while ignoring Gemini's visible version number."""
     tokens = set(re.findall(r"[a-z0-9]+", (value or "").strip().lower()))
     if "flash" in tokens and "lite" in tokens:
         return "flash-lite"
     if "pro" in tokens:
         return "pro"
+    if "argon" in tokens:
+        return "argon"
     if "flash" in tokens:
         return "flash"
     return None
@@ -44,6 +46,6 @@ def thinking_level_from_picker_text(value: str) -> str | None:
             return level.capitalize()
     # Gemini omits the word "Low" from the closed picker. For example, after
     # choosing Low the button reads just "Flash" instead of "Flash Low".
-    if "flash" in tokens or "pro" in tokens:
+    if "flash" in tokens or "pro" in tokens or "argon" in tokens:
         return "Low"
     return None

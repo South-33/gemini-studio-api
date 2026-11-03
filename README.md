@@ -5,11 +5,11 @@ production Windows server. Requests are serialized through one browser worker.
 
 ## Contract
 
-- Models: `flash`, `flash-lite`, `pro`
+- Models: `flash-lite`, `flash`, `pro`, `argon`
 - Thinking: `Low`, `Medium`, `High`; default `Medium`
 - Only these model and thinking values are accepted
 - `POST /v1/chat/completions` accepts OpenAI-style `messages`
-- `GET /v1/models` lists the three supported model families
+- `GET /v1/models` lists the four supported model families
 - `GET /health` returns 200 only while the worker is on a usable Gemini `/app`
 - `GET /v1/diagnostics` exposes current browser/queue/recovery state
 
@@ -28,19 +28,21 @@ Invoke-RestMethod -Method Post `
   -Body $body
 ```
 
-Gemini can change numeric model versions in the web UI. The automation matches
-the visible family text and does not expose numeric versions through the API.
+Gemini can change numeric model versions in the web UI. The automation ignores
+those numbers, matches only the visible family name (`Flash-Lite`, `Flash`,
+`Pro`, or `Argon`), and never exposes numeric versions through the API.
 
 ## Current Gemini UI contract
 
-Last validated on 2026-10-13.
+Last validated on 2026-11-03 against the authenticated production account.
 
 - Chat is `https://gemini.google.com/app` with a visible prompt composer.
 - The model button currently uses `data-test-id="bard-mode-menu-button"` and an
   accessible label beginning with `Open mode picker`.
-- The closed picker includes the active thinking level when applicable, for
-  example `Flash Medium`.
-- Thinking is selected by the exact visible labels `Low`, `Medium`, and `High`.
+- The open picker exposes the stable family names `Flash-Lite`, `Flash`, `Pro`,
+  and `Argon`. Any numeric version shown beside them is ignored.
+- The picker also has a semantic `Thinking level` row. Open that row, then
+  select the exact visible label `Low`, `Medium`, or `High`.
 - Responses are returned only from Gemini's Copy control/clipboard. DOM text is
   used for state detection, not as the API response body.
 - A Google Accounts sign-in page is not healthy. If the session expires, sign

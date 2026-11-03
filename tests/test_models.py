@@ -10,7 +10,7 @@ from gemini_models import (
 
 class ModelTests(unittest.TestCase):
     def test_api_models_are_exact_current_families(self):
-        for model in ("flash", "flash-lite", "pro"):
+        for model in ("flash-lite", "flash", "pro", "argon"):
             self.assertEqual(normalize_model(model), model)
         for unsupported in ("thinking", "fast", "gemini-flash", "gemini-3.5-flash-lite"):
             with self.assertRaises(ValueError):
@@ -20,6 +20,8 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(model_family_from_ui("3.5 Flash-Lite Fastest answers"), "flash-lite")
         self.assertEqual(model_family_from_ui("3.8 Flash All-around help"), "flash")
         self.assertEqual(model_family_from_ui("3.1 Pro Advanced reasoning"), "pro")
+        self.assertEqual(model_family_from_ui("4 Argon Complex tasks"), "argon")
+        self.assertEqual(model_family_from_ui("99.12 Argon Complex tasks"), "argon")
 
     def test_unknown_thinking_level_is_rejected(self):
         with self.assertRaises(ValueError):
@@ -31,6 +33,7 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(thinking_level_from_picker_text("Flash"), "Low")
         self.assertEqual(thinking_level_from_picker_text("Flash-Lite"), "Low")
         self.assertEqual(thinking_level_from_picker_text("Pro"), "Low")
+        self.assertEqual(thinking_level_from_picker_text("Argon"), "Low")
 
 if __name__ == "__main__":
     unittest.main()
