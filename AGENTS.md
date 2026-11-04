@@ -28,8 +28,8 @@ This is the project's AGENTS.md
   or other low-resource modes because Gemini can render incompletely.
 - `.browser_session/` and `logs/` are private runtime state and must not be
   committed.
-- The autostart task must use the delayed Windows startup trigger with the
-  signed-in user's interactive token. Do not change it back to `AtLogOn`, and
-  do not enable `StartWhenAvailable`: SSH logons or missed-trigger replay can
-  otherwise interrupt the headed browser. Keep the launcher mutex in the
+- Production autostart lives in the signed-in user's HKCU `Run` key and starts
+  `launcher.py` with the interactive desktop. Do not move it back to Task
+  Scheduler: task stop/relaunch events can interrupt the headed browser, while
+  SSH logons do not execute the HKCU Run entry. Keep the launcher mutex in the
   Windows `Global\` namespace as a second single-owner guard across sessions.

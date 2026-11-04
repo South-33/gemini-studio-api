@@ -12,6 +12,16 @@ import launcher
 
 
 class LauncherLogTests(unittest.TestCase):
+    def test_autostart_uses_interactive_run_key_not_task_scheduler(self):
+        script = (Path(__file__).parents[1] / "ops" / "windows" / "install_autostart.ps1").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run", script)
+        self.assertIn("Set-ItemProperty", script)
+        self.assertIn("pythonw.exe", script)
+        self.assertNotIn("Register-ScheduledTask", script)
+        self.assertNotIn("Start-ScheduledTask", script)
+
     def test_rotate_log_keeps_one_backup(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             log_path = Path(temp_dir) / "server.log"

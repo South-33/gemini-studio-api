@@ -299,7 +299,7 @@ def run() -> int:
 
         log(f"Ready: http://localhost:{PORT}")
         log(f"Tunnel: https://{DOMAIN}")
-        log("Press Ctrl+C once, or close this window, to stop all services")
+        log("Launcher owns the API/ngrok process tree; stop the launcher to stop all services")
 
         local_health_failures = 0
         public_health_failures = 0

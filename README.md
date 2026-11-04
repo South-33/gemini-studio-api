@@ -65,13 +65,12 @@ playwright install chromium
 powershell -ExecutionPolicy Bypass -File .\ops\windows\install_autostart.ps1
 ```
 
-The scheduled task `Gemini Studio API` runs 45 seconds after Windows startup,
-after auto-login creates the signed-in user's interactive token.
-`launcher.py` owns the API, headed Chromium, and ngrok as one Windows process
-tree. The startup trigger is intentional: an `AtLogOn` trigger also fires for
-OpenSSH logons under the same account and can interrupt an active headed browser.
-Do not enable Task Scheduler's `StartWhenAvailable` option for this task; replaying
-a missed boot trigger later can also interrupt an active browser request.
+The installer registers `Gemini Studio API` under the signed-in user's
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Run` key. Windows auto-login
+starts `launcher.py` when the real desktop session opens. `launcher.py` owns the
+API, headed Chromium, and ngrok as one Windows process tree. Task Scheduler is
+not used for production autostart because task stop/relaunch events can interrupt
+an active browser request, while SSH logons do not execute the HKCU Run entry.
 The browser profile is stored in `.browser_session/` and must not be committed.
 
 Headed Chromium needs an interactive desktop. The production host is configured
