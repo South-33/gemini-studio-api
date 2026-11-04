@@ -903,7 +903,9 @@ class GeminiWebAutomation:
                         }
 
                         // Stop/Send button states
-                        const visibleButtons = Array.from(document.querySelectorAll('button')).filter(isVisible);
+                        const visibleButtons = Array.from(
+                            document.querySelectorAll('button, [role="button"]')
+                        ).filter(isVisible);
                         const stopVisible = !!visibleButtons.find((b) => {
                             const label = (b.getAttribute('aria-label') || '').toLowerCase();
                             const text = (b.innerText || '').toLowerCase();
@@ -915,8 +917,48 @@ class GeminiWebAutomation:
                             return label.includes('send') || text.includes('send');
                         });
 
+                        const responseNodes = Array.from(document.querySelectorAll(
+                            '[data-content-type="response"], model-response, assistant-message-content'
+                        ));
+                        const lastResponse = responseNodes.length
+                            ? responseNodes[responseNodes.length - 1]
+                            : null;
+                        const responseRect = lastResponse?.getBoundingClientRect?.() || null;
+                        const nearbyActions = visibleButtons
+                            .map((button) => {
+                                const rect = button.getBoundingClientRect();
+                                const icon = button.querySelector(
+                                    'mat-icon, .material-symbols-outlined, .material-symbols-rounded, .google-symbols, [fonticon]'
+                                );
+                                const iconText = (
+                                    icon?.getAttribute?.('fonticon') ||
+                                    icon?.getAttribute?.('data-mat-icon-name') ||
+                                    icon?.getAttribute?.('aria-label') ||
+                                    icon?.innerText || icon?.textContent || ''
+                                ).trim();
+                                const nearby = responseRect
+                                    ? rect.top >= responseRect.top - 100
+                                        && rect.top <= responseRect.bottom + 260
+                                        && rect.right >= responseRect.left - 140
+                                        && rect.left <= responseRect.right + 140
+                                    : false;
+                                return {
+                                    nearby,
+                                    tag: button.tagName.toLowerCase(),
+                                    role: button.getAttribute('role') || '',
+                                    aria: button.getAttribute('aria-label') || '',
+                                    title: button.getAttribute('title') || '',
+                                    text: (button.innerText || '').trim().slice(0, 80),
+                                    icon: iconText.slice(0, 80),
+                                    classes: String(button.className || '').slice(0, 120),
+                                };
+                            })
+                            .filter((item) => item.nearby)
+                            .slice(0, 20);
+
                         return { url, title, errors: [...new Set(errors)].slice(0, 10),
-                                 responseTail, userPromptPreview, stopVisible, sendVisible };
+                                 responseTail, userPromptPreview, stopVisible, sendVisible,
+                                 nearbyActions };
                     }
                 """)
                 lines = [
@@ -934,6 +976,21 @@ class GeminiWebAutomation:
                 for err in (dom_info.get("errors") or []):
                     lines.append(f"  {err}")
                 if not dom_info.get("errors"):
+                    lines.append("  (none found)")
+                lines += [
+                    "",
+                    "=== NEARBY RESPONSE ACTIONS ===",
+                ]
+                nearby_actions = dom_info.get("nearbyActions") or []
+                for action in nearby_actions:
+                    lines.append(
+                        "  "
+                        f"tag={action.get('tag')!r} role={action.get('role')!r} "
+                        f"aria={action.get('aria')!r} title={action.get('title')!r} "
+                        f"text={action.get('text')!r} icon={action.get('icon')!r} "
+                        f"classes={action.get('classes')!r}"
+                    )
+                if not nearby_actions:
                     lines.append("  (none found)")
                 lines += [
                     "",
