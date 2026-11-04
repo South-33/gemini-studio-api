@@ -22,6 +22,14 @@ class LauncherLogTests(unittest.TestCase):
         self.assertNotIn("Register-ScheduledTask", script)
         self.assertNotIn("Start-ScheduledTask", script)
 
+    def test_autostart_is_idempotent_when_live_service_is_healthy(self):
+        script = (Path(__file__).parents[1] / "ops" / "windows" / "install_autostart.ps1").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("Invoke-RestMethod 'http://127.0.0.1:8000/health'", script)
+        self.assertIn("Leaving the live launcher process tree untouched.", script)
+        self.assertIn("$currentRunCommand -eq $runCommand", script)
+
     def test_rotate_log_keeps_one_backup(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             log_path = Path(temp_dir) / "server.log"
