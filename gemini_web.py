@@ -202,6 +202,191 @@ class GeminiWebAutomation:
             and int(snapshot.get("response_body_len") or 0) == 0
             and int(snapshot.get("response_copy_count") or 0) == 0
         )
+
+    @staticmethod
+    def _is_native_retry_action(
+        aria_label: str = "",
+        title: str = "",
+        text: str = "",
+        icon_text: str = "",
+    ) -> bool:
+        """Recognize Gemini's response-level retry/regenerate control conservatively."""
+        combined = " ".join((aria_label, title, text)).strip().lower()
+        explicit_phrases = (
+            "retry",
+            "try again",
+            "regenerate",
+            "generate again",
+            "redo response",
+            "refresh response",
+        )
+        if any(phrase in combined for phrase in explicit_phrases):
+            return True
+
+        # Gemini currently renders the circular-arrow response action as a
+        # Material icon. Only accept these icon names inside the last response;
+        # callers never search the whole page for a generic refresh control.
+        normalized_icon = (icon_text or "").strip().lower().replace(" ", "_")
+        return normalized_icon in {"refresh", "replay", "autorenew", "restart_alt"}
+
+    async def _find_native_retry_button(self):
+        """Return Gemini's retry/regenerate button from the last response, if present."""
+        if not self.page:
+            return None
+        try:
+            responses = self.page.locator(
+                '[data-content-type="response"], model-response, assistant-message-content'
+            )
+            count = await responses.count()
+            if count <= 0:
+                return None
+            last = responses.nth(count - 1)
+            buttons = last.locator("button")
+            button_count = await buttons.count()
+            for index in range(button_count):
+                button = buttons.nth(index)
+                if not await button.is_visible():
+                    continue
+                aria_label = (await button.get_attribute("aria-label") or "").strip()
+                title = (await button.get_attribute("title") or "").strip()
+                try:
+                    text = (await button.inner_text() or "").strip()
+                except Exception:
+                    text = ""
+                try:
+                    icon_text = await button.evaluate(
+                        """
+                        (button) => {
+                            const icon = button.querySelector(
+                                'mat-icon, .material-symbols-outlined, .material-symbols-rounded, .google-symbols'
+                            );
+                            return (icon?.innerText || icon?.textContent || '').trim();
+                        }
+                        """
+                    )
+                except Exception:
+                    icon_text = ""
+                if self._is_native_retry_action(aria_label, title, text, icon_text):
+                    return button, {
+                        "aria_label": aria_label,
+                        "title": title,
+                        "text": text,
+                        "icon": icon_text,
+                    }
+        except Exception as exc:
+            log(f"Native retry lookup failed: {exc}", f"Worker {self.worker_id}")
+        return None
+
+    async def retry_last_response_native(self) -> Optional[Dict[str, Any]]:
+        """Ask Gemini to retry its accepted request in-place once.
+
+        This is used only after a recognized generic Gemini refusal. It avoids
+        re-uploading the prompt and preserves Gemini's own request context. A
+        missing/ambiguous retry control returns None so WorkerPool can use its
+        existing fresh-tab retry path.
+        """
+        found = await self._find_native_retry_button()
+        if not found or not self.page:
+            return None
+
+        button, metadata = found
+        try:
+            before = await self._capture_state_snapshot()
+            before_signature = str(before.get("last_response_signature") or "")
+            log(
+                f"[{self._request_id}] Native Gemini retry action found "
+                f"aria={metadata['aria_label']!r} title={metadata['title']!r} icon={metadata['icon']!r}",
+                f"Worker {self.worker_id}",
+            )
+            await button.click()
+        except Exception as exc:
+            log(f"[{self._request_id}] Native Gemini retry click failed: {exc}", f"Worker {self.worker_id}")
+            return None
+
+        self._generation_in_progress = True
+        saw_generation = False
+        start_deadline = time.time() + 8.0
+        while time.time() < start_deadline:
+            snap = await self._capture_state_snapshot()
+            signature = str(snap.get("last_response_signature") or "")
+            if bool(snap.get("stop_visible")) or signature != before_signature:
+                saw_generation = True
+                break
+            await asyncio.sleep(UI_POLL_SECONDS)
+
+        if not saw_generation:
+            self._generation_in_progress = False
+            log(f"[{self._request_id}] Native Gemini retry did not start", f"Worker {self.worker_id}")
+            return None
+
+        log(f"[{self._request_id}] Native Gemini retry started", f"Worker {self.worker_id}")
+        deadline = time.time() + BROWSER_TIMEOUT_SECONDS
+        saw_stop = False
+        terminal_since = None
+        while time.time() < deadline:
+            snap = await self._capture_state_snapshot()
+            stop_visible = bool(snap.get("stop_visible"))
+            if stop_visible:
+                saw_stop = True
+                terminal_since = None
+                await asyncio.sleep(UI_POLL_SECONDS)
+                continue
+
+            if saw_stop and int(snap.get("response_copy_count") or 0) > 0 and int(snap.get("response_body_len") or 0) > 0:
+                if terminal_since is None:
+                    terminal_since = time.time()
+                if time.time() - terminal_since < 0.8:
+                    await asyncio.sleep(UI_POLL_SECONDS)
+                    continue
+
+                try:
+                    responses = self.page.locator(
+                        '[data-content-type="response"], model-response, assistant-message-content'
+                    )
+                    response_count = await responses.count()
+                    if response_count <= 0:
+                        break
+                    last = responses.nth(response_count - 1)
+                    copy_buttons = last.locator('button[aria-label="Copy"]')
+                    if await copy_buttons.count() <= 0:
+                        await asyncio.sleep(UI_POLL_SECONDS)
+                        continue
+                    copy_button = copy_buttons.first
+                    async with GeminiWebAutomation._get_clipboard_lock():
+                        try:
+                            await self.page.evaluate("navigator.clipboard.writeText('')")
+                        except Exception:
+                            pass
+                        await copy_button.click()
+                        markdown = ""
+                        clipboard_deadline = time.time() + 1.5
+                        while time.time() < clipboard_deadline:
+                            markdown = await self.page.evaluate("navigator.clipboard.readText()")
+                            if markdown and markdown.strip():
+                                break
+                            await asyncio.sleep(CLIPBOARD_POLL_SECONDS)
+                    self._generation_in_progress = False
+                    if markdown and markdown.strip():
+                        log(
+                            f"[{self._request_id}] Native Gemini retry response chars={len(markdown)}",
+                            f"Worker {self.worker_id}",
+                        )
+                        return {
+                            "success": True,
+                            "response": markdown.strip(),
+                            "raw_response": markdown,
+                            "native_retry": True,
+                        }
+                except Exception as exc:
+                    self._generation_in_progress = False
+                    log(f"[{self._request_id}] Native Gemini retry extraction failed: {exc}", f"Worker {self.worker_id}")
+                    return None
+
+            await asyncio.sleep(UI_POLL_SECONDS)
+
+        self._generation_in_progress = False
+        log(f"[{self._request_id}] Native Gemini retry timed out", f"Worker {self.worker_id}")
+        return None
     
     # Stable selectors first; bounded fallbacks second with fuzzy/partial matching
     SELECTORS = {

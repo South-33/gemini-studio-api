@@ -150,6 +150,16 @@ class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
             ['button[aria-label="Copy"]'],
         )
 
+    def test_native_retry_action_matching_is_conservative(self):
+        matcher = GeminiWebAutomation._is_native_retry_action
+        self.assertTrue(matcher(aria_label="Retry"))
+        self.assertTrue(matcher(title="Regenerate response"))
+        self.assertTrue(matcher(icon_text="refresh"))
+        self.assertTrue(matcher(text="Try again"))
+        self.assertFalse(matcher(aria_label="Copy"))
+        self.assertFalse(matcher(title="Share"))
+        self.assertFalse(matcher(icon_text="thumb_up"))
+
     def test_submission_signal_accepts_late_ui_evidence_after_click_timeout(self):
         helper = GeminiWebAutomation._submission_start_signal
         self.assertEqual(

@@ -365,6 +365,7 @@ class WorkerPool:
                 request_log_files: List[str] = []
                 last_error = "unknown"
                 attempt = 0
+                native_retry_used = False
                 max_attempts = 2 if fallback_thinking_level else 3
                 for attempt in range(1, max_attempts + 1):
                     effective_thinking_level = (
@@ -406,6 +407,27 @@ class WorkerPool:
                         result = {"success": False, "error": str(exc)}
                     attempt_finished_at = datetime.now(timezone.utc).isoformat()
                     attempt_duration_ms = int((time.time() - attempt_started) * 1000)
+
+                    if (
+                        not native_retry_used
+                        and result.get("success")
+                        and self._is_transient_gemini_refusal(str(result.get("response") or ""))
+                    ):
+                        native_retry_used = True
+                        native_retry = getattr(worker, "retry_last_response_native", None)
+                        native_result = None
+                        if callable(native_retry):
+                            try:
+                                native_result = await native_retry()
+                            except Exception as exc:
+                                log(
+                                    f"[{request_id}] Native Gemini retry failed ({type(exc).__name__}); using fresh-tab retry",
+                                    "Worker",
+                                )
+                        if native_result is not None:
+                            result = native_result
+                            attempt_finished_at = datetime.now(timezone.utc).isoformat()
+                            attempt_duration_ms = int((time.time() - attempt_started) * 1000)
 
                     request_log = worker.get_request_log()
                     if request_log:
