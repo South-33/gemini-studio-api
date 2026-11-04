@@ -434,9 +434,10 @@ class GeminiWebAutomation:
         """Return buffered log lines for the current/last request (for error reports)."""
         return list(self._request_log_lines)
 
-    async def _save_diagnostic_artifacts(self, reason: str):
+    async def _save_diagnostic_artifacts(self, reason: str, request_id: Optional[str] = None):
         """Save a screenshot and visible DOM summary before the page is replaced."""
-        if not self.page or not self._request_id:
+        artifact_request_id = (request_id or self._request_id or "").strip()
+        if not self.page or not artifact_request_id:
             return
 
         try:
@@ -459,7 +460,7 @@ class GeminiWebAutomation:
                 return
 
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            req_id = self._request_id
+            req_id = artifact_request_id
             w_id = self.worker_id
 
             safe_reason = "".join(c for c in str(reason) if c.isalnum() or c in ("-", "_", " ")).strip().replace(" ", "_")
