@@ -68,6 +68,26 @@ class ApiStatusTests(unittest.TestCase):
     def test_public_api_timeout_finishes_before_tunnel_ceiling(self):
         self.assertLess(main.PUBLIC_API_TIMEOUT_SECONDS, 300)
 
+    def test_async_jobs_can_outlive_tunnel_idle_ceiling(self):
+        self.assertGreater(main.ASYNC_JOB_TIMEOUT_SECONDS, 300)
+
+    def test_async_job_response_is_idempotent_for_pending_and_completed_jobs(self):
+        pending = main.async_job_response({"request_id": "req-1", "status": "started"})
+        self.assertEqual(pending.status_code, 202)
+
+        payload = {
+            "id": "chatcmpl-1",
+            "request_id": "req-1",
+            "choices": [{"message": {"content": "ok"}}],
+        }
+        complete = main.async_job_response({
+            "request_id": "req-1",
+            "status": "ok",
+            "response": payload,
+        })
+        self.assertEqual(complete.status_code, 200)
+        self.assertIn(b'"content":"ok"', complete.body)
+
 
 class HealthEndpointTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):

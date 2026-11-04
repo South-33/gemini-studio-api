@@ -15,8 +15,6 @@ from request_log import write_request_log
 
 FALLBACK_PRIMARY_ATTEMPT_TIMEOUT_SECONDS = 60
 FALLBACK_SECONDARY_ATTEMPT_TIMEOUT_SECONDS = 210
-REQUEST_ACTIVE_BUDGET_SECONDS = 230
-MIN_RETRY_ACTIVE_BUDGET_SECONDS = 30
 
 
 class WorkerPool:
@@ -339,7 +337,6 @@ class WorkerPool:
                 self._queued_requests -= 1
                 waiting = False
                 wait_ms = int((time.time() - queued_at) * 1000)
-                active_started = time.monotonic()
                 if wait_ms >= 250:
                     log(f"[{request_id}] Queue wait: {wait_ms}ms", "Worker")
 
@@ -370,13 +367,6 @@ class WorkerPool:
                 attempt = 0
                 max_attempts = 2 if fallback_thinking_level else 3
                 for attempt in range(1, max_attempts + 1):
-                    active_remaining = REQUEST_ACTIVE_BUDGET_SECONDS - (time.monotonic() - active_started)
-                    if active_remaining <= 0:
-                        last_error = (
-                            f"Gemini request active budget exhausted after "
-                            f"{REQUEST_ACTIVE_BUDGET_SECONDS}s"
-                        )
-                        break
                     effective_thinking_level = (
                         fallback_thinking_level
                         if attempt > 1 and fallback_thinking_level
@@ -398,39 +388,20 @@ class WorkerPool:
                             request_id=request_id,
                         )
                         if fallback_thinking_level:
-                            desired_attempt_timeout = (
+                            attempt_timeout = (
                                 FALLBACK_PRIMARY_ATTEMPT_TIMEOUT_SECONDS
                                 if attempt == 1
                                 else FALLBACK_SECONDARY_ATTEMPT_TIMEOUT_SECONDS
                             )
-                            attempt_timeout = min(desired_attempt_timeout, active_remaining)
                             try:
                                 result = await asyncio.wait_for(send_coro, timeout=attempt_timeout)
                             except asyncio.TimeoutError:
-                                if attempt_timeout < desired_attempt_timeout:
-                                    result = {
-                                        "success": False,
-                                        "error": (
-                                            f"Gemini request active budget exhausted after "
-                                            f"{REQUEST_ACTIVE_BUDGET_SECONDS}s"
-                                        ),
-                                    }
-                                else:
-                                    result = {
-                                        "success": False,
-                                        "error": f"Gemini fallback attempt timed out after {attempt_timeout}s",
-                                    }
-                        else:
-                            try:
-                                result = await asyncio.wait_for(send_coro, timeout=active_remaining)
-                            except asyncio.TimeoutError:
                                 result = {
                                     "success": False,
-                                    "error": (
-                                        f"Gemini request active budget exhausted after "
-                                        f"{REQUEST_ACTIVE_BUDGET_SECONDS}s"
-                                    ),
+                                    "error": f"Gemini fallback attempt timed out after {attempt_timeout}s",
                                 }
+                        else:
+                            result = await send_coro
                     except Exception as exc:
                         result = {"success": False, "error": str(exc)}
                     attempt_finished_at = datetime.now(timezone.utc).isoformat()
@@ -442,13 +413,6 @@ class WorkerPool:
                         attempt_logs.extend(request_log)
 
                     retryable = self._is_retryable_response_rejection(result)
-                    retry_budget_remaining = REQUEST_ACTIVE_BUDGET_SECONDS - (time.monotonic() - active_started)
-                    if retryable and retry_budget_remaining < MIN_RETRY_ACTIVE_BUDGET_SECONDS:
-                        retryable = False
-                        last_error = (
-                            f"Gemini request active budget exhausted after "
-                            f"{REQUEST_ACTIVE_BUDGET_SECONDS}s"
-                        )
                     search_instruction_present = GeminiWebAutomation._needs_search_hint(prompt, use_search)
                     if result.get("success") and str(result.get("response") or "").strip():
                         response = str(result.get("response") or "")

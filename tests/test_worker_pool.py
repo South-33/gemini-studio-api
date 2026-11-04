@@ -108,28 +108,6 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(worker.calls, 1)
         pool._recreate_worker.assert_not_awaited()
 
-    async def test_active_request_budget_stops_a_hung_generation_before_tunnel_timeout(self):
-        pool = WorkerPool()
-        worker = FakeWorker()
-
-        async def slow_send(*_args, **_kwargs):
-            worker.calls += 1
-            await asyncio.sleep(0.1)
-            return {"success": True, "response": "late"}
-
-        worker.send_message = slow_send
-        pool.workers = [worker]
-        pool._initialized = True
-        pool._recreate_worker = AsyncMock(return_value=True)
-
-        with patch("worker_pool.REQUEST_ACTIVE_BUDGET_SECONDS", 0.02):
-            result = await pool.send_message("hello", request_id="active-budget")
-
-        self.assertFalse(result["success"])
-        self.assertIn("active budget exhausted", result["error"])
-        self.assertEqual(worker.calls, 1)
-        pool._recreate_worker.assert_not_awaited()
-
     async def test_empty_terminal_generation_is_retried_on_a_fresh_chat(self):
         pool = WorkerPool()
         worker = FakeWorker([

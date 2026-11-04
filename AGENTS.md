@@ -11,9 +11,9 @@ This is the project's AGENTS.md
 - Develop locally, commit and push, then deploy on production with Git only.
 - The API has one queued Gemini Web worker. Do not add provider abstractions or
   multiple workers.
-- The public ngrok request path cuts off near 300 seconds. Keep the API deadline
-  below that ceiling and the active browser budget lower still, so callers get
-  a terminal `Gemini request failed` response instead of retrying a live request.
+- The public ngrok path has a 5-minute idle timeout. Long Gemini work must use
+  async submit-and-poll requests so browser thinking is not capped by the
+  tunnel and a caller retry cannot duplicate a still-running request.
 - API models are exactly `flash-lite`, `flash`, `pro`, and `argon`. Thinking
   levels are exactly `Low`, `Medium`, and `High`. Do not add aliases.
 - Model numbers shown by Gemini are disposable UI version labels. Ignore them

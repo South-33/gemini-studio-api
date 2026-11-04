@@ -33,6 +33,7 @@ from worker_pool import WorkerPool
 
 # Configuration
 PUBLIC_API_TIMEOUT_SECONDS = 290
+ASYNC_JOB_TIMEOUT_SECONDS = 2700
 RECENT_REQUEST_LIMIT = 200
 ASYNC_JOB_LIMIT = 200
 IMAGE_TOKEN_ESTIMATE = 300
@@ -276,12 +277,20 @@ async def openai_chat(request: Request):
         raise HTTPException(status_code=400, detail="Request body must be a JSON object")
     if body.get("stream"):
         raise HTTPException(status_code=400, detail="Streaming responses are not supported")
+    respond_async = body.get("async", False)
+    if not isinstance(respond_async, bool):
+        raise HTTPException(status_code=400, detail="async must be a boolean")
     
     if not worker_pool:
         raise HTTPException(status_code=503, detail="Worker pool not initialized")
     
     source = extract_request_source(request, body)
     trace_id = source["request_id"]
+    if respond_async:
+        existing_job = async_jobs.get(trace_id)
+        if existing_job is not None:
+            log(f"[{trace_id}] Reusing existing async job status={existing_job.get('status')}", "API")
+            return async_job_response(existing_job)
 
     # Extract fields
     model = body.get("model", "flash")
@@ -426,7 +435,27 @@ async def openai_chat(request: Request):
         },
     )
     future = asyncio.run_coroutine_threadsafe(coro, browser_loop)
-    
+
+    if respond_async:
+        job: Dict[str, Any] = {
+            "request_id": trace_id,
+            "status": "started",
+            "started_at": trace["started_at"],
+        }
+        remember_async_job(job)
+        task = asyncio.create_task(finish_async_job(
+            job=job,
+            trace=trace,
+            future=future,
+            api_timeout=ASYNC_JOB_TIMEOUT_SECONDS,
+            cleanup_image_paths=cleanup_image_paths,
+            model=model,
+            prompt_tokens_est=prompt_tokens_est,
+        ))
+        job["_task"] = task
+        log(f"[{trace_id}] Async request accepted; poll /v1/chat/completions/{trace_id}", "API")
+        return async_job_response(job)
+
     api_timeout = PUBLIC_API_TIMEOUT_SECONDS
     
     try:
@@ -504,6 +533,15 @@ async def openai_chat(request: Request):
             "token_estimate": True,
         }
     }
+
+
+@app.get("/v1/chat/completions/{request_id}")
+async def get_chat_completion(request_id: str):
+    """Poll a long-running completion without holding an idle tunnel request."""
+    job = async_jobs.get(request_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Unknown async request_id")
+    return async_job_response(job)
 
 def ready_worker_count() -> int:
     if not worker_pool or not worker_pool._initialized:
