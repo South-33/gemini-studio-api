@@ -299,9 +299,15 @@ class WorkerPool:
 
     @staticmethod
     def _is_retryable_response_rejection(result: Dict) -> bool:
-        """Retry only for Gemini's concrete transient refusal."""
+        """Retry only when Gemini definitely ended the submitted generation transiently."""
         response = str(result.get("response") or "")
-        return WorkerPool._is_transient_gemini_refusal(response)
+        if WorkerPool._is_transient_gemini_refusal(response):
+            return True
+        error = " ".join(str(result.get("error") or "").strip().lower().split())
+        return error in {
+            "gemini generation ended without a response",
+            "gemini entered a non-copyable terminal response state",
+        }
 
     async def send_message(
         self,
@@ -425,19 +431,21 @@ class WorkerPool:
 
                     ready_after_failure = None
                     if attempt < max_attempts and retryable:
+                        is_refusal = self._is_transient_gemini_refusal(str(result.get("response") or ""))
+                        diagnostic_reason = "transient_refusal" if is_refusal else "transient_generation_failure"
                         try:
-                            await worker._save_diagnostic_artifacts("transient_refusal", request_id=request_id)
+                            await worker._save_diagnostic_artifacts(diagnostic_reason, request_id=request_id)
                         except Exception as exc:
                             log(
-                                f"[{request_id}] Transient-refusal diagnostics failed ({type(exc).__name__}); continuing retry",
+                                f"[{request_id}] Transient Gemini diagnostics failed ({type(exc).__name__}); continuing retry",
                                 "Worker",
                             )
                         log(
-                            f"[{request_id}] Response rejected; recreating tab before retry {attempt + 1}/{max_attempts}",
+                            f"[{request_id}] Transient Gemini failure; recreating tab before retry {attempt + 1}/{max_attempts}",
                             "Worker",
                         )
                         ready_for_retry = await self._recreate_worker(
-                            f"transient refusal retry {attempt + 1}/{max_attempts} for request {request_id}"
+                            f"transient Gemini retry {attempt + 1}/{max_attempts} for request {request_id}"
                         )
                         if ready_for_retry:
                             configured, configuration_error = await self._prepare_request_configuration(
