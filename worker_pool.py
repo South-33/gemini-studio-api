@@ -13,8 +13,8 @@ from playwright.async_api import Page, async_playwright
 from gemini_web import GeminiWebAutomation, log
 from request_log import write_request_log
 
-FALLBACK_PRIMARY_ATTEMPT_TIMEOUT_SECONDS = 90
-FALLBACK_SECONDARY_ATTEMPT_TIMEOUT_SECONDS = 180
+FALLBACK_PRIMARY_ATTEMPT_TIMEOUT_SECONDS = 60
+FALLBACK_SECONDARY_ATTEMPT_TIMEOUT_SECONDS = 210
 
 
 class WorkerPool:

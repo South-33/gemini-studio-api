@@ -12,7 +12,7 @@ worker.
 - `fallback_thinking_level` is optional. When supplied, a recognized transient
   Gemini failure retries once on a fresh chat at that thinking level while
   keeping the same model family. Fallback requests are bounded to two browser
-  attempts: up to 90 seconds on the primary level and up to 180 seconds on the
+  attempts: up to 60 seconds on the primary level and up to 210 seconds on the
   fallback level.
 - `POST /v1/chat/completions` accepts OpenAI-style `messages`
 - `GET /v1/models` lists the four supported model families
