@@ -204,6 +204,38 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.request_logger.call_args_list[0].kwargs["thinking_level"], "Medium")
         self.assertEqual(self.request_logger.call_args_list[1].kwargs["thinking_level"], "High")
 
+    async def test_fallback_request_stops_after_primary_and_one_fallback_attempt(self):
+        pool = WorkerPool()
+        worker = FakeWorker([
+            {
+                "success": True,
+                "response": "Sorry, something went wrong. Please try your request again.",
+            },
+            {
+                "success": True,
+                "response": "I encountered an error doing what you asked. Could you try again?",
+            },
+            {"success": True, "response": "unexpected-third-attempt"},
+        ])
+        pool.workers = [worker]
+        pool._initialized = True
+        pool._recreate_worker = AsyncMock(return_value=True)
+        pool._prepare_request_configuration = AsyncMock(return_value=(True, None))
+
+        result = await pool.send_message(
+            "hello",
+            model="flash",
+            thinking_level="Medium",
+            fallback_thinking_level="High",
+            request_id="bounded-fallback",
+        )
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["attempts"], 2)
+        self.assertEqual(result["effective_thinking_level"], "High")
+        self.assertEqual(worker.calls, 2)
+        self.assertEqual(worker.thinking_levels, ["Medium", "High"])
+
     async def test_request_log_disk_failure_does_not_fail_completion(self):
         self.request_logger.side_effect = OSError("disk unavailable")
         pool = WorkerPool()

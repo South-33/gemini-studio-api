@@ -13,6 +13,9 @@ from playwright.async_api import Page, async_playwright
 from gemini_web import GeminiWebAutomation, log
 from request_log import write_request_log
 
+FALLBACK_PRIMARY_ATTEMPT_TIMEOUT_SECONDS = 90
+FALLBACK_SECONDARY_ATTEMPT_TIMEOUT_SECONDS = 180
+
 
 class WorkerPool:
     """Serialize requests through one tab and recreate it after concrete failures."""
@@ -304,6 +307,8 @@ class WorkerPool:
         if WorkerPool._is_transient_gemini_refusal(response):
             return True
         error = " ".join(str(result.get("error") or "").strip().lower().split())
+        if error.startswith("gemini fallback attempt timed out after "):
+            return True
         return error in {
             "gemini generation ended without a response",
             "gemini entered a non-copyable terminal response state",
@@ -360,7 +365,7 @@ class WorkerPool:
                 request_log_files: List[str] = []
                 last_error = "unknown"
                 attempt = 0
-                max_attempts = 3
+                max_attempts = 2 if fallback_thinking_level else 3
                 for attempt in range(1, max_attempts + 1):
                     effective_thinking_level = (
                         fallback_thinking_level
@@ -374,7 +379,7 @@ class WorkerPool:
                     attempt_started = time.time()
                     attempt_started_at = datetime.now(timezone.utc).isoformat()
                     try:
-                        result = await worker.send_message(
+                        send_coro = worker.send_message(
                             prompt,
                             model,
                             effective_thinking_level,
@@ -382,6 +387,21 @@ class WorkerPool:
                             images,
                             request_id=request_id,
                         )
+                        if fallback_thinking_level:
+                            attempt_timeout = (
+                                FALLBACK_PRIMARY_ATTEMPT_TIMEOUT_SECONDS
+                                if attempt == 1
+                                else FALLBACK_SECONDARY_ATTEMPT_TIMEOUT_SECONDS
+                            )
+                            try:
+                                result = await asyncio.wait_for(send_coro, timeout=attempt_timeout)
+                            except asyncio.TimeoutError:
+                                result = {
+                                    "success": False,
+                                    "error": f"Gemini fallback attempt timed out after {attempt_timeout}s",
+                                }
+                        else:
+                            result = await send_coro
                     except Exception as exc:
                         result = {"success": False, "error": str(exc)}
                     attempt_finished_at = datetime.now(timezone.utc).isoformat()

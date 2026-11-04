@@ -10,8 +10,10 @@ worker.
 - Thinking: `Low`, `Medium`, `High`; default `Medium`
 - Only these model and thinking values are accepted
 - `fallback_thinking_level` is optional. When supplied, a recognized transient
-  Gemini failure retries on a fresh chat at that thinking level while keeping
-  the same model family and the same three-attempt request budget.
+  Gemini failure retries once on a fresh chat at that thinking level while
+  keeping the same model family. Fallback requests are bounded to two browser
+  attempts: up to 90 seconds on the primary level and up to 180 seconds on the
+  fallback level.
 - `POST /v1/chat/completions` accepts OpenAI-style `messages`
 - `GET /v1/models` lists the four supported model families
 - `GET /health` returns 200 while the service can accept work, including the
@@ -56,10 +58,11 @@ Last validated on 2026-11-04 against the authenticated production account.
 Each request starts from a verified clean `/app` chat. Long prompts (1,500+
 characters) are attached as `prompt.txt` to avoid freezing the editor.
 `use_search: true` adds an explicit Search instruction. Caller prompts are sent
-without hidden marker or anti-image instructions. The worker uses at most three
-browser attempts for Gemini's recognized transient refusal or empty-terminal
-generation states. A caller-supplied `fallback_thinking_level` applies only to
-attempts 2–3. Browser or unrelated transport failures are not silently resent.
+without hidden marker or anti-image instructions. Requests without a thinking
+fallback use at most three browser attempts for Gemini's recognized transient
+refusal or empty-terminal generation states. Requests with
+`fallback_thinking_level` use one primary attempt and one fallback attempt.
+Browser or unrelated transport failures are not silently resent.
 
 ## Install and production startup
 
