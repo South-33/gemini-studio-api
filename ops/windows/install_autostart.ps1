@@ -32,9 +32,9 @@ $launcherProcesses = @(
 $existingTask = Get-ScheduledTask -TaskName $startupName -ErrorAction SilentlyContinue
 
 # Re-running the installer is a normal deploy/repair operation. If production
-# already has the desired Run entry, no legacy task, and a healthy launcher,
-# leave the live browser process tree alone. This keeps concurrent maintenance
-# sessions from interrupting an in-flight Gemini request.
+# already has a launcher process for this repo, never replace it just because
+# the API health probe is temporarily unavailable. The launcher owns API
+# recovery and replacing it from SSH would also tear down the headed browser.
 $apiHealthy = $false
 try {
     $health = Invoke-RestMethod 'http://127.0.0.1:8000/health' -TimeoutSec 5
@@ -64,19 +64,15 @@ $shortcut.WindowStyle = 7
 $shortcut.Description = 'Starts Gemini Studio API in the interactive desktop session.'
 $shortcut.Save()
 
-if ($launcherProcesses.Count -gt 0 -and $apiHealthy) {
-    Write-Host "Interactive startup shortcut configured and healthy: $startupName"
+if ($launcherProcesses.Count -gt 0) {
+    if ($apiHealthy) {
+        Write-Host "Interactive startup shortcut configured and healthy: $startupName"
+    } else {
+        Write-Warning 'Launcher is already running while the API health probe is unavailable; leaving launcher recovery in control.'
+    }
     Write-Host 'Leaving the live launcher process tree untouched.'
     exit 0
 }
-
-# A previously detached launcher can outlive the scheduled-task registration
-# long enough to keep the single-instance mutex.  Stop any launcher that owns
-# this repo before registering the new task so the replacement can start cleanly.
-$launcherProcesses | ForEach-Object {
-    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
-}
-Start-Sleep -Milliseconds 750
 
 $currentSessionId = (Get-Process -Id $PID).SessionId
 if ($currentSessionId -eq 0) {

@@ -26,13 +26,14 @@ class LauncherLogTests(unittest.TestCase):
         self.assertNotIn("New-ScheduledTaskTrigger", script)
         self.assertNotIn("StartWhenAvailable", script)
 
-    def test_autostart_is_idempotent_when_live_service_is_healthy(self):
+    def test_autostart_never_replaces_an_existing_launcher(self):
         script = (Path(__file__).parents[1] / "ops" / "windows" / "install_autostart.ps1").read_text(
             encoding="utf-8"
         )
         self.assertIn("Invoke-RestMethod 'http://127.0.0.1:8000/health'", script)
         self.assertIn("Leaving the live launcher process tree untouched.", script)
-        self.assertIn("$launcherProcesses.Count -gt 0 -and $apiHealthy", script)
+        self.assertIn("if ($launcherProcesses.Count -gt 0)", script)
+        self.assertNotIn("Stop-Process -Id $_.ProcessId", script)
 
     def test_rotate_log_keeps_one_backup(self):
         with tempfile.TemporaryDirectory() as temp_dir:
