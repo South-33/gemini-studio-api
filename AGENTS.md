@@ -33,3 +33,6 @@ This is the project's AGENTS.md
   Scheduler: task stop/relaunch events can interrupt the headed browser, while
   SSH logons do not execute the HKCU Run entry. Keep the launcher mutex in the
   Windows `Global\` namespace as a second single-owner guard across sessions.
+- `ops/windows/install_autostart.ps1` may use a transient interactive bootstrap
+  task when invoked from SSH. It must be deleted immediately; persistent
+  autostart remains only the HKCU `Run` entry.

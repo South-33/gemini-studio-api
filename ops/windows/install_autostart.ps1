@@ -1,6 +1,7 @@
 $ErrorActionPreference = 'Stop'
 
 $startupName = 'Gemini Studio API'
+$bootstrapTaskName = 'Gemini Studio API Bootstrap'
 $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $launcher = Join-Path $repoRoot 'launcher.py'
@@ -71,11 +72,41 @@ Start-Sleep -Milliseconds 750
 New-Item -Path $runKey -Force | Out-Null
 Set-ItemProperty -Path $runKey -Name $startupName -Value $runCommand
 
-Start-Process `
-    -FilePath $pythonw `
-    -ArgumentList @($launcher) `
-    -WorkingDirectory $repoRoot `
-    -WindowStyle Hidden
+$currentSessionId = (Get-Process -Id $PID).SessionId
+if ($currentSessionId -eq 0) {
+    # OpenSSH runs in session 0. Use a short-lived interactive task only as a
+    # launch bridge so headed Chromium starts on the real desktop. The task
+    # exits immediately after Start-Process and is then deleted; persistent
+    # autostart remains only the HKCU Run entry above.
+    $bootstrapCommand = "Start-Process -FilePath '$pythonw' -ArgumentList '$launcher' -WorkingDirectory '$repoRoot' -WindowStyle Hidden"
+    $bootstrapAction = New-ScheduledTaskAction `
+        -Execute 'powershell.exe' `
+        -Argument "-NoProfile -WindowStyle Hidden -Command `"$bootstrapCommand`""
+    $bootstrapPrincipal = New-ScheduledTaskPrincipal `
+        -UserId $currentUser `
+        -LogonType Interactive `
+        -RunLevel Limited
+    $bootstrapSettings = New-ScheduledTaskSettingsSet `
+        -ExecutionTimeLimit ([TimeSpan]::FromMinutes(2)) `
+        -MultipleInstances IgnoreNew
+
+    Unregister-ScheduledTask -TaskName $bootstrapTaskName -Confirm:$false -ErrorAction SilentlyContinue
+    Register-ScheduledTask `
+        -TaskName $bootstrapTaskName `
+        -Action $bootstrapAction `
+        -Principal $bootstrapPrincipal `
+        -Settings $bootstrapSettings `
+        -Force | Out-Null
+    Start-ScheduledTask -TaskName $bootstrapTaskName
+    Start-Sleep -Seconds 4
+    Unregister-ScheduledTask -TaskName $bootstrapTaskName -Confirm:$false
+} else {
+    Start-Process `
+        -FilePath $pythonw `
+        -ArgumentList @($launcher) `
+        -WorkingDirectory $repoRoot `
+        -WindowStyle Hidden
+}
 Start-Sleep -Seconds 3
 
 Write-Host "Installed interactive startup entry: $startupName"

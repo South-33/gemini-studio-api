@@ -71,6 +71,9 @@ starts `launcher.py` when the real desktop session opens. `launcher.py` owns the
 API, headed Chromium, and ngrok as one Windows process tree. Task Scheduler is
 not used for production autostart because task stop/relaunch events can interrupt
 an active browser request, while SSH logons do not execute the HKCU Run entry.
+If this installer is run over SSH, it may create a short-lived interactive
+bootstrap task only to start the initial launcher in the desktop session. That
+task is deleted immediately and is not a production autostart mechanism.
 The browser profile is stored in `.browser_session/` and must not be committed.
 
 Headed Chromium needs an interactive desktop. The production host is configured

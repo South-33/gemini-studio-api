@@ -19,8 +19,10 @@ class LauncherLogTests(unittest.TestCase):
         self.assertIn("HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run", script)
         self.assertIn("Set-ItemProperty", script)
         self.assertIn("pythonw.exe", script)
-        self.assertNotIn("Register-ScheduledTask", script)
-        self.assertNotIn("Start-ScheduledTask", script)
+        self.assertIn("Gemini Studio API Bootstrap", script)
+        self.assertIn("Unregister-ScheduledTask -TaskName $bootstrapTaskName", script)
+        self.assertNotIn("New-ScheduledTaskTrigger", script)
+        self.assertNotIn("StartWhenAvailable", script)
 
     def test_autostart_is_idempotent_when_live_service_is_healthy(self):
         script = (Path(__file__).parents[1] / "ops" / "windows" / "install_autostart.ps1").read_text(
