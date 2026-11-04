@@ -442,14 +442,15 @@ def run() -> int:
                 local_health_failures = 0
 
             cloudflare_exited = bool(cloudflare and cloudflare.process.poll() is not None)
-            cloudflare_in_startup_grace = time.monotonic() < cloudflare_grace_until
-            if cloudflare and cloudflare_url and not cloudflare_in_startup_grace:
-                data_ok = healthy(f"{cloudflare_url}/health")
-                cloudflare_health_failures = 0 if data_ok else cloudflare_health_failures + 1
-            elif cloudflare_exited:
-                cloudflare_health_failures = PUBLIC_HEALTH_FAILURE_LIMIT
-            else:
-                cloudflare_health_failures = 0
+            # This host's Windows resolver can fail for a freshly issued
+            # trycloudflare.com hostname even when Cloudflare public DNS has
+            # already published it. The tunnel's registered edge connection
+            # is validated at startup, so do not rotate a live process based
+            # on a self-probe that depends on the local resolver. BorderClash
+            # retries the data plane and falls back to ngrok independently.
+            cloudflare_health_failures = (
+                PUBLIC_HEALTH_FAILURE_LIMIT if cloudflare_exited else 0
+            )
 
             # Async Gemini work lives in the local API/browser, not in the
             # Cloudflare connection. Rotating a broken Quick Tunnel is safe

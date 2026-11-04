@@ -97,6 +97,17 @@ class LauncherLogTests(unittest.TestCase):
             )
         )
 
+    def test_cloudflare_live_process_does_not_depend_on_public_self_probe(self):
+        cloudflare_exited = False
+        failures = launcher.PUBLIC_HEALTH_FAILURE_LIMIT if cloudflare_exited else 0
+
+        self.assertFalse(
+            launcher.should_restart_data_tunnel(
+                process_exited=cloudflare_exited,
+                failures=failures,
+            )
+        )
+
 
 @unittest.skipUnless(os.name == "nt", "Windows Job Objects are Windows-only")
 class LauncherTests(unittest.TestCase):
