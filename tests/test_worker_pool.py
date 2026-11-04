@@ -7,7 +7,7 @@ from worker_pool import WorkerPool
 
 
 class FakeWorker:
-    def __init__(self, results=None, prepare_ok=True):
+    def __init__(self, results=None, prepare_ok=True, native_retry_result=None):
         self._initialized = True
         self._generation_in_progress = False
         self._results = list(results or [])
@@ -22,6 +22,8 @@ class FakeWorker:
         self.diagnostic_reasons = []
         self.thinking_levels = []
         self.site_state_reset_calls = 0
+        self.native_retry_result = native_retry_result
+        self.native_retry_calls = 0
 
     async def ensure_configuration(self, *_args, **_kwargs):
         if self.configuration_results:
@@ -50,6 +52,10 @@ class FakeWorker:
     async def clear_non_cookie_site_state(self):
         self.site_state_reset_calls += 1
         return True
+
+    async def retry_last_response_native(self):
+        self.native_retry_calls += 1
+        return self.native_retry_result
 
     async def prepare_next_request(self):
         self.prepare_calls += 1
@@ -176,6 +182,30 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("hard time fulfilling", self.request_logger.call_args_list[0].kwargs["result"]["response"])
         self.assertTrue(self.request_logger.call_args_list[0].kwargs["will_retry"])
         self.assertEqual(self.request_logger.call_args_list[1].kwargs["attempt"], 2)
+
+    async def test_generic_refusal_can_recover_with_native_retry_without_resend(self):
+        pool = WorkerPool()
+        worker = FakeWorker(
+            [{"success": True, "response": "Sorry, something went wrong. Please try your request again."}],
+            native_retry_result={
+                "success": True,
+                "response": "recovered in place",
+                "raw_response": "recovered in place",
+                "native_retry": True,
+            },
+        )
+        pool.workers = [worker]
+        pool._initialized = True
+        pool._recreate_worker = AsyncMock(return_value=True)
+
+        result = await pool.send_message("hello", request_id="native-retry-recovery")
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["response"], "recovered in place")
+        self.assertEqual(result["attempts"], 1)
+        self.assertEqual(worker.calls, 1)
+        self.assertEqual(worker.native_retry_calls, 1)
+        pool._recreate_worker.assert_not_awaited()
 
     async def test_generic_refusal_clears_non_cookie_site_state_before_final_retry(self):
         pool = WorkerPool()

@@ -326,13 +326,19 @@ class GeminiWebAutomation:
         while time.time() < deadline:
             snap = await self._capture_state_snapshot()
             stop_visible = bool(snap.get("stop_visible"))
+            response_signature = str(snap.get("last_response_signature") or "")
+            response_changed = bool(response_signature and response_signature != before_signature)
             if stop_visible:
                 saw_stop = True
                 terminal_since = None
                 await asyncio.sleep(UI_POLL_SECONDS)
                 continue
 
-            if saw_stop and int(snap.get("response_copy_count") or 0) > 0 and int(snap.get("response_body_len") or 0) > 0:
+            if (
+                (saw_stop or response_changed)
+                and int(snap.get("response_copy_count") or 0) > 0
+                and int(snap.get("response_body_len") or 0) > 0
+            ):
                 if terminal_since is None:
                     terminal_since = time.time()
                 if time.time() - terminal_since < 0.8:
