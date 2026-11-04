@@ -124,24 +124,32 @@ class LauncherTests(unittest.TestCase):
         self.assertFalse(
             launcher.should_restart_api(
                 process_exited=False,
-                failures=launcher.LOCAL_HEALTH_FAILURE_LIMIT,
+                unhealthy_for_seconds=launcher.LOCAL_HEALTH_RESTART_AFTER_SECONDS,
                 busy_grace_active=True,
             )
         )
         self.assertTrue(
             launcher.should_restart_api(
                 process_exited=False,
-                failures=launcher.LOCAL_HEALTH_FAILURE_LIMIT,
+                unhealthy_for_seconds=launcher.LOCAL_HEALTH_RESTART_AFTER_SECONDS,
+                busy_grace_active=False,
+            )
+        )
+        self.assertFalse(
+            launcher.should_restart_api(
+                process_exited=False,
+                unhealthy_for_seconds=launcher.LOCAL_HEALTH_RESTART_AFTER_SECONDS - 1,
                 busy_grace_active=False,
             )
         )
         self.assertTrue(
             launcher.should_restart_api(
                 process_exited=True,
-                failures=0,
+                unhealthy_for_seconds=0,
                 busy_grace_active=True,
             )
         )
+        self.assertGreaterEqual(launcher.LOCAL_HEALTH_RESTART_AFTER_SECONDS, 10 * 60)
 
     def test_tunnel_monitor_defers_probe_failures_during_active_request(self):
         self.assertFalse(

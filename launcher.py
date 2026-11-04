@@ -29,9 +29,9 @@ ENDPOINT_STATE = ROOT / "runtime_endpoint.json"
 CLOUDFLARE_BINARY = ROOT / "cloudflared.exe"
 CLOUDFLARE_URL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com", re.IGNORECASE)
 LAUNCHER_MUTEX_NAME = r"Global\GeminiStudioAPILauncher"
-LOCAL_HEALTH_FAILURE_LIMIT = 3
 PUBLIC_HEALTH_FAILURE_LIMIT = 3
 BUSY_HEALTH_GRACE_SECONDS = 15 * 60
+LOCAL_HEALTH_RESTART_AFTER_SECONDS = 12 * 60
 CLOUDFLARE_STARTUP_GRACE_SECONDS = 3 * 60
 
 
@@ -314,10 +314,21 @@ def should_restart_data_tunnel(process_exited: bool, failures: int) -> bool:
     return process_exited or failures >= PUBLIC_HEALTH_FAILURE_LIMIT
 
 
-def should_restart_api(process_exited: bool, failures: int, busy_grace_active: bool) -> bool:
-    """Do not interrupt a recently observed long-running browser request."""
+def should_restart_api(
+    process_exited: bool,
+    unhealthy_for_seconds: float,
+    busy_grace_active: bool,
+) -> bool:
+    """Restart only for process exit or a sustained health outage.
+
+    Short local probe failures have repeatedly occurred while Gemini is still
+    generating normally. A three-probe threshold can therefore destroy a
+    healthy async job. Keep process-exit recovery immediate, but require a
+    prolonged health outage before killing a still-running API.
+    """
     return process_exited or (
-        not busy_grace_active and failures >= LOCAL_HEALTH_FAILURE_LIMIT
+        not busy_grace_active
+        and unhealthy_for_seconds >= LOCAL_HEALTH_RESTART_AFTER_SECONDS
     )
 
 
@@ -422,22 +433,35 @@ def run() -> int:
         cloudflare_health_failures = 0
         control_health_failures = 0
         busy_grace_until = 0.0
+        last_local_health_ok = time.monotonic()
         while True:
             time.sleep(10)
+            now = time.monotonic()
             api_exited = api.process.poll() is not None
             local_payload = None if api_exited else health_payload(LOCAL_HEALTH)
             local_ok = local_payload is not None
             active_request = bool(local_payload and local_payload.get("active_request"))
             queued_requests = int(local_payload.get("queued_requests", 0) or 0) if local_payload else 0
             if active_request or queued_requests > 0:
-                busy_grace_until = time.monotonic() + BUSY_HEALTH_GRACE_SECONDS
-            local_health_failures = 0 if local_ok else local_health_failures + 1
-            busy_grace_active = time.monotonic() < busy_grace_until
-            if should_restart_api(api_exited, local_health_failures, busy_grace_active):
-                log("API or Gemini worker unhealthy; restarting API...")
+                busy_grace_until = now + BUSY_HEALTH_GRACE_SECONDS
+            if local_ok:
+                local_health_failures = 0
+                last_local_health_ok = now
+            else:
+                local_health_failures += 1
+            unhealthy_for_seconds = max(0.0, now - last_local_health_ok)
+            busy_grace_active = now < busy_grace_until
+            if should_restart_api(api_exited, unhealthy_for_seconds, busy_grace_active):
+                reason = "process exited" if api_exited else (
+                    f"health unavailable for {int(unhealthy_for_seconds)}s "
+                    f"across {local_health_failures} probes"
+                )
+                log(f"API unhealthy ({reason}); restarting API...")
                 api.stop()
                 api = start_process("API", [sys.executable, "-u", "main.py"], "server.log")
-                if not wait_until_healthy(api, LOCAL_HEALTH, 120):
+                if wait_until_healthy(api, LOCAL_HEALTH, 120):
+                    last_local_health_ok = time.monotonic()
+                else:
                     log("API restart failed; retrying on the next monitor cycle")
                 local_health_failures = 0
 
