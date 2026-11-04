@@ -19,6 +19,7 @@ class FakeWorker:
         self.started_ready = []
         self.prepare_ok = prepare_ok
         self.configuration_results = []
+        self.diagnostic_reasons = []
 
     async def ensure_configuration(self, *_args, **_kwargs):
         if self.configuration_results:
@@ -39,6 +40,9 @@ class FakeWorker:
 
     def get_request_log(self):
         return []
+
+    async def _save_diagnostic_artifacts(self, reason):
+        self.diagnostic_reasons.append(reason)
 
     async def prepare_next_request(self):
         self.prepare_calls += 1
@@ -134,6 +138,7 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["success"])
         self.assertEqual(result["response"], "expected")
         self.assertEqual(result["attempts"], 2)
+        self.assertEqual(worker.diagnostic_reasons, ["transient_refusal"])
         pool._recreate_worker.assert_awaited_once()
         self.assertEqual(pool._prepare_request_configuration.await_count, 2)
         self.assertEqual(self.request_logger.call_count, 2)

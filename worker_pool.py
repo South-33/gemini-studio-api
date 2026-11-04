@@ -425,6 +425,13 @@ class WorkerPool:
 
                     ready_after_failure = None
                     if attempt < max_attempts and retryable:
+                        try:
+                            await worker._save_diagnostic_artifacts("transient_refusal")
+                        except Exception as exc:
+                            log(
+                                f"[{request_id}] Transient-refusal diagnostics failed ({type(exc).__name__}); continuing retry",
+                                "Worker",
+                            )
                         log(
                             f"[{request_id}] Response rejected; recreating tab before retry {attempt + 1}/{max_attempts}",
                             "Worker",
