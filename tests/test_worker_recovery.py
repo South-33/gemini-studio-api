@@ -200,6 +200,23 @@ class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
             "response_copy_count": 0,
         }, 0))
 
+    def test_generation_that_ends_without_response_is_detected(self):
+        helper = GeminiWebAutomation._is_empty_terminal_after_generation
+        empty_terminal = {
+            "user_query_count": 1,
+            "response_count": 0,
+            "phase": "idle_or_unknown",
+            "stop_visible": False,
+            "send_visible": True,
+            "thinking_active": False,
+            "response_body_len": 0,
+            "response_copy_count": 0,
+        }
+        self.assertTrue(helper(empty_terminal, 0, 0, True))
+        self.assertFalse(helper(empty_terminal, 0, 0, False))
+        self.assertFalse(helper({**empty_terminal, "response_count": 1}, 0, 0, True))
+        self.assertFalse(helper({**empty_terminal, "stop_visible": True}, 0, 0, True))
+
     def test_model_matching_tolerates_version_and_label_changes(self):
         matcher = GeminiWebAutomation(worker_id=1)._matches_model
         self.assertTrue(matcher("Gemini 3.8 Flash", "flash"))

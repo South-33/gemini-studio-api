@@ -69,6 +69,7 @@ ERROR_ARTIFACT_MAX_FILES = 500
 ERROR_ARTIFACT_MAX_BYTES = 64 * 1024 * 1024
 
 DEAD_RESPONSE_SHELL_SECONDS = 5.0
+EMPTY_TERMINAL_GRACE_SECONDS = 3.0
 
 
 def _rotate_error_artifacts(directory: Path) -> None:
@@ -175,6 +176,26 @@ class GeminiWebAutomation:
             and int(snapshot.get("response_count") or 0) > 0
             and str(snapshot.get("phase") or "") == "idle_or_unknown"
             and not bool(snapshot.get("stop_visible"))
+            and not bool(snapshot.get("thinking_active"))
+            and int(snapshot.get("response_body_len") or 0) == 0
+            and int(snapshot.get("response_copy_count") or 0) == 0
+        )
+
+    @staticmethod
+    def _is_empty_terminal_after_generation(
+        snapshot: Dict[str, Any],
+        pre_send_user_query_count: int,
+        pre_send_response_count: int,
+        saw_stop_visible: bool,
+    ) -> bool:
+        """Detect a generation that visibly ran, then ended without creating a response."""
+        return (
+            saw_stop_visible
+            and int(snapshot.get("user_query_count") or 0) > pre_send_user_query_count
+            and int(snapshot.get("response_count") or 0) <= pre_send_response_count
+            and str(snapshot.get("phase") or "") == "idle_or_unknown"
+            and not bool(snapshot.get("stop_visible"))
+            and bool(snapshot.get("send_visible"))
             and not bool(snapshot.get("thinking_active"))
             and int(snapshot.get("response_body_len") or 0) == 0
             and int(snapshot.get("response_copy_count") or 0) == 0
@@ -1530,6 +1551,8 @@ class GeminiWebAutomation:
             last_scroll_nudge_at = 0.0
             finalize_attempted = False
             seen_new_response = False
+            saw_stop_visible = False
+            empty_terminal_since: Optional[float] = None
             while (time.time() - start_time) < max_wait:
                 outage = self._get_active_network_outage()
                 if outage:
@@ -1589,6 +1612,26 @@ class GeminiWebAutomation:
 
                 now = time.time()
                 elapsed_float = now - start_time
+
+                if bool(page_snapshot.get("stop_visible")):
+                    saw_stop_visible = True
+
+                empty_terminal = self._is_empty_terminal_after_generation(
+                    page_snapshot,
+                    pre_send_user_query_count,
+                    pre_send_resp_count,
+                    saw_stop_visible,
+                )
+                if empty_terminal:
+                    if empty_terminal_since is None:
+                        empty_terminal_since = now
+                    elif now - empty_terminal_since >= EMPTY_TERMINAL_GRACE_SECONDS:
+                        error = "Gemini generation ended without a response"
+                        log(f"{error}", f"Worker {self.worker_id}")
+                        self._track_error(error, "copy_btn", "wait_for_response_empty_terminal", page_snapshot)
+                        return {"success": False, "error": error}
+                else:
+                    empty_terminal_since = None
 
                 if (
                     elapsed_float >= DEAD_RESPONSE_SHELL_SECONDS
