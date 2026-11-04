@@ -622,12 +622,36 @@ async def health(response: Response):
     }
 
 
+async def get_live_pool_diagnostics() -> Dict[str, Any]:
+    """Run Playwright-backed diagnostics on the browser's owning event loop."""
+    if not worker_pool:
+        return {}
+    if not browser_loop or not browser_loop.is_running():
+        return worker_pool.get_diagnostics()
+
+    future = asyncio.run_coroutine_threadsafe(
+        worker_pool.get_live_diagnostics(),
+        browser_loop,
+    )
+    try:
+        return await asyncio.wait_for(asyncio.wrap_future(future), timeout=8.0)
+    except asyncio.TimeoutError:
+        future.cancel()
+        fallback = worker_pool.get_diagnostics()
+        fallback["live_diagnostics_error"] = "browser diagnostics timed out"
+        return fallback
+    except Exception as exc:
+        fallback = worker_pool.get_diagnostics()
+        fallback["live_diagnostics_error"] = str(exc)
+        return fallback
+
+
 @app.get("/v1/diagnostics")
 async def diagnostics():
     if not worker_pool:
         return {"status": "not_initialized"}
 
-    pool_diag = await worker_pool.get_live_diagnostics()
+    pool_diag = await get_live_pool_diagnostics()
     ready_workers = ready_worker_count()
     browser_state = pool_diag.get("browser_state")
     is_ready = bool(

@@ -1,10 +1,7 @@
-import json
-import tempfile
 import unittest
 import json
 import tempfile
-from pathlib import Path
-from unittest.mock import patch
+import threading
 from pathlib import Path
 from unittest.mock import patch
 
@@ -191,6 +188,33 @@ class EndpointDiscoveryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(payload["queued_requests"], 2)
+
+    async def test_live_diagnostics_run_on_browser_owner_loop(self):
+        class DiagnosticPool(FakePool):
+            async def get_live_diagnostics(self):
+                return {
+                    "browser_state": self._browser_state,
+                    "thread_id": threading.get_ident(),
+                    "workers": [],
+                }
+
+            def get_diagnostics(self):
+                return {"browser_state": self._browser_state, "workers": []}
+
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=loop.run_forever, daemon=True)
+        thread.start()
+        self.addCleanup(loop.call_soon_threadsafe, loop.stop)
+        self.addCleanup(thread.join, 2)
+
+        main.worker_pool = DiagnosticPool(True, [FakeWorker(initialized=True)])
+        main.browser_loop = loop
+        caller_thread_id = threading.get_ident()
+
+        payload = await main.get_live_pool_diagnostics()
+
+        self.assertNotEqual(payload["thread_id"], caller_thread_id)
+        self.assertEqual(payload["thread_id"], thread.ident)
 
     async def test_health_is_ok_while_browser_is_intentionally_cold(self):
         main.worker_pool = FakePool(
