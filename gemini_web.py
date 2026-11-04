@@ -1255,6 +1255,66 @@ class GeminiWebAutomation:
         finally:
             self._request_id = previous_request_id
 
+    async def clear_non_cookie_site_state(self) -> bool:
+        """Clear Gemini app caches/state without touching Google login cookies."""
+        if not self._initialized or not self.page:
+            return False
+        try:
+            result = await self.page.evaluate(
+                """
+                async () => {
+                    let localStorageCleared = false;
+                    let sessionStorageCleared = false;
+                    let deletedCaches = 0;
+                    let unregisteredWorkers = 0;
+
+                    try {
+                        localStorage.clear();
+                        localStorageCleared = true;
+                    } catch (_) {}
+                    try {
+                        sessionStorage.clear();
+                        sessionStorageCleared = true;
+                    } catch (_) {}
+                    try {
+                        if ('caches' in window) {
+                            const names = await caches.keys();
+                            for (const name of names) {
+                                if (await caches.delete(name)) deletedCaches += 1;
+                            }
+                        }
+                    } catch (_) {}
+                    try {
+                        if ('serviceWorker' in navigator) {
+                            const registrations = await navigator.serviceWorker.getRegistrations();
+                            for (const registration of registrations) {
+                                if (await registration.unregister()) unregisteredWorkers += 1;
+                            }
+                        }
+                    } catch (_) {}
+
+                    return {
+                        localStorageCleared,
+                        sessionStorageCleared,
+                        deletedCaches,
+                        unregisteredWorkers,
+                    };
+                }
+                """
+            )
+            log(
+                "Non-cookie Gemini site state cleared "
+                f"local={bool(result.get('localStorageCleared'))} "
+                f"session={bool(result.get('sessionStorageCleared'))} "
+                f"caches={int(result.get('deletedCaches') or 0)} "
+                f"service_workers={int(result.get('unregisteredWorkers') or 0)}",
+                f"Worker {self.worker_id}",
+            )
+            return True
+        except Exception as exc:
+            log(f"Non-cookie site-state clear failed: {exc}", f"Worker {self.worker_id}")
+            return False
+
     def _track_error(self, error: str, selector_key: str, action: str, diagnostics: Optional[Dict[str, Any]] = None):
         payload = {
             "error": error,

@@ -472,6 +472,18 @@ class WorkerPool:
                             f" thinking={effective_thinking_level}->{fallback_thinking_level or thinking_level}",
                             "Worker",
                         )
+                        if is_refusal and attempt == max_attempts - 1:
+                            try:
+                                reset_ok = await worker.clear_non_cookie_site_state()
+                                log(
+                                    f"[{request_id}] Final-retry site-state reset ok={reset_ok} cookies_preserved=true",
+                                    "Worker",
+                                )
+                            except Exception as exc:
+                                log(
+                                    f"[{request_id}] Final-retry site-state reset failed ({type(exc).__name__}); continuing",
+                                    "Worker",
+                                )
                         ready_for_retry = await self._recreate_worker(
                             f"transient Gemini retry {attempt + 1}/{max_attempts} for request {request_id}"
                         )
