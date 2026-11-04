@@ -24,7 +24,7 @@ DOMAIN = "believable-unplagiarised-josette.ngrok-free.dev"
 PUBLIC_ROOT = f"https://{DOMAIN}"
 LOCAL_HEALTH = f"http://127.0.0.1:{PORT}/health"
 PUBLIC_HEALTH = f"{PUBLIC_ROOT}/health"
-LAUNCHER_MUTEX_NAME = r"Local\GeminiStudioAPILauncher"
+LAUNCHER_MUTEX_NAME = r"Global\GeminiStudioAPILauncher"
 LOCAL_HEALTH_FAILURE_LIMIT = 3
 PUBLIC_HEALTH_FAILURE_LIMIT = 3
 
@@ -53,7 +53,7 @@ def rotate_log(path: Path) -> None:
 
 
 def acquire_launcher_mutex(name: str = LAUNCHER_MUTEX_NAME) -> object | None:
-    """Acquire the per-session Windows launcher mutex, or return None if owned."""
+    """Acquire the host-wide Windows launcher mutex, or return None if owned."""
     if os.name != "nt":
         return object()
 
@@ -266,7 +266,7 @@ def run() -> int:
     log("Launcher starting")
     launcher_mutex = acquire_launcher_mutex()
     if launcher_mutex is None:
-        log("Another launcher already owns this desktop session; exiting")
+        log("Another launcher already owns this host; exiting")
         return 0
     if shutil.which("ngrok") is None:
         log("ngrok was not found on PATH; install/configure ngrok before starting the server")

@@ -28,3 +28,4 @@ This is the project's AGENTS.md
   or other low-resource modes because Gemini can render incompletely.
 - `.browser_session/` and `logs/` are private runtime state and must not be
   committed.
+- The autostart task can fire on SSH logons too; keep the launcher mutex in the Windows `Global\` namespace so non-desktop sessions cannot replace the production process tree.

@@ -52,8 +52,11 @@ class LauncherTests(unittest.TestCase):
             )
         )
 
+    def test_launcher_mutex_is_host_wide(self):
+        self.assertTrue(launcher.LAUNCHER_MUTEX_NAME.startswith("Global\\"))
+
     def test_launcher_mutex_allows_only_one_owner(self):
-        mutex_name = rf"Local\GeminiStudioAPITest-{uuid.uuid4()}"
+        mutex_name = rf"Global\GeminiStudioAPITest-{uuid.uuid4()}"
         owner_code = (
             "import launcher, sys, time; "
             "handle = launcher.acquire_launcher_mutex(sys.argv[1]); "
@@ -127,3 +130,4 @@ class LauncherTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
