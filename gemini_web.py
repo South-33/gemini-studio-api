@@ -273,6 +273,81 @@ class GeminiWebAutomation:
                         "text": text,
                         "icon": icon_text,
                     }
+
+            # Gemini's response-action toolbar can be a sibling rather than a
+            # descendant of the response body. Search visible page buttons, but
+            # accept icon-only retry controls only when they are spatially next
+            # to the final response. Explicit retry/regenerate labels are safe
+            # anywhere on the page after a recognized generic refusal.
+            page_buttons = self.page.locator("button")
+            page_button_count = await page_buttons.count()
+            nearby_actions = []
+            for index in range(page_button_count):
+                button = page_buttons.nth(index)
+                if not await button.is_visible():
+                    continue
+                aria_label = (await button.get_attribute("aria-label") or "").strip()
+                title = (await button.get_attribute("title") or "").strip()
+                try:
+                    text = (await button.inner_text() or "").strip()
+                except Exception:
+                    text = ""
+                try:
+                    icon_data = await button.evaluate(
+                        """
+                        (button) => {
+                            const icon = button.querySelector(
+                                'mat-icon, .material-symbols-outlined, .material-symbols-rounded, .google-symbols, [fonticon]'
+                            );
+                            const value = (
+                                icon?.getAttribute?.('fonticon') ||
+                                icon?.getAttribute?.('data-mat-icon-name') ||
+                                icon?.getAttribute?.('aria-label') ||
+                                icon?.innerText || icon?.textContent || ''
+                            ).trim();
+                            const responses = Array.from(document.querySelectorAll(
+                                '[data-content-type="response"], model-response, assistant-message-content'
+                            ));
+                            const last = responses.length ? responses[responses.length - 1] : null;
+                            if (!last) return { value, nearby: false };
+                            const br = button.getBoundingClientRect();
+                            const rr = last.getBoundingClientRect();
+                            const vertical = br.top >= rr.top - 80 && br.top <= rr.bottom + 220;
+                            const horizontal = br.right >= rr.left - 120 && br.left <= rr.right + 120;
+                            return { value, nearby: vertical && horizontal };
+                        }
+                        """
+                    )
+                    icon_text = str((icon_data or {}).get("value") or "")
+                    nearby = bool((icon_data or {}).get("nearby"))
+                except Exception:
+                    icon_text = ""
+                    nearby = False
+
+                combined = " ".join((aria_label, title, text)).strip().lower()
+                explicit_retry = any(
+                    phrase in combined
+                    for phrase in ("retry", "try again", "regenerate", "generate again", "redo response", "refresh response")
+                )
+                icon_retry = self._is_native_retry_action(icon_text=icon_text)
+                if explicit_retry or (nearby and icon_retry):
+                    return button, {
+                        "aria_label": aria_label,
+                        "title": title,
+                        "text": text,
+                        "icon": icon_text,
+                    }
+                if nearby and (aria_label or title or text or icon_text):
+                    nearby_actions.append(
+                        f"aria={aria_label!r} title={title!r} text={text[:40]!r} icon={icon_text!r}"
+                    )
+
+            if nearby_actions:
+                log(
+                    f"[{self._request_id}] Nearby response actions without retry match: "
+                    + " | ".join(nearby_actions[:12]),
+                    f"Worker {self.worker_id}",
+                )
         except Exception as exc:
             log(f"Native retry lookup failed: {exc}", f"Worker {self.worker_id}")
         return None
