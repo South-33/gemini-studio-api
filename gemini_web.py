@@ -719,6 +719,27 @@ class GeminiWebAutomation:
             print(f"[Worker {self.worker_id}] Failed to read current model/thinking level from button: {e}")
             return None, None
 
+    async def _wait_for_ui_configuration(
+        self,
+        model: Optional[str] = None,
+        thinking_level: Optional[str] = None,
+        timeout_seconds: float = 4.0,
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Wait briefly for Gemini's mode picker label to settle after a selection."""
+        deadline = time.time() + timeout_seconds
+        last_model: Optional[str] = None
+        last_thinking: Optional[str] = None
+
+        while time.time() < deadline:
+            last_model, last_thinking = await self._get_current_ui_model_and_thinking()
+            model_ok = not model or bool(last_model and self._matches_model(last_model, model))
+            thinking_ok = not thinking_level or last_thinking == thinking_level
+            if model_ok and thinking_ok:
+                return last_model, last_thinking
+            await asyncio.sleep(0.2)
+
+        return last_model, last_thinking
+
     async def ensure_configuration(
         self,
         model: Optional[str],
@@ -731,7 +752,10 @@ class GeminiWebAutomation:
         if model and (not ui_model or not self._matches_model(ui_model, model)):
             selected = await self._select_model(model)
             model_family_changed = bool(selected)
-            ui_model, ui_thinking = await self._get_current_ui_model_and_thinking()
+            if selected:
+                ui_model, ui_thinking = await self._wait_for_ui_configuration(model=model)
+            else:
+                ui_model, ui_thinking = await self._get_current_ui_model_and_thinking()
             if not selected or not ui_model or not self._matches_model(ui_model, model):
                 self._track_error(
                     f"Requested model {model!r} but Gemini UI is {ui_model or 'unknown'!r}",
@@ -744,7 +768,10 @@ class GeminiWebAutomation:
         target_thinking = thinking_level or "Medium"
         if target_thinking and ui_thinking != target_thinking:
             await self._set_thinking_level(target_thinking)
-            ui_model, ui_thinking = await self._get_current_ui_model_and_thinking()
+            ui_model, ui_thinking = await self._wait_for_ui_configuration(
+                model=model,
+                thinking_level=target_thinking,
+            )
             if ui_thinking != target_thinking:
                 self._track_error(
                     f"Requested thinking {target_thinking!r} but Gemini UI is {ui_thinking or 'unknown'!r}",

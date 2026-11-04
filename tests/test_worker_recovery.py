@@ -124,6 +124,24 @@ class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(worker.page.picker.clicked, 1)
         self.assertEqual(worker.page.option.clicked, 1)
 
+    async def test_configuration_wait_tolerates_transient_unknown_picker_label(self):
+        worker = GeminiWebAutomation(worker_id=1)
+        worker._get_current_ui_model_and_thinking = AsyncMock(side_effect=[
+            (None, None),
+            (None, None),
+            ("flash-lite", "Low"),
+        ])
+
+        model, thinking = await worker._wait_for_ui_configuration(
+            model="flash-lite",
+            thinking_level="Low",
+            timeout_seconds=1.0,
+        )
+
+        self.assertEqual(model, "flash-lite")
+        self.assertEqual(thinking, "Low")
+        self.assertEqual(worker._get_current_ui_model_and_thinking.await_count, 3)
+
     def test_copy_selector_can_be_used_before_a_copy_button_exists(self):
         worker = GeminiWebAutomation(worker_id=1)
 
