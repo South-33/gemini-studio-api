@@ -79,6 +79,40 @@ class FakeNavigationPage:
 
 
 class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    def test_response_polling_slows_only_during_prefill_and_thinking(self):
+        self.assertEqual(
+            GeminiWebAutomation._response_poll_seconds({
+                "phase": "thinking_only",
+                "stop_visible": True,
+                "response_body_len": 0,
+            }),
+            gemini_web.THINKING_POLL_SECONDS,
+        )
+        self.assertEqual(
+            GeminiWebAutomation._response_poll_seconds({
+                "phase": "response_streaming",
+                "stop_visible": True,
+                "response_body_len": 0,
+            }),
+            gemini_web.PREFILL_POLL_SECONDS,
+        )
+        self.assertEqual(
+            GeminiWebAutomation._response_poll_seconds({
+                "phase": "response_streaming",
+                "stop_visible": True,
+                "response_body_len": 120,
+            }),
+            gemini_web.UI_POLL_SECONDS,
+        )
+        self.assertEqual(
+            GeminiWebAutomation._response_poll_seconds({
+                "phase": "response_complete_postprocessing",
+                "stop_visible": False,
+                "response_body_len": 120,
+            }),
+            gemini_web.UI_POLL_SECONDS,
+        )
+
     def test_error_artifact_retention_keeps_newest_files(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             directory = Path(temp_dir)

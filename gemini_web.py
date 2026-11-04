@@ -38,6 +38,8 @@ BROWSER_TIMEOUT_SECONDS = 480
 
 # Reliability constants (intentionally hardcoded)
 UI_POLL_SECONDS = 0.2
+PREFILL_POLL_SECONDS = 0.5
+THINKING_POLL_SECONDS = 1.0
 SEND_VERIFY_POLL_SECONDS = 0.1
 CLIPBOARD_POLL_SECONDS = 0.05
 NEW_CHAT_CONTROL_CONFIRM_SECONDS = 0.8
@@ -478,7 +480,7 @@ class GeminiWebAutomation:
             if stop_visible:
                 saw_stop = True
                 terminal_since = None
-                await asyncio.sleep(UI_POLL_SECONDS)
+                await asyncio.sleep(self._response_poll_seconds(snap))
                 continue
 
             if (
@@ -535,7 +537,7 @@ class GeminiWebAutomation:
                     log(f"[{self._request_id}] Native Gemini retry extraction failed: {exc}", f"Worker {self.worker_id}")
                     return None
 
-            await asyncio.sleep(UI_POLL_SECONDS)
+            await asyncio.sleep(self._response_poll_seconds(snap))
 
         self._generation_in_progress = False
         log(f"[{self._request_id}] Native Gemini retry timed out", f"Worker {self.worker_id}")
@@ -1226,6 +1228,16 @@ class GeminiWebAutomation:
         by_chars = max(1, math.ceil(chars / 4))
         by_words = max(1, math.ceil(words * 1.3))
         return max(by_chars, by_words)
+
+    @staticmethod
+    def _response_poll_seconds(snapshot: Dict[str, Any]) -> float:
+        """Poll slowly while Gemini is only thinking, then react quickly to output."""
+        phase = str(snapshot.get("phase") or "idle_or_unknown")
+        if phase == "thinking_only":
+            return THINKING_POLL_SECONDS
+        if bool(snapshot.get("stop_visible")) and int(snapshot.get("response_body_len") or 0) == 0:
+            return PREFILL_POLL_SECONDS
+        return UI_POLL_SECONDS
 
     async def _capture_state_snapshot(self) -> Dict[str, Any]:
         snapshot: Dict[str, Any] = {
@@ -2355,7 +2367,7 @@ class GeminiWebAutomation:
 
                     last_wait_log = now
                         
-                await asyncio.sleep(UI_POLL_SECONDS)
+                await asyncio.sleep(self._response_poll_seconds(page_snapshot))
             
             if not copy_btn:
                 log(f"Timeout after {max_wait}s waiting for response", f"Worker {self.worker_id}")
