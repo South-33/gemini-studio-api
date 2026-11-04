@@ -264,6 +264,18 @@ class GeminiWebAutomation:
 
     def _empty_stall_threshold(self, backend_activity_live: bool = False) -> int:
         """Scale first-output timeout to the current request size."""
+        # Flash High can legitimately remain visually silent for several
+        # minutes before the first reasoning/output DOM appears. We have
+        # observed successful BorderClash High requests first producing output
+        # after >180s, so the compact-request fast-fail window must not apply
+        # to High thinking.
+        if getattr(self, "_thinking_requested", False):
+            return (
+                STALL_EMPTY_SECONDS_WITH_ACTIVITY
+                if backend_activity_live
+                else self._stall_empty_seconds
+            )
+
         compact = (
             self._current_prompt_tokens_est > 0
             and self._current_prompt_tokens_est <= COMPACT_PROMPT_TOKEN_THRESHOLD
