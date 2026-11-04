@@ -28,11 +28,12 @@ This is the project's AGENTS.md
   or other low-resource modes because Gemini can render incompletely.
 - `.browser_session/` and `logs/` are private runtime state and must not be
   committed.
-- Production autostart lives in the signed-in user's HKCU `Run` key and starts
-  `launcher.py` with the interactive desktop. Do not move it back to Task
-  Scheduler: task stop/relaunch events can interrupt the headed browser, while
-  SSH logons do not execute the HKCU Run entry. Keep the launcher mutex in the
-  Windows `Global\` namespace as a second single-owner guard across sessions.
+- Production autostart lives in the signed-in user's Explorer Startup folder as
+  `Gemini Studio API.lnk` and starts `launcher.py` with the interactive desktop.
+  Do not move it back to Task Scheduler or HKCU `Run`: both were observed to
+  relaunch the headed browser during SSH maintenance on this host. Keep the
+  launcher mutex in the Windows `Global\` namespace as a second single-owner
+  guard across sessions.
 - `ops/windows/install_autostart.ps1` may use a transient interactive bootstrap
   task when invoked from SSH. It must be deleted immediately; persistent
-  autostart remains only the HKCU `Run` entry.
+  autostart remains only the Explorer Startup shortcut.

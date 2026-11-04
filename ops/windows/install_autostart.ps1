@@ -2,6 +2,8 @@ $ErrorActionPreference = 'Stop'
 
 $startupName = 'Gemini Studio API'
 $bootstrapTaskName = 'Gemini Studio API Bootstrap'
+$startupFolder = [Environment]::GetFolderPath('Startup')
+$shortcutPath = Join-Path $startupFolder "$startupName.lnk"
 $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $launcher = Join-Path $repoRoot 'launcher.py'
@@ -19,7 +21,6 @@ if (-not (Test-Path $pythonw)) {
     $pythonw = $python
 }
 
-$runCommand = '"{0}" "{1}"' -f $pythonw, $launcher
 $launcherPattern = [Regex]::Escape($launcher)
 $launcherProcesses = @(
     Get-CimInstance Win32_Process |
@@ -28,10 +29,6 @@ $launcherProcesses = @(
             $_.CommandLine -match $launcherPattern
         }
 )
-$currentRunCommand = $null
-if (Test-Path $runKey) {
-    $currentRunCommand = (Get-ItemProperty -Path $runKey -Name $startupName -ErrorAction SilentlyContinue).$startupName
-}
 $existingTask = Get-ScheduledTask -TaskName $startupName -ErrorAction SilentlyContinue
 
 # Re-running the installer is a normal deploy/repair operation. If production
@@ -46,15 +43,31 @@ try {
     $apiHealthy = $false
 }
 
-if (-not $existingTask -and $currentRunCommand -eq $runCommand -and $launcherProcesses.Count -gt 0 -and $apiHealthy) {
-    Write-Host "Interactive startup entry already configured and healthy: $startupName"
-    Write-Host 'Leaving the live launcher process tree untouched.'
-    exit 0
-}
-
 if ($existingTask) {
     Stop-ScheduledTask -TaskName $startupName -ErrorAction SilentlyContinue
     Unregister-ScheduledTask -TaskName $startupName -Confirm:$false
+}
+
+# Retire the legacy HKCU Run entry. On this production host it is also processed
+# for OpenSSH logons, so it can unexpectedly relaunch the headed browser.
+Remove-ItemProperty -Path $runKey -Name $startupName -ErrorAction SilentlyContinue
+
+# Persistent autostart lives in Explorer's Startup folder. Explorer processes
+# this shortcut for the real interactive desktop; OpenSSH session logons do not.
+New-Item -ItemType Directory -Path $startupFolder -Force | Out-Null
+$shell = New-Object -ComObject WScript.Shell
+$shortcut = $shell.CreateShortcut($shortcutPath)
+$shortcut.TargetPath = $pythonw
+$shortcut.Arguments = '"{0}"' -f $launcher
+$shortcut.WorkingDirectory = $repoRoot
+$shortcut.WindowStyle = 7
+$shortcut.Description = 'Starts Gemini Studio API in the interactive desktop session.'
+$shortcut.Save()
+
+if ($launcherProcesses.Count -gt 0 -and $apiHealthy) {
+    Write-Host "Interactive startup shortcut configured and healthy: $startupName"
+    Write-Host 'Leaving the live launcher process tree untouched.'
+    exit 0
 }
 
 # A previously detached launcher can outlive the scheduled-task registration
@@ -65,19 +78,12 @@ $launcherProcesses | ForEach-Object {
 }
 Start-Sleep -Milliseconds 750
 
-# Gemini uses headed Chromium, so autostart must happen only when Explorer has
-# created the real interactive desktop. HKCU Run is intentionally used instead
-# of Task Scheduler: SSH logons do not execute this key, and there is no task
-# service that can stop/relaunch the process tree during an active request.
-New-Item -Path $runKey -Force | Out-Null
-Set-ItemProperty -Path $runKey -Name $startupName -Value $runCommand
-
 $currentSessionId = (Get-Process -Id $PID).SessionId
 if ($currentSessionId -eq 0) {
     # OpenSSH runs in session 0. Use a short-lived interactive task only as a
     # launch bridge so headed Chromium starts on the real desktop. The task
     # exits immediately after Start-Process and is then deleted; persistent
-    # autostart remains only the HKCU Run entry above.
+    # autostart remains only the Explorer Startup shortcut above.
     $bootstrapCommand = "Start-Process -FilePath '$pythonw' -ArgumentList '$launcher' -WorkingDirectory '$repoRoot' -WindowStyle Hidden"
     $bootstrapAction = New-ScheduledTaskAction `
         -Execute 'powershell.exe' `
@@ -109,12 +115,11 @@ if ($currentSessionId -eq 0) {
 }
 Start-Sleep -Seconds 3
 
-Write-Host "Installed interactive startup entry: $startupName"
+Write-Host "Installed interactive startup shortcut: $shortcutPath"
 Write-Host "User: $currentUser"
 Write-Host "Launcher: $launcher"
-Write-Host "Command: $runCommand"
 Write-Host ''
-Write-Host 'The launcher starts when the Windows desktop signs in. SSH logons do not trigger it.'
+Write-Host 'Explorer starts the launcher when the Windows desktop signs in. SSH logons do not trigger it.'
 $winlogon = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
 if ($winlogon.AutoAdminLogon -ne '1') {
     Write-Warning 'Windows auto-login is disabled. After a full reboot, sign in to this account before the API can start.'

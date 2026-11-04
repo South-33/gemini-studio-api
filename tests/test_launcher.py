@@ -12,13 +12,15 @@ import launcher
 
 
 class LauncherLogTests(unittest.TestCase):
-    def test_autostart_uses_interactive_run_key_not_task_scheduler(self):
+    def test_autostart_uses_explorer_startup_shortcut_not_persistent_task_or_run_key(self):
         script = (Path(__file__).parents[1] / "ops" / "windows" / "install_autostart.ps1").read_text(
             encoding="utf-8"
         )
-        self.assertIn("HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run", script)
-        self.assertIn("Set-ItemProperty", script)
+        self.assertIn("[Environment]::GetFolderPath('Startup')", script)
+        self.assertIn("CreateShortcut", script)
         self.assertIn("pythonw.exe", script)
+        self.assertIn("Remove-ItemProperty -Path $runKey", script)
+        self.assertNotIn("Set-ItemProperty -Path $runKey", script)
         self.assertIn("Gemini Studio API Bootstrap", script)
         self.assertIn("Unregister-ScheduledTask -TaskName $bootstrapTaskName", script)
         self.assertNotIn("New-ScheduledTaskTrigger", script)
@@ -30,7 +32,7 @@ class LauncherLogTests(unittest.TestCase):
         )
         self.assertIn("Invoke-RestMethod 'http://127.0.0.1:8000/health'", script)
         self.assertIn("Leaving the live launcher process tree untouched.", script)
-        self.assertIn("$currentRunCommand -eq $runCommand", script)
+        self.assertIn("$launcherProcesses.Count -gt 0 -and $apiHealthy", script)
 
     def test_rotate_log_keeps_one_backup(self):
         with tempfile.TemporaryDirectory() as temp_dir:
