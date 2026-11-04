@@ -237,6 +237,16 @@ class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(helper({**empty_terminal, "response_count": 1}, 0, 0, True))
         self.assertFalse(helper({**empty_terminal, "stop_visible": True}, 0, 0, True))
 
+    def test_compact_prompt_uses_shorter_first_output_timeout(self):
+        worker = GeminiWebAutomation(worker_id=1)
+        worker._current_prompt_tokens_est = 2573
+        self.assertEqual(worker._empty_stall_threshold(False), 150)
+        self.assertEqual(worker._empty_stall_threshold(True), 180)
+
+        worker._current_prompt_tokens_est = 10000
+        self.assertEqual(worker._empty_stall_threshold(False), gemini_web.STALL_EMPTY_SECONDS)
+        self.assertEqual(worker._empty_stall_threshold(True), gemini_web.STALL_EMPTY_SECONDS_WITH_ACTIVITY)
+
     def test_model_matching_tolerates_version_and_label_changes(self):
         matcher = GeminiWebAutomation(worker_id=1)._matches_model
         self.assertTrue(matcher("Gemini 3.8 Flash", "flash"))

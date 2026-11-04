@@ -44,6 +44,9 @@ NEW_CHAT_CONTROL_CONFIRM_SECONDS = 0.8
 WAIT_LOG_INTERVAL_SECONDS = 10
 STALL_EMPTY_SECONDS = 420
 STALL_EMPTY_SECONDS_WITH_ACTIVITY = 450
+COMPACT_PROMPT_TOKEN_THRESHOLD = 6000
+STALL_EMPTY_SECONDS_COMPACT = 150
+STALL_EMPTY_SECONDS_COMPACT_WITH_ACTIVITY = 180
 # Extra grace for large prompts (>15k tokens) where backend prefill can take 5+ minutes
 STALL_EMPTY_SECONDS_LARGE_PROMPT = 360
 LARGE_PROMPT_TOKEN_THRESHOLD = 15000
@@ -258,6 +261,24 @@ class GeminiWebAutomation:
     def _reset_model_tracking(self):
         self._current_selected_model = None
         self._current_selected_thinking_level = None
+
+    def _empty_stall_threshold(self, backend_activity_live: bool = False) -> int:
+        """Scale first-output timeout to the current request size."""
+        compact = (
+            self._current_prompt_tokens_est > 0
+            and self._current_prompt_tokens_est <= COMPACT_PROMPT_TOKEN_THRESHOLD
+        )
+        if compact:
+            return (
+                STALL_EMPTY_SECONDS_COMPACT_WITH_ACTIVITY
+                if backend_activity_live
+                else STALL_EMPTY_SECONDS_COMPACT
+            )
+        return (
+            STALL_EMPTY_SECONDS_WITH_ACTIVITY
+            if backend_activity_live
+            else self._stall_empty_seconds
+        )
 
 
     @classmethod
@@ -1778,9 +1799,7 @@ class GeminiWebAutomation:
                             self._last_request_success = True
                             return {"success": True, "response": finalized_text}
 
-                    empty_threshold = self._stall_empty_seconds
-                    if backend_activity_live:
-                        empty_threshold = max(empty_threshold, STALL_EMPTY_SECONDS_WITH_ACTIVITY)
+                    empty_threshold = self._empty_stall_threshold(backend_activity_live)
 
                     # For the pre-first-token phase (no output yet), also check broader network
                     # liveness from any relevant gemini.google.com traffic. Playwright fires
@@ -1796,7 +1815,7 @@ class GeminiWebAutomation:
                         if broader_live and not backend_activity_live:
                             # Broader traffic is alive even though generation URL is stale —
                             # use the longer threshold so we don't kill a healthy slow prefill.
-                            empty_threshold = max(empty_threshold, STALL_EMPTY_SECONDS_WITH_ACTIVITY)
+                            empty_threshold = self._empty_stall_threshold(True)
                             log(
                                 f"[{self._request_id}] Broader liveness active (broad_net_age={int(broader_age)}s); "
                                 f"extending empty threshold to {empty_threshold}s",
