@@ -118,7 +118,6 @@ class LauncherTests(unittest.TestCase):
                 failures=launcher.PUBLIC_HEALTH_FAILURE_LIMIT,
             )
         )
-        self.assertTrue(launcher.CLOUDFLARE_STARTUP_GRACE_SECONDS >= 120)
 
     def test_api_monitor_defers_probe_failures_during_busy_grace(self):
         self.assertFalse(

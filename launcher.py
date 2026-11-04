@@ -32,7 +32,6 @@ LAUNCHER_MUTEX_NAME = r"Global\GeminiStudioAPILauncher"
 PUBLIC_HEALTH_FAILURE_LIMIT = 3
 BUSY_HEALTH_GRACE_SECONDS = 15 * 60
 LOCAL_HEALTH_RESTART_AFTER_SECONDS = 12 * 60
-CLOUDFLARE_STARTUP_GRACE_SECONDS = 3 * 60
 
 
 def log(message: str) -> None:
@@ -419,10 +418,8 @@ def run() -> int:
         # Cloudflare carries normal API traffic. Its Quick Tunnel hostname can
         # change on every launch, so publish the current URL through ngrok.
         cloudflare, cloudflare_url = start_cloudflare_tunnel(cloudflared_path)
-        cloudflare_grace_until = 0.0
         if cloudflare_url:
             write_endpoint_state(cloudflare_url, "cloudflare-quick")
-            cloudflare_grace_until = time.monotonic() + CLOUDFLARE_STARTUP_GRACE_SECONDS
 
         log(f"Ready: http://localhost:{PORT}")
         log(f"Control plane: {CONTROL_ROOT}")
@@ -488,17 +485,14 @@ def run() -> int:
                 cloudflare, cloudflare_url = start_cloudflare_tunnel(cloudflared_path)
                 if cloudflare_url:
                     write_endpoint_state(cloudflare_url, "cloudflare-quick")
-                    cloudflare_grace_until = time.monotonic() + CLOUDFLARE_STARTUP_GRACE_SECONDS
                     log(f"Data plane rotated: {cloudflare_url}")
                 else:
                     write_endpoint_state(CONTROL_ROOT, "ngrok-fallback")
-                    cloudflare_grace_until = 0.0
                 cloudflare_health_failures = 0
             elif not cloudflare and cloudflared_path:
                 cloudflare, cloudflare_url = start_cloudflare_tunnel(cloudflared_path)
                 if cloudflare_url:
                     write_endpoint_state(cloudflare_url, "cloudflare-quick")
-                    cloudflare_grace_until = time.monotonic() + CLOUDFLARE_STARTUP_GRACE_SECONDS
                     log(f"Data plane restored: {cloudflare_url}")
 
             ngrok_exited = ngrok.process.poll() is not None
