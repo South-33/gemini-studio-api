@@ -292,6 +292,7 @@ class WorkerPool:
             normalized.startswith("i'm having a hard time fulfilling your request.")
             and "something else instead?" in normalized
         ) or normalized in {
+            "sorry, something went wrong. please try your request again.",
             "i encountered an error doing what you asked. could you try again?",
             "i seem to be encountering an error. can i try something else for you?",
         }
