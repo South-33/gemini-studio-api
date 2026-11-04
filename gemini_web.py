@@ -191,7 +191,6 @@ class GeminiWebAutomation:
         """Detect a generation that visibly ran, then ended without creating a response."""
         return (
             saw_stop_visible
-            and int(snapshot.get("user_query_count") or 0) > pre_send_user_query_count
             and int(snapshot.get("response_count") or 0) <= pre_send_response_count
             and str(snapshot.get("phase") or "") == "idle_or_unknown"
             and not bool(snapshot.get("stop_visible"))
