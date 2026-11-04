@@ -269,7 +269,7 @@ class GeminiWebAutomation:
             if count <= 0:
                 return None
             last = responses.nth(count - 1)
-            buttons = last.locator("button")
+            buttons = last.locator('button, [role="button"]')
             button_count = await buttons.count()
             for index in range(button_count):
                 button = buttons.nth(index)
@@ -307,7 +307,7 @@ class GeminiWebAutomation:
             # accept icon-only retry controls only when they are spatially next
             # to the final response. Explicit retry/regenerate labels are safe
             # anywhere on the page after a recognized generic refusal.
-            page_buttons = self.page.locator("button")
+            page_buttons = self.page.locator('button, [role="button"]')
             page_button_count = await page_buttons.count()
             nearby_actions = []
             for index in range(page_button_count):
@@ -382,13 +382,16 @@ class GeminiWebAutomation:
             # Copy action. Use that layout only as a final conservative
             # fallback; feedback buttons are excluded via aria-pressed.
             copy_buttons = self.page.locator(
-                'button[aria-label*="Copy" i], button[title*="Copy" i]'
+                'button[aria-label*="Copy" i], button[title*="Copy" i], '
+                '[role="button"][aria-label*="Copy" i], [role="button"][title*="Copy" i]'
             )
             for index in range(await copy_buttons.count() - 1, -1, -1):
                 copy_button = copy_buttons.nth(index)
                 if not await copy_button.is_visible():
                     continue
-                candidate = copy_button.locator("xpath=preceding::button[1]")
+                candidate = copy_button.locator(
+                    "xpath=preceding::*[self::button or @role='button'][1]"
+                )
                 if await candidate.count() <= 0 or not await candidate.is_visible():
                     continue
                 copy_box = await copy_button.bounding_box()
