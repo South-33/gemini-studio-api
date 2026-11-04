@@ -229,6 +229,34 @@ class GeminiWebAutomation:
         normalized_icon = (icon_text or "").strip().lower().replace(" ", "_")
         return normalized_icon in {"refresh", "replay", "autorenew", "restart_alt"}
 
+    @staticmethod
+    def _is_retry_neighbor_of_copy(
+        copy_box: Optional[Dict[str, float]],
+        candidate_box: Optional[Dict[str, float]],
+        aria_pressed: Optional[str],
+        descriptor: str = "",
+    ) -> bool:
+        """Recognize Gemini's unlabeled retry icon immediately left of Copy.
+
+        This fallback is used only after a known generic Gemini refusal. The
+        response toolbar currently places Retry directly left of Copy, while
+        Like/Dislike controls expose aria-pressed and are therefore excluded.
+        """
+        if not copy_box or not candidate_box or aria_pressed is not None:
+            return False
+        normalized = (descriptor or "").strip().lower()
+        if any(token in normalized for token in ("like", "dislike", "thumb", "copy", "share", "more")):
+            return False
+
+        copy_y = float(copy_box.get("y") or 0)
+        candidate_y = float(candidate_box.get("y") or 0)
+        copy_x = float(copy_box.get("x") or 0)
+        candidate_x = float(candidate_box.get("x") or 0)
+        candidate_width = float(candidate_box.get("width") or 0)
+        vertical_delta = abs(candidate_y - copy_y)
+        horizontal_gap = copy_x - (candidate_x + candidate_width)
+        return vertical_delta <= 18 and -8 <= horizontal_gap <= 56
+
     async def _find_native_retry_button(self):
         """Return Gemini's retry/regenerate button from the last response, if present."""
         if not self.page:
@@ -348,6 +376,47 @@ class GeminiWebAutomation:
                     + " | ".join(nearby_actions[:12]),
                     f"Worker {self.worker_id}",
                 )
+
+            # Current Gemini can render Retry as an unlabeled circular-arrow
+            # SVG. On generic error responses it sits directly left of the
+            # Copy action. Use that layout only as a final conservative
+            # fallback; feedback buttons are excluded via aria-pressed.
+            copy_buttons = self.page.locator(
+                'button[aria-label*="Copy" i], button[title*="Copy" i]'
+            )
+            for index in range(await copy_buttons.count() - 1, -1, -1):
+                copy_button = copy_buttons.nth(index)
+                if not await copy_button.is_visible():
+                    continue
+                candidate = copy_button.locator("xpath=preceding::button[1]")
+                if await candidate.count() <= 0 or not await candidate.is_visible():
+                    continue
+                copy_box = await copy_button.bounding_box()
+                candidate_box = await candidate.bounding_box()
+                aria_pressed = await candidate.get_attribute("aria-pressed")
+                aria_label = (await candidate.get_attribute("aria-label") or "").strip()
+                title = (await candidate.get_attribute("title") or "").strip()
+                try:
+                    text = (await candidate.inner_text() or "").strip()
+                except Exception:
+                    text = ""
+                descriptor = " ".join((aria_label, title, text))
+                if self._is_retry_neighbor_of_copy(
+                    copy_box,
+                    candidate_box,
+                    aria_pressed,
+                    descriptor,
+                ):
+                    log(
+                        f"[{self._request_id}] Native Gemini retry inferred from response toolbar position",
+                        f"Worker {self.worker_id}",
+                    )
+                    return candidate, {
+                        "aria_label": aria_label,
+                        "title": title,
+                        "text": text,
+                        "icon": "positional-retry",
+                    }
         except Exception as exc:
             log(f"Native retry lookup failed: {exc}", f"Worker {self.worker_id}")
         return None

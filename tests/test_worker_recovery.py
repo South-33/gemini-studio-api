@@ -160,6 +160,32 @@ class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(matcher(title="Share"))
         self.assertFalse(matcher(icon_text="thumb_up"))
 
+    def test_unlabeled_retry_neighbor_is_bounded_to_copy_toolbar(self):
+        matcher = GeminiWebAutomation._is_retry_neighbor_of_copy
+        copy_box = {"x": 500, "y": 200, "width": 32, "height": 32}
+
+        self.assertTrue(matcher(
+            copy_box,
+            {"x": 456, "y": 201, "width": 32, "height": 32},
+            None,
+        ))
+        self.assertFalse(matcher(
+            copy_box,
+            {"x": 456, "y": 201, "width": 32, "height": 32},
+            "false",
+            "Dislike",
+        ))
+        self.assertFalse(matcher(
+            copy_box,
+            {"x": 360, "y": 201, "width": 32, "height": 32},
+            None,
+        ))
+        self.assertFalse(matcher(
+            copy_box,
+            {"x": 456, "y": 260, "width": 32, "height": 32},
+            None,
+        ))
+
     def test_submission_signal_accepts_late_ui_evidence_after_click_timeout(self):
         helper = GeminiWebAutomation._submission_start_signal
         self.assertEqual(
