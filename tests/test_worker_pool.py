@@ -21,7 +21,6 @@ class FakeWorker:
         self.configuration_results = []
         self.diagnostic_reasons = []
         self.thinking_levels = []
-        self.site_state_reset_calls = 0
         self.native_retry_result = native_retry_result
         self.native_retry_calls = 0
 
@@ -48,10 +47,6 @@ class FakeWorker:
 
     async def _save_diagnostic_artifacts(self, reason, request_id=None):
         self.diagnostic_reasons.append((reason, request_id))
-
-    async def clear_non_cookie_site_state(self):
-        self.site_state_reset_calls += 1
-        return True
 
     async def retry_last_response_native(self):
         self.native_retry_calls += 1
@@ -206,24 +201,6 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(worker.calls, 1)
         self.assertEqual(worker.native_retry_calls, 1)
         pool._recreate_worker.assert_not_awaited()
-
-    async def test_generic_refusal_clears_non_cookie_site_state_before_final_retry(self):
-        pool = WorkerPool()
-        worker = FakeWorker([
-            {"success": True, "response": "Sorry, something went wrong. Please try your request again."},
-            {"success": True, "response": "I encountered an error doing what you asked. Could you try again?"},
-            {"success": True, "response": "recovered"},
-        ])
-        pool.workers = [worker]
-        pool._initialized = True
-        pool._recreate_worker = AsyncMock(return_value=True)
-        pool._prepare_request_configuration = AsyncMock(return_value=(True, None))
-
-        result = await pool.send_message("hello", request_id="site-state-recovery")
-
-        self.assertTrue(result["success"])
-        self.assertEqual(result["attempts"], 3)
-        self.assertEqual(worker.site_state_reset_calls, 1)
 
     async def test_transient_medium_failure_promotes_retry_to_high(self):
         pool = WorkerPool()
