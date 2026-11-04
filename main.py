@@ -166,17 +166,25 @@ async def openai_chat(request: Request):
     if not isinstance(messages, list) or not messages:
         raise HTTPException(status_code=400, detail="messages must be a non-empty array")
     thinking_level_explicit = body.get("thinking_level")
+    fallback_thinking_level_explicit = body.get("fallback_thinking_level")
     use_search = body.get("use_search", False)
     if not isinstance(model, str):
         raise HTTPException(status_code=400, detail="model must be a string")
     if thinking_level_explicit is not None and not isinstance(thinking_level_explicit, str):
         raise HTTPException(status_code=400, detail="thinking_level must be a string")
+    if fallback_thinking_level_explicit is not None and not isinstance(fallback_thinking_level_explicit, str):
+        raise HTTPException(status_code=400, detail="fallback_thinking_level must be a string")
     if not isinstance(use_search, bool):
         raise HTTPException(status_code=400, detail="use_search must be a boolean")
 
     try:
         base_model = normalize_model(model)
         thinking_level = normalize_thinking_level(thinking_level_explicit or "medium")
+        fallback_thinking_level = (
+            normalize_thinking_level(fallback_thinking_level_explicit)
+            if fallback_thinking_level_explicit is not None
+            else None
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -251,12 +259,17 @@ async def openai_chat(request: Request):
         "model": model,
         "resolved_model": base_model,
         "thinking_level": thinking_level,
+        "fallback_thinking_level": fallback_thinking_level,
         "status": "started",
         "started_at": datetime.now(timezone.utc).isoformat(),
     }
     recent_requests.append(trace)
     log(f"[{trace_id}] Source: project={source['project']} client={source['client']} ip={source['ip']}", "API")
-    log(f"Model: {base_model} | Thinking: {thinking_level} | Messages: {len(messages)} | Raw: {model}", "API")
+    log(
+        f"Model: {base_model} | Thinking: {thinking_level}"
+        f" | Fallback: {fallback_thinking_level or '-'} | Messages: {len(messages)} | Raw: {model}",
+        "API",
+    )
     
     # Send to worker
     prompt_chars = len(prompt)
@@ -274,6 +287,7 @@ async def openai_chat(request: Request):
         prompt, 
         model=base_model, 
         thinking_level=thinking_level, 
+        fallback_thinking_level=fallback_thinking_level,
         use_search=use_search, 
         images=image_paths,
         request_id=trace_id,
@@ -282,6 +296,7 @@ async def openai_chat(request: Request):
             "client": source["client"],
             "ip": source["ip"],
             "raw_model": model,
+            "fallback_thinking_level": fallback_thinking_level,
             "message_count": len(messages),
             "image_count": len(image_paths),
             "prompt_tokens_est": prompt_tokens_est,
@@ -324,6 +339,7 @@ async def openai_chat(request: Request):
         trace["error"] = result.get("error")
         trace["queue_wait_ms"] = result.get("queue_wait_ms")
         trace["attempts"] = result.get("attempts")
+        trace["effective_thinking_level"] = result.get("effective_thinking_level")
         trace["request_logs"] = result.get("request_logs") or []
         trace["finished_at"] = datetime.now(timezone.utc).isoformat()
         raise HTTPException(status_code=500, detail=result.get("error"))
@@ -333,6 +349,7 @@ async def openai_chat(request: Request):
     trace["status"] = "ok"
     trace["queue_wait_ms"] = result.get("queue_wait_ms")
     trace["attempts"] = result.get("attempts")
+    trace["effective_thinking_level"] = result.get("effective_thinking_level")
     trace["response_chars"] = len(content)
     trace["request_logs"] = result.get("request_logs") or []
     trace["response_tokens_est"] = completion_tokens_est

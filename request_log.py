@@ -82,6 +82,7 @@ def write_request_log(
             "raw_model": context.get("raw_model"),
             "resolved_model": model,
             "thinking_level": thinking_level,
+            "fallback_thinking_level": context.get("fallback_thinking_level"),
             "use_search": bool(use_search),
             "search_requested": bool(use_search),
             "search_instruction_present": bool(

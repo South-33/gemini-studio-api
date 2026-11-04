@@ -314,6 +314,7 @@ class WorkerPool:
         prompt: str,
         model: str | None = None,
         thinking_level: str | None = None,
+        fallback_thinking_level: str | None = None,
         use_search: bool = False,
         images: List[str] | None = None,
         request_id: str | None = None,
@@ -361,6 +362,11 @@ class WorkerPool:
                 attempt = 0
                 max_attempts = 3
                 for attempt in range(1, max_attempts + 1):
+                    effective_thinking_level = (
+                        fallback_thinking_level
+                        if attempt > 1 and fallback_thinking_level
+                        else thinking_level
+                    )
                     worker = self.worker
                     if not worker:
                         last_error = "Gemini worker disappeared"
@@ -371,7 +377,7 @@ class WorkerPool:
                         result = await worker.send_message(
                             prompt,
                             model,
-                            thinking_level,
+                            effective_thinking_level,
                             use_search,
                             images,
                             request_id=request_id,
@@ -393,6 +399,7 @@ class WorkerPool:
                         if not self._is_transient_gemini_refusal(response):
                             result["queue_wait_ms"] = wait_ms
                             result["attempts"] = attempt
+                            result["effective_thinking_level"] = effective_thinking_level
                             result["ready_for_next_request"] = await self._ensure_ready_after_request(
                                 f"request {request_id} completed"
                             )
@@ -404,7 +411,7 @@ class WorkerPool:
                                     prompt=prompt,
                                     result=result,
                                     model=model,
-                                    thinking_level=thinking_level,
+                                    thinking_level=effective_thinking_level,
                                     use_search=use_search,
                                     search_instruction_present=search_instruction_present,
                                     queue_wait_ms=wait_ms,
@@ -441,7 +448,8 @@ class WorkerPool:
                                 "Worker",
                             )
                         log(
-                            f"[{request_id}] Transient Gemini failure; recreating tab before retry {attempt + 1}/{max_attempts}",
+                            f"[{request_id}] Transient Gemini failure; recreating tab before retry {attempt + 1}/{max_attempts}"
+                            f" thinking={effective_thinking_level}->{fallback_thinking_level or thinking_level}",
                             "Worker",
                         )
                         ready_for_retry = await self._recreate_worker(
@@ -450,7 +458,7 @@ class WorkerPool:
                         if ready_for_retry:
                             configured, configuration_error = await self._prepare_request_configuration(
                                 model,
-                                thinking_level,
+                                fallback_thinking_level or thinking_level,
                                 request_id,
                             )
                             if not configured:
@@ -464,7 +472,7 @@ class WorkerPool:
                                 prompt=prompt,
                                 result=result,
                                 model=model,
-                                thinking_level=thinking_level,
+                                thinking_level=effective_thinking_level,
                                 use_search=use_search,
                                 search_instruction_present=search_instruction_present,
                                 queue_wait_ms=wait_ms,
@@ -497,7 +505,7 @@ class WorkerPool:
                             prompt=prompt,
                             result=result,
                             model=model,
-                            thinking_level=thinking_level,
+                            thinking_level=effective_thinking_level,
                             use_search=use_search,
                             search_instruction_present=search_instruction_present,
                             queue_wait_ms=wait_ms,
@@ -526,6 +534,11 @@ class WorkerPool:
                     "request_logs": request_log_files,
                     "queue_wait_ms": wait_ms,
                     "attempts": max(1, attempt),
+                    "effective_thinking_level": (
+                        fallback_thinking_level
+                        if attempt > 1 and fallback_thinking_level
+                        else thinking_level
+                    ),
                 }
         finally:
             if waiting:
