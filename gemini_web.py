@@ -195,7 +195,7 @@ class GeminiWebAutomation:
             and int(snapshot.get("response_count") or 0) <= pre_send_response_count
             and str(snapshot.get("phase") or "") == "idle_or_unknown"
             and not bool(snapshot.get("stop_visible"))
-            and bool(snapshot.get("send_visible"))
+            and (bool(snapshot.get("send_visible")) or bool(snapshot.get("input_visible")))
             and not bool(snapshot.get("thinking_active"))
             and int(snapshot.get("response_body_len") or 0) == 0
             and int(snapshot.get("response_copy_count") or 0) == 0

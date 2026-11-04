@@ -231,6 +231,7 @@ class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
             "response_copy_count": 0,
         }
         self.assertTrue(helper(empty_terminal, 0, 0, True))
+        self.assertTrue(helper({**empty_terminal, "send_visible": False, "input_visible": True}, 0, 0, True))
         self.assertFalse(helper(empty_terminal, 0, 0, False))
         self.assertFalse(helper({**empty_terminal, "response_count": 1}, 0, 0, True))
         self.assertFalse(helper({**empty_terminal, "stop_visible": True}, 0, 0, True))

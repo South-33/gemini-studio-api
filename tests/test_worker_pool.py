@@ -126,13 +126,16 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
         ])
         pool.workers = [worker]
         pool._initialized = True
+        pool._recreate_worker = AsyncMock(return_value=True)
+        pool._prepare_request_configuration = AsyncMock(return_value=(True, None))
 
         result = await pool.send_message("hello", request_id="transient-refusal")
 
         self.assertTrue(result["success"])
         self.assertEqual(result["response"], "expected")
         self.assertEqual(result["attempts"], 2)
-        self.assertEqual(worker.prepare_calls, 2)
+        pool._recreate_worker.assert_awaited_once()
+        self.assertEqual(pool._prepare_request_configuration.await_count, 2)
         self.assertEqual(self.request_logger.call_count, 2)
         self.assertIn("hard time fulfilling", self.request_logger.call_args_list[0].kwargs["result"]["response"])
         self.assertTrue(self.request_logger.call_args_list[0].kwargs["will_retry"])

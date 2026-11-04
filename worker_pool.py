@@ -299,7 +299,7 @@ class WorkerPool:
 
     @staticmethod
     def _is_retryable_response_rejection(result: Dict) -> bool:
-        """Retry once only for Gemini's concrete transient refusal."""
+        """Retry only for Gemini's concrete transient refusal."""
         response = str(result.get("response") or "")
         return WorkerPool._is_transient_gemini_refusal(response)
 
@@ -353,7 +353,8 @@ class WorkerPool:
                 request_log_files: List[str] = []
                 last_error = "unknown"
                 attempt = 0
-                for attempt in (1, 2):
+                max_attempts = 3
+                for attempt in range(1, max_attempts + 1):
                     worker = self.worker
                     if not worker:
                         last_error = "Gemini worker disappeared"
@@ -423,11 +424,23 @@ class WorkerPool:
                         last_error = result.get("error") or "Empty response"
 
                     ready_after_failure = None
-                    if attempt == 1 and retryable:
-                        log(f"[{request_id}] Response rejected; retrying once", "Worker")
-                        ready_for_retry = await self._ensure_ready_after_request(
-                            f"request {request_id} response rejected before retry"
+                    if attempt < max_attempts and retryable:
+                        log(
+                            f"[{request_id}] Response rejected; recreating tab before retry {attempt + 1}/{max_attempts}",
+                            "Worker",
                         )
+                        ready_for_retry = await self._recreate_worker(
+                            f"transient refusal retry {attempt + 1}/{max_attempts} for request {request_id}"
+                        )
+                        if ready_for_retry:
+                            configured, configuration_error = await self._prepare_request_configuration(
+                                model,
+                                thinking_level,
+                                request_id,
+                            )
+                            if not configured:
+                                ready_for_retry = False
+                                last_error = f"Gemini request failed: {configuration_error}"
                         try:
                             request_file = await asyncio.to_thread(
                                 write_request_log,
