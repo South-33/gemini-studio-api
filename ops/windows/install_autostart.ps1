@@ -33,15 +33,17 @@ Get-CimInstance Win32_Process |
     }
 Start-Sleep -Milliseconds 750
 
-# Gemini uses headed Chromium, so this task must run inside the signed-in user's
-# interactive desktop session. A machine-startup/SYSTEM task would launch the
-# browser in session 0 where it cannot be used by the automation.
+# Gemini uses headed Chromium, so this task must run with the signed-in user's
+# interactive token. Trigger from machine startup instead of user logon: an
+# AtLogOn trigger also fires for OpenSSH logons under the same account and can
+# tear down an in-flight headed browser. StartWhenAvailable lets Task Scheduler
+# wait until the interactive user token exists after boot.
 $action = New-ScheduledTaskAction `
     -Execute $python `
     -Argument "-u `"$launcher`"" `
     -WorkingDirectory $repoRoot
 
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User $currentUser
+$trigger = New-ScheduledTaskTrigger -AtStartup
 $principal = New-ScheduledTaskPrincipal `
     -UserId $currentUser `
     -LogonType Interactive `
@@ -54,7 +56,7 @@ $settings = New-ScheduledTaskSettingsSet `
     -ExecutionTimeLimit ([TimeSpan]::Zero) `
     -MultipleInstances IgnoreNew
 
-# Task Scheduler only bootstraps the foreground launcher at sign-in. The
+# Task Scheduler only bootstraps the foreground launcher after startup. The
 # launcher itself owns API/ngrok health and restarts; a second task-level
 # restart policy can tear down an in-flight Gemini request.
 
@@ -64,7 +66,7 @@ Register-ScheduledTask `
     -Trigger $trigger `
     -Principal $principal `
     -Settings $settings `
-    -Description 'Runs Gemini Studio API, Chromium, and ngrok whenever the server user signs in.' `
+    -Description 'Runs Gemini Studio API, Chromium, and ngrok after Windows starts and the interactive user token is available.' `
     -Force | Out-Null
 
 Start-ScheduledTask -TaskName $taskName
@@ -79,7 +81,7 @@ Write-Host "State: $($task.State)"
 Write-Host "Last result: $($info.LastTaskResult)"
 Write-Host "Launcher: $launcher"
 Write-Host ''
-Write-Host 'This task starts at Windows sign-in because Chromium needs an interactive desktop.'
+Write-Host 'This task becomes due at Windows startup and starts when the interactive user token is available.'
 $winlogon = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
 if ($winlogon.AutoAdminLogon -ne '1') {
     Write-Warning 'Windows auto-login is disabled. After a full reboot, sign in to this account before the API can start.'
