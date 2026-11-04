@@ -4,6 +4,8 @@ __pycache__/
 .pytest_cache/
 venv/
 logs/
+cloudflared.exe
+runtime_endpoint.json
 *.tmp
 .DS_Store
 Thumbs.db

@@ -5,7 +5,9 @@ import tempfile
 import time
 import unittest
 import uuid
+import json
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import launcher
@@ -49,9 +51,66 @@ class LauncherLogTests(unittest.TestCase):
                 "old log",
             )
 
+    def test_endpoint_state_publishes_cloudflare_url_with_ngrok_control_plane(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "runtime_endpoint.json"
+            with patch.object(launcher, "ENDPOINT_STATE", state_path):
+                launcher.write_endpoint_state(
+                    "https://fresh-route.trycloudflare.com/",
+                    "cloudflare-quick",
+                )
+
+            payload = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["data_plane_url"], "https://fresh-route.trycloudflare.com")
+            self.assertEqual(payload["control_plane_url"], launcher.CONTROL_ROOT)
+            self.assertEqual(payload["transport"], "cloudflare-quick")
+
+    def test_quick_tunnel_parser_ignores_urls_from_previous_launches(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "cloudflared.log"
+            old = "old https://old-route.trycloudflare.com\n"
+            log_path.write_text(old + "new https://new-route.trycloudflare.com\n", encoding="utf-8")
+            process = SimpleNamespace(log_path=log_path, log_start_offset=len(old.encode("utf-8")))
+
+            self.assertEqual(
+                launcher.quick_tunnel_url(process),
+                "https://new-route.trycloudflare.com",
+            )
+
+    def test_cloudflare_data_plane_can_rotate_during_active_gemini_work(self):
+        self.assertTrue(
+            launcher.should_restart_data_tunnel(
+                process_exited=False,
+                failures=launcher.PUBLIC_HEALTH_FAILURE_LIMIT,
+            )
+        )
+
 
 @unittest.skipUnless(os.name == "nt", "Windows Job Objects are Windows-only")
 class LauncherTests(unittest.TestCase):
+    def test_api_monitor_defers_probe_failures_during_busy_grace(self):
+        self.assertFalse(
+            launcher.should_restart_api(
+                process_exited=False,
+                failures=launcher.LOCAL_HEALTH_FAILURE_LIMIT,
+                busy_grace_active=True,
+            )
+        )
+        self.assertTrue(
+            launcher.should_restart_api(
+                process_exited=False,
+                failures=launcher.LOCAL_HEALTH_FAILURE_LIMIT,
+                busy_grace_active=False,
+            )
+        )
+        self.assertTrue(
+            launcher.should_restart_api(
+                process_exited=True,
+                failures=0,
+                busy_grace_active=True,
+            )
+        )
+
     def test_tunnel_monitor_defers_probe_failures_during_active_request(self):
         self.assertFalse(
             launcher.should_restart_tunnel(

@@ -1,4 +1,12 @@
+import json
+import tempfile
 import unittest
+import json
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
+from pathlib import Path
+from unittest.mock import patch
 
 import main
 from fastapi import Response
@@ -20,10 +28,11 @@ class FakeWorker:
 
 
 class FakePool:
-    def __init__(self, initialized, workers, active_request=False, browser_state="warm"):
+    def __init__(self, initialized, workers, active_request=False, queued_requests=0, browser_state="warm"):
         self._initialized = initialized
         self.workers = workers
         self._active_request = active_request
+        self._queued_requests = queued_requests
         self._browser_state = browser_state
 
 
@@ -34,20 +43,17 @@ class ApiStatusTests(unittest.TestCase):
     def tearDown(self):
         main.worker_pool = self.original_pool
 
-    def test_ready_worker_count_requires_a_live_initialized_page(self):
+    def test_ready_worker_count_uses_cached_worker_state(self):
         main.worker_pool = FakePool(True, [
             FakeWorker(initialized=True),
             FakeWorker(initialized=False),
             FakeWorker(initialized=True, closed=True),
         ])
 
-        self.assertEqual(main.ready_worker_count(), 1)
+        self.assertEqual(main.ready_worker_count(), 2)
 
-    def test_ready_worker_count_rejects_google_login_page(self):
-        main.worker_pool = FakePool(True, [
-            FakeWorker(initialized=True, url="https://accounts.google.com/v3/signin/identifier"),
-            FakeWorker(initialized=True, url="https://gemini.google.com/signin"),
-        ])
+    def test_ready_worker_count_is_zero_when_browser_not_warm(self):
+        main.worker_pool = FakePool(True, [FakeWorker(initialized=True)], browser_state="cold")
 
         self.assertEqual(main.ready_worker_count(), 0)
 
@@ -114,6 +120,48 @@ class HealthEndpointTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertTrue(payload["ready"])
+        self.assertFalse(payload["active_request"])
+        self.assertEqual(payload["status"], "ok")
+
+
+class EndpointDiscoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_endpoint_defaults_to_stable_ngrok_control_plane(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            missing_state = Path(temp_dir) / "missing.json"
+            with patch.object(main, "ENDPOINT_STATE", missing_state):
+                payload = await main.endpoint_discovery()
+
+        self.assertEqual(payload["data_plane_url"], main.CONTROL_PLANE_URL)
+        self.assertEqual(payload["control_plane_url"], main.CONTROL_PLANE_URL)
+        self.assertEqual(payload["transport"], "ngrok-fallback")
+
+    async def test_endpoint_publishes_current_cloudflare_quick_tunnel(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "runtime_endpoint.json"
+            state_path.write_text(json.dumps({
+                "data_plane_url": "https://example-words.trycloudflare.com",
+                "control_plane_url": main.CONTROL_PLANE_URL,
+                "transport": "cloudflare-quick",
+                "updated_at": "2026-11-05T00:00:00Z",
+            }), encoding="utf-8")
+            with patch.object(main, "ENDPOINT_STATE", state_path):
+                payload = await main.endpoint_discovery()
+
+        self.assertEqual(payload["data_plane_url"], "https://example-words.trycloudflare.com")
+        self.assertEqual(payload["transport"], "cloudflare-quick")
+
+    async def test_endpoint_rejects_untrusted_runtime_host(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "runtime_endpoint.json"
+            state_path.write_text(json.dumps({
+                "data_plane_url": "https://example.invalid",
+                "transport": "cloudflare-quick",
+            }), encoding="utf-8")
+            with patch.object(main, "ENDPOINT_STATE", state_path):
+                payload = await main.endpoint_discovery()
+
+        self.assertEqual(payload["data_plane_url"], main.CONTROL_PLANE_URL)
+        self.assertEqual(payload["transport"], "ngrok-fallback")
         self.assertEqual(payload["ready_workers"], 1)
 
     async def test_health_stays_ready_while_request_is_active(self):
@@ -131,6 +179,19 @@ class HealthEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(payload["active_request"])
         self.assertEqual(payload["status"], "busy")
 
+    async def test_health_reports_queued_requests(self):
+        main.worker_pool = FakePool(
+            True,
+            [FakeWorker(initialized=True)],
+            queued_requests=2,
+        )
+        response = Response()
+
+        payload = await main.health(response)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload["queued_requests"], 2)
+
     async def test_health_is_ok_while_browser_is_intentionally_cold(self):
         main.worker_pool = FakePool(
             True,
@@ -147,6 +208,36 @@ class HealthEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["ready_workers"], 0)
         self.assertEqual(payload["browser_state"], "cold")
         self.assertEqual(payload["status"], "ok")
+
+
+class EndpointDiscoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_discovery_returns_current_cloudflare_data_plane(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = Path(temp_dir) / "runtime_endpoint.json"
+            state.write_text(json.dumps({
+                "data_plane_url": "https://fresh-route.trycloudflare.com",
+                "control_plane_url": main.CONTROL_PLANE_URL,
+                "transport": "cloudflare-quick",
+                "updated_at": "2026-11-05T02:00:00Z",
+            }), encoding="utf-8")
+
+            with patch.object(main, "ENDPOINT_STATE", state):
+                payload = await main.endpoint_discovery()
+
+        self.assertEqual(payload["data_plane_url"], "https://fresh-route.trycloudflare.com")
+        self.assertEqual(payload["control_plane_url"], main.CONTROL_PLANE_URL)
+        self.assertEqual(payload["transport"], "cloudflare-quick")
+
+    async def test_discovery_falls_back_to_ngrok_for_missing_or_invalid_state(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = Path(temp_dir) / "runtime_endpoint.json"
+            state.write_text(json.dumps({"data_plane_url": "https://example.com"}), encoding="utf-8")
+
+            with patch.object(main, "ENDPOINT_STATE", state):
+                payload = await main.endpoint_discovery()
+
+        self.assertEqual(payload["data_plane_url"], main.CONTROL_PLANE_URL)
+        self.assertEqual(payload["transport"], "ngrok-fallback")
 
 
 if __name__ == "__main__":

@@ -13,8 +13,10 @@ import tempfile
 import time
 import uuid
 import math
+import json
 from collections import deque
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional, Dict, Any
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -37,6 +39,9 @@ ASYNC_JOB_TIMEOUT_SECONDS = 2700
 RECENT_REQUEST_LIMIT = 200
 ASYNC_JOB_LIMIT = 200
 IMAGE_TOKEN_ESTIMATE = 300
+ROOT = Path(__file__).resolve().parent
+ENDPOINT_STATE = ROOT / "runtime_endpoint.json"
+CONTROL_PLANE_URL = "https://believable-unplagiarised-josette.ngrok-free.dev"
 
 # Global State
 worker_pool: Optional[WorkerPool] = None
@@ -265,6 +270,35 @@ async def list_models():
     return {
         "data": [{"id": name, "object": "model", "provider": "gemini-web"} for name in MODEL_FAMILIES]
     }
+
+
+@app.get("/v1/endpoint")
+async def endpoint_discovery():
+    """Return the current fast data plane behind the stable ngrok control URL."""
+    payload: Dict[str, Any] = {
+        "version": 1,
+        "data_plane_url": CONTROL_PLANE_URL,
+        "control_plane_url": CONTROL_PLANE_URL,
+        "transport": "ngrok-fallback",
+    }
+    try:
+        candidate = json.loads(ENDPOINT_STATE.read_text(encoding="utf-8"))
+        data_plane = str(candidate.get("data_plane_url") or "").rstrip("/")
+        if (
+            data_plane == CONTROL_PLANE_URL
+            or data_plane.endswith(".trycloudflare.com")
+            or data_plane.startswith("http://127.0.0.1:")
+            or data_plane.startswith("http://localhost:")
+        ):
+            payload.update({
+                "data_plane_url": data_plane,
+                "control_plane_url": str(candidate.get("control_plane_url") or CONTROL_PLANE_URL).rstrip("/"),
+                "transport": str(candidate.get("transport") or "unknown"),
+                "updated_at": candidate.get("updated_at"),
+            })
+    except (OSError, ValueError, TypeError):
+        pass
+    return payload
 
 @app.post("/v1/chat/completions")
 async def openai_chat(request: Request):
@@ -547,20 +581,12 @@ def ready_worker_count() -> int:
     if not worker_pool or not worker_pool._initialized:
         return 0
 
-    ready = 0
-    for worker in worker_pool.workers:
-        try:
-            if (
-                worker
-                and worker._initialized
-                and worker.page
-                and not worker.page.is_closed()
-                and str(worker.page.url).startswith("https://gemini.google.com/app")
-            ):
-                ready += 1
-        except Exception:
-            continue
-    return ready
+    # FastAPI and Playwright run on different event-loop threads. Keep /health
+    # thread-safe and cheap by reading only cached pool state. Deep browser
+    # inspection belongs in /v1/diagnostics.
+    if worker_pool._browser_state != "warm":
+        return 0
+    return sum(1 for worker in worker_pool.workers if worker and worker._initialized)
 
 
 def public_request_trace(trace: Dict) -> Dict:
@@ -576,6 +602,7 @@ def public_request_trace(trace: Dict) -> Dict:
 async def health(response: Response):
     ready_workers = ready_worker_count()
     active_request = bool(worker_pool and worker_pool._initialized and worker_pool._active_request)
+    queued_requests = int(getattr(worker_pool, "_queued_requests", 0) or 0) if worker_pool else 0
     browser_state = getattr(worker_pool, "_browser_state", "unavailable") if worker_pool else "unavailable"
     pool_ready = bool(worker_pool and worker_pool._initialized)
     is_ready = pool_ready and (
@@ -590,6 +617,7 @@ async def health(response: Response):
         "workers": 1,
         "ready_workers": ready_workers,
         "active_request": active_request,
+        "queued_requests": queued_requests,
         "browser_state": browser_state,
     }
 

@@ -37,6 +37,11 @@ This is the project's AGENTS.md
   relaunch the headed browser during SSH maintenance on this host. Keep the
   launcher mutex in the Windows `Global\` namespace as a second single-owner
   guard across sessions.
+- Public transport uses two tunnels to the same local API: Cloudflare Quick
+  Tunnel is the preferred data plane and the fixed ngrok domain is the control
+  plane plus emergency fallback. `GET /v1/endpoint` on ngrok publishes the
+  current `trycloudflare.com` URL. Quick Tunnel URLs are runtime state and must
+  never be hardcoded into callers or committed.
 - `ops/windows/install_autostart.ps1` may use a transient interactive bootstrap
   task when invoked from SSH. It must be deleted immediately; persistent
   autostart remains only the Explorer Startup shortcut.
