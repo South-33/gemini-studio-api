@@ -28,4 +28,8 @@ This is the project's AGENTS.md
   or other low-resource modes because Gemini can render incompletely.
 - `.browser_session/` and `logs/` are private runtime state and must not be
   committed.
-- The autostart task can fire on SSH logons too; keep the launcher mutex in the Windows `Global\` namespace so non-desktop sessions cannot replace the production process tree.
+- The autostart task must use the Windows startup trigger with the signed-in
+  user's interactive token. Do not change it back to `AtLogOn`: OpenSSH logons
+  under the same account can otherwise interrupt the headed browser. Keep the
+  launcher mutex in the Windows `Global\` namespace as a second single-owner
+  guard across sessions.
