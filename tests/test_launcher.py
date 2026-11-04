@@ -77,6 +77,18 @@ class LauncherLogTests(unittest.TestCase):
                 "https://new-route.trycloudflare.com",
             )
 
+    def test_quick_tunnel_connection_marker_is_scoped_to_current_launch(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "cloudflared.log"
+            old = "Registered tunnel connection\n"
+            log_path.write_text(old + "new launch pending\n", encoding="utf-8")
+            process = SimpleNamespace(log_path=log_path, log_start_offset=len(old.encode("utf-8")))
+            self.assertFalse(launcher.quick_tunnel_connected(process))
+
+            with log_path.open("a", encoding="utf-8") as stream:
+                stream.write("Registered tunnel connection connIndex=0\n")
+            self.assertTrue(launcher.quick_tunnel_connected(process))
+
     def test_cloudflare_data_plane_can_rotate_during_active_gemini_work(self):
         self.assertTrue(
             launcher.should_restart_data_tunnel(
@@ -88,6 +100,15 @@ class LauncherLogTests(unittest.TestCase):
 
 @unittest.skipUnless(os.name == "nt", "Windows Job Objects are Windows-only")
 class LauncherTests(unittest.TestCase):
+    def test_data_tunnel_can_rotate_independently_of_browser_work(self):
+        self.assertTrue(
+            launcher.should_restart_data_tunnel(
+                process_exited=False,
+                failures=launcher.PUBLIC_HEALTH_FAILURE_LIMIT,
+            )
+        )
+        self.assertTrue(launcher.CLOUDFLARE_STARTUP_GRACE_SECONDS >= 120)
+
     def test_api_monitor_defers_probe_failures_during_busy_grace(self):
         self.assertFalse(
             launcher.should_restart_api(

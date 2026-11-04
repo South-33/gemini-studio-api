@@ -32,6 +32,7 @@ LAUNCHER_MUTEX_NAME = r"Global\GeminiStudioAPILauncher"
 LOCAL_HEALTH_FAILURE_LIMIT = 3
 PUBLIC_HEALTH_FAILURE_LIMIT = 3
 BUSY_HEALTH_GRACE_SECONDS = 15 * 60
+CLOUDFLARE_STARTUP_GRACE_SECONDS = 3 * 60
 
 
 def log(message: str) -> None:
@@ -224,14 +225,25 @@ def quick_tunnel_url(process: ManagedProcess) -> str | None:
         return None
 
 
+def quick_tunnel_connected(process: ManagedProcess) -> bool:
+    """Return whether this launch has registered its Cloudflare connection."""
+    try:
+        with process.log_path.open("r", encoding="utf-8", errors="ignore") as stream:
+            stream.seek(process.log_start_offset)
+            return "Registered tunnel connection" in stream.read()
+    except OSError:
+        return False
+
+
 def wait_for_quick_tunnel_url(process: ManagedProcess, seconds: int = 30) -> str | None:
     deadline = time.monotonic() + seconds
+    latest_url = None
     while time.monotonic() < deadline:
         if process.process.poll() is not None:
             return None
-        url = quick_tunnel_url(process)
-        if url:
-            return url
+        latest_url = quick_tunnel_url(process) or latest_url
+        if latest_url and quick_tunnel_connected(process):
+            return latest_url
         time.sleep(0.5)
     return None
 
@@ -262,11 +274,7 @@ def start_cloudflare_tunnel(cloudflared: str | None) -> tuple[ManagedProcess | N
     )
     url = wait_for_quick_tunnel_url(process, 30)
     if not url:
-        log("Cloudflare quick tunnel did not publish a URL; falling back to ngrok")
-        process.stop()
-        return None, None
-    if not wait_until_healthy(process, f"{url}/health", 30):
-        log(f"Cloudflare quick tunnel failed health check: {url}")
+        log("Cloudflare quick tunnel did not register; falling back to ngrok")
         process.stop()
         return None, None
     return process, url
@@ -400,8 +408,10 @@ def run() -> int:
         # Cloudflare carries normal API traffic. Its Quick Tunnel hostname can
         # change on every launch, so publish the current URL through ngrok.
         cloudflare, cloudflare_url = start_cloudflare_tunnel(cloudflared_path)
+        cloudflare_grace_until = 0.0
         if cloudflare_url:
             write_endpoint_state(cloudflare_url, "cloudflare-quick")
+            cloudflare_grace_until = time.monotonic() + CLOUDFLARE_STARTUP_GRACE_SECONDS
 
         log(f"Ready: http://localhost:{PORT}")
         log(f"Control plane: {CONTROL_ROOT}")
@@ -432,7 +442,8 @@ def run() -> int:
                 local_health_failures = 0
 
             cloudflare_exited = bool(cloudflare and cloudflare.process.poll() is not None)
-            if cloudflare and cloudflare_url:
+            cloudflare_in_startup_grace = time.monotonic() < cloudflare_grace_until
+            if cloudflare and cloudflare_url and not cloudflare_in_startup_grace:
                 data_ok = healthy(f"{cloudflare_url}/health")
                 cloudflare_health_failures = 0 if data_ok else cloudflare_health_failures + 1
             elif cloudflare_exited:
@@ -452,14 +463,17 @@ def run() -> int:
                 cloudflare, cloudflare_url = start_cloudflare_tunnel(cloudflared_path)
                 if cloudflare_url:
                     write_endpoint_state(cloudflare_url, "cloudflare-quick")
+                    cloudflare_grace_until = time.monotonic() + CLOUDFLARE_STARTUP_GRACE_SECONDS
                     log(f"Data plane rotated: {cloudflare_url}")
                 else:
                     write_endpoint_state(CONTROL_ROOT, "ngrok-fallback")
+                    cloudflare_grace_until = 0.0
                 cloudflare_health_failures = 0
             elif not cloudflare and cloudflared_path:
                 cloudflare, cloudflare_url = start_cloudflare_tunnel(cloudflared_path)
                 if cloudflare_url:
                     write_endpoint_state(cloudflare_url, "cloudflare-quick")
+                    cloudflare_grace_until = time.monotonic() + CLOUDFLARE_STARTUP_GRACE_SECONDS
                     log(f"Data plane restored: {cloudflare_url}")
 
             ngrok_exited = ngrok.process.poll() is not None
