@@ -36,21 +36,22 @@ Start-Sleep -Milliseconds 750
 # Gemini uses headed Chromium, so this task must run with the signed-in user's
 # interactive token. Trigger from machine startup instead of user logon: an
 # AtLogOn trigger also fires for OpenSSH logons under the same account and can
-# tear down an in-flight headed browser. StartWhenAvailable lets Task Scheduler
-# wait until the interactive user token exists after boot.
+# tear down an in-flight headed browser. Delay boot execution long enough for
+# auto-login to create the interactive token, and do not enable StartWhenAvailable:
+# replaying a missed boot trigger can relaunch the task later and kill live work.
 $action = New-ScheduledTaskAction `
     -Execute $python `
     -Argument "-u `"$launcher`"" `
     -WorkingDirectory $repoRoot
 
 $trigger = New-ScheduledTaskTrigger -AtStartup
+$trigger.Delay = 'PT45S'
 $principal = New-ScheduledTaskPrincipal `
     -UserId $currentUser `
     -LogonType Interactive `
     -RunLevel Limited
 
 $settings = New-ScheduledTaskSettingsSet `
-    -StartWhenAvailable `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
     -ExecutionTimeLimit ([TimeSpan]::Zero) `
@@ -81,7 +82,7 @@ Write-Host "State: $($task.State)"
 Write-Host "Last result: $($info.LastTaskResult)"
 Write-Host "Launcher: $launcher"
 Write-Host ''
-Write-Host 'This task becomes due at Windows startup and starts when the interactive user token is available.'
+Write-Host 'This task starts 45 seconds after Windows startup, after auto-login creates the interactive user token.'
 $winlogon = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
 if ($winlogon.AutoAdminLogon -ne '1') {
     Write-Warning 'Windows auto-login is disabled. After a full reboot, sign in to this account before the API can start.'
