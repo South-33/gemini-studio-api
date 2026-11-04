@@ -15,9 +15,10 @@ import uuid
 import math
 from collections import deque
 from datetime import datetime, timezone
-from typing import Optional, Dict
+from typing import Optional, Dict, Any
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 
 # --- Timestamped Logging (use stderr - always unbuffered) ---
@@ -31,10 +32,9 @@ from gemini_models import MODEL_FAMILIES, normalize_model, normalize_thinking_le
 from worker_pool import WorkerPool
 
 # Configuration
-BROWSER_TIMEOUT = 480
-API_TIMEOUT_HEADROOM = 30
-QUEUE_TIMEOUT = 1800
+PUBLIC_API_TIMEOUT_SECONDS = 290
 RECENT_REQUEST_LIMIT = 200
+ASYNC_JOB_LIMIT = 200
 IMAGE_TOKEN_ESTIMATE = 300
 
 # Global State
@@ -42,6 +42,7 @@ worker_pool: Optional[WorkerPool] = None
 browser_loop: Optional[asyncio.AbstractEventLoop] = None
 browser_thread: Optional[threading.Thread] = None
 recent_requests = deque(maxlen=max(20, RECENT_REQUEST_LIMIT))
+async_jobs: Dict[str, Dict[str, Any]] = {}
 
 def run_browser_loop(loop):
     asyncio.set_event_loop(loop)
@@ -131,6 +132,128 @@ def estimate_text_tokens(text: str) -> int:
     by_chars = max(1, math.ceil(chars / 4))
     by_words = max(1, math.ceil(words * 1.3))
     return max(by_chars, by_words)
+
+
+def build_completion_payload(
+    *,
+    trace_id: str,
+    model: str,
+    content: str,
+    prompt_tokens_est: int,
+) -> Dict[str, Any]:
+    completion_tokens_est = estimate_text_tokens(content)
+    return {
+        "id": f"chatcmpl-{int(time.time())}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "request_id": trace_id,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": content},
+            "finish_reason": "stop",
+        }],
+        "usage": {
+            "prompt_tokens": prompt_tokens_est,
+            "completion_tokens": completion_tokens_est,
+            "total_tokens": prompt_tokens_est + completion_tokens_est,
+            "completion_chars": len(content),
+            "token_estimate": True,
+        },
+    }
+
+
+def remember_async_job(job: Dict[str, Any]) -> None:
+    """Keep a bounded in-memory result cache for long-running browser jobs."""
+    request_id = str(job["request_id"])
+    async_jobs[request_id] = job
+    while len(async_jobs) > ASYNC_JOB_LIMIT:
+        oldest = next(iter(async_jobs))
+        if oldest == request_id and len(async_jobs) == 1:
+            break
+        async_jobs.pop(oldest, None)
+
+
+def async_job_response(job: Dict[str, Any]) -> JSONResponse:
+    status = str(job.get("status") or "started")
+    if status == "ok" and isinstance(job.get("response"), dict):
+        return JSONResponse(status_code=200, content=job["response"])
+    if status in {"failed", "error", "timeout"}:
+        return JSONResponse(status_code=200, content={
+            "request_id": job["request_id"],
+            "status": status,
+            "error": str(job.get("error") or "Gemini request failed"),
+        })
+    return JSONResponse(status_code=202, content={
+        "request_id": job["request_id"],
+        "status": status,
+    })
+
+
+async def finish_async_job(
+    *,
+    job: Dict[str, Any],
+    trace: Dict[str, Any],
+    future,
+    api_timeout: float,
+    cleanup_image_paths,
+    model: str,
+    prompt_tokens_est: int,
+) -> None:
+    """Finish a browser request after the submit HTTP request has returned."""
+    try:
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, lambda: future.result(timeout=api_timeout))
+    except TimeoutError:
+        try:
+            future.cancel()
+        except Exception:
+            pass
+        job["status"] = "timeout"
+        job["error"] = f"Browser operation timed out after {api_timeout}s"
+        trace["status"] = "timeout"
+        trace["finished_at"] = datetime.now(timezone.utc).isoformat()
+        log(f"[{job['request_id']}] Async browser timeout after {api_timeout}s", "API")
+        return
+    except Exception as exc:
+        job["status"] = "error"
+        job["error"] = str(exc)
+        trace["status"] = "error"
+        trace["error"] = str(exc)
+        trace["finished_at"] = datetime.now(timezone.utc).isoformat()
+        log(f"[{job['request_id']}] Async browser error: {exc}", "API")
+        return
+    finally:
+        cleanup_image_paths()
+
+    trace["queue_wait_ms"] = result.get("queue_wait_ms")
+    trace["attempts"] = result.get("attempts")
+    trace["effective_thinking_level"] = result.get("effective_thinking_level")
+    trace["request_logs"] = result.get("request_logs") or []
+    trace["finished_at"] = datetime.now(timezone.utc).isoformat()
+
+    if not result.get("success"):
+        error = str(result.get("error") or "Gemini request failed")
+        job["status"] = "failed"
+        job["error"] = error
+        trace["status"] = "failed"
+        trace["error"] = error
+        log(f"[{job['request_id']}] Async request failed: {error}", "API")
+        return
+
+    content = str(result.get("response") or "")
+    response = build_completion_payload(
+        trace_id=str(job["request_id"]),
+        model=model,
+        content=content,
+        prompt_tokens_est=prompt_tokens_est,
+    )
+    job["status"] = "ok"
+    job["response"] = response
+    trace["status"] = "ok"
+    trace["response_chars"] = len(content)
+    trace["response_tokens_est"] = estimate_text_tokens(content)
+    log(f"[{job['request_id']}] Async request complete chars={len(content)}", "API")
 
 
 # --- Endpoints ---
@@ -304,12 +427,11 @@ async def openai_chat(request: Request):
     )
     future = asyncio.run_coroutine_threadsafe(coro, browser_loop)
     
-    retry_budget = 2
-    api_timeout = QUEUE_TIMEOUT + (BROWSER_TIMEOUT * retry_budget) + API_TIMEOUT_HEADROOM
+    api_timeout = PUBLIC_API_TIMEOUT_SECONDS
     
     try:
         log(
-            f"Waiting for queue/browser (queue_timeout={QUEUE_TIMEOUT}s, worker_timeout={BROWSER_TIMEOUT}s, retries={retry_budget}, api_timeout={api_timeout}s)...",
+            f"Waiting for queued browser request (api_timeout={api_timeout}s)...",
             "API"
         )
         result = await asyncio.get_event_loop().run_in_executor(
@@ -325,7 +447,10 @@ async def openai_chat(request: Request):
         trace["status"] = "timeout"
         trace["finished_at"] = datetime.now(timezone.utc).isoformat()
         log(f"BROWSER TIMEOUT after {api_timeout}s - request stuck in browser thread", "API")
-        raise HTTPException(status_code=504, detail=f"Browser operation timed out after {api_timeout}s")
+        raise HTTPException(
+            status_code=504,
+            detail=f"Gemini request failed: API request timed out after {api_timeout}s",
+        )
     except Exception as e:
         trace["status"] = "error"
         trace["error"] = str(e)

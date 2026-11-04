@@ -65,6 +65,9 @@ class ApiStatusTests(unittest.TestCase):
             "prompt_chars": 1234,
         })
 
+    def test_public_api_timeout_finishes_before_tunnel_ceiling(self):
+        self.assertLess(main.PUBLIC_API_TIMEOUT_SECONDS, 300)
+
 
 class HealthEndpointTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
