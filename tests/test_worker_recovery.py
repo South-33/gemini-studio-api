@@ -176,6 +176,20 @@ class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(thinking, "Low")
         self.assertEqual(worker._get_current_ui_model_and_thinking.await_count, 3)
 
+    async def test_configuration_accepts_verified_model_after_transient_picker_miss(self):
+        worker = GeminiWebAutomation(worker_id=1)
+        worker._get_current_ui_model_and_thinking = AsyncMock(side_effect=[
+            (None, None),
+            ("flash", "High"),
+        ])
+        worker._select_model = AsyncMock(return_value=False)
+
+        ok, model_family_changed = await worker.ensure_configuration("flash", "High")
+
+        self.assertTrue(ok)
+        self.assertFalse(model_family_changed)
+        worker._select_model.assert_awaited_once_with("flash")
+
     def test_copy_selector_can_be_used_before_a_copy_button_exists(self):
         worker = GeminiWebAutomation(worker_id=1)
 

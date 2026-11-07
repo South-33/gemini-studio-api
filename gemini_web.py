@@ -1185,8 +1185,16 @@ class GeminiWebAutomation:
             if selected:
                 ui_model, ui_thinking = await self._wait_for_ui_configuration(model=model)
             else:
-                ui_model, ui_thinking = await self._get_current_ui_model_and_thinking()
-            if not selected or not ui_model or not self._matches_model(ui_model, model):
+                # A freshly recreated Gemini tab can expose the active model
+                # label a moment after the picker itself becomes clickable.
+                # If the requested family is then observable, selection was
+                # unnecessary; verify the state instead of failing on the
+                # transient picker miss.
+                ui_model, ui_thinking = await self._wait_for_ui_configuration(
+                    model=model,
+                    timeout_seconds=2.0,
+                )
+            if not ui_model or not self._matches_model(ui_model, model):
                 self._track_error(
                     f"Requested model {model!r} but Gemini UI is {ui_model or 'unknown'!r}",
                     "model_btn",
