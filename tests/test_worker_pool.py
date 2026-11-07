@@ -264,7 +264,33 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["attempts"], 2)
         self.assertEqual(result["effective_thinking_level"], "High")
         self.assertEqual(worker.calls, 2)
-        self.assertEqual(worker.thinking_levels, ["Medium", "High"])
+
+    async def test_failed_retry_recreation_still_runs_final_ready_reset(self):
+        pool = WorkerPool()
+        worker = FakeWorker([
+            {"success": False, "error": "Gemini fallback attempt timed out after 60s"},
+        ])
+        pool.workers = [worker]
+        pool._initialized = True
+        pool._recreate_worker = AsyncMock(return_value=False)
+        pool._ensure_ready_after_request = AsyncMock(return_value=True)
+
+        result = await pool.send_message(
+            "hello",
+            model="flash",
+            thinking_level="Medium",
+            fallback_thinking_level="High",
+            request_id="fallback-timeout-cleanup",
+        )
+
+        self.assertFalse(result["success"])
+        pool._recreate_worker.assert_awaited_once()
+        pool._ensure_ready_after_request.assert_awaited_once_with(
+            "request fallback-timeout-cleanup failed"
+        )
+        self.assertEqual(result["attempts"], 1)
+        self.assertEqual(result["effective_thinking_level"], "Medium")
+        self.assertEqual(worker.thinking_levels, ["Medium"])
 
     async def test_request_log_disk_failure_does_not_fail_completion(self):
         self.request_logger.side_effect = OSError("disk unavailable")

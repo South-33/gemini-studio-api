@@ -535,7 +535,10 @@ class WorkerPool:
                             log(f"[{request_id}] Request logging failed ({type(exc).__name__}); request handling continues", "Worker")
                         if ready_for_retry:
                             continue
-                        ready_after_failure = ready_for_retry
+                        # A failed retry recreation is not a clean final state.
+                        # Fall through to the canonical ready reset below so it
+                        # can recreate once more or mark the pool unavailable.
+                        ready_after_failure = None
 
                     if ready_after_failure is None:
                         ready_after_failure = await self._ensure_ready_after_request(f"request {request_id} failed")
