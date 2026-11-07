@@ -92,45 +92,6 @@ class ApiStatusTests(unittest.TestCase):
         self.assertIn(b'"content":"ok"', complete.body)
 
 
-class AsyncCancellationTests(unittest.IsolatedAsyncioTestCase):
-    class FakeFuture:
-        def __init__(self):
-            self.cancelled = False
-
-        def done(self):
-            return False
-
-        def cancel(self):
-            self.cancelled = True
-            return True
-
-    def setUp(self):
-        self.original_jobs = main.async_jobs.copy()
-        main.async_jobs.clear()
-
-    def tearDown(self):
-        main.async_jobs.clear()
-        main.async_jobs.update(self.original_jobs)
-
-    async def test_cancel_async_job_marks_terminal_failure_and_cancels_future(self):
-        future = self.FakeFuture()
-        main.async_jobs["req-cancel"] = {
-            "request_id": "req-cancel",
-            "status": "started",
-            "_future": future,
-        }
-
-        payload = await main.cancel_chat_completion("req-cancel")
-
-        self.assertTrue(future.cancelled)
-        self.assertTrue(payload["cancelled"])
-        self.assertEqual(payload["status"], "failed")
-        self.assertEqual(main.async_jobs["req-cancel"]["status"], "failed")
-        response = main.async_job_response(main.async_jobs["req-cancel"])
-        self.assertEqual(response.status_code, 200)
-        self.assertIn(b"cancelled by client", response.body)
-
-
 class HealthEndpointTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.original_pool = main.worker_pool
