@@ -475,6 +475,7 @@ async def openai_chat(request: Request):
             "request_id": trace_id,
             "status": "started",
             "started_at": trace["started_at"],
+            "_future": future,
         }
         remember_async_job(job)
         task = asyncio.create_task(finish_async_job(
@@ -576,6 +577,31 @@ async def get_chat_completion(request_id: str):
     if job is None:
         raise HTTPException(status_code=404, detail="Unknown async request_id")
     return async_job_response(job)
+
+
+@app.delete("/v1/chat/completions/{request_id}")
+async def cancel_chat_completion(request_id: str):
+    """Cancel a queued/in-flight async job and expose a normal terminal failure."""
+    job = async_jobs.get(request_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Unknown async request_id")
+
+    status = str(job.get("status") or "started")
+    if status in {"ok", "failed", "error", "timeout"}:
+        return {"request_id": request_id, "status": status, "cancelled": False}
+
+    future = job.get("_future")
+    cancelled = False
+    if future is not None and not future.done():
+        cancelled = bool(future.cancel())
+
+    job["status"] = "failed"
+    job["error"] = "Async request cancelled by client"
+    task = job.get("_task")
+    if task is not None and not task.done():
+        task.cancel()
+    log(f"[{request_id}] Async request cancelled", "API")
+    return {"request_id": request_id, "status": "failed", "cancelled": cancelled}
 
 def ready_worker_count() -> int:
     if not worker_pool or not worker_pool._initialized:
