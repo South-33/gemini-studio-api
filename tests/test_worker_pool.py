@@ -102,17 +102,37 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(worker.prepare_calls, 1)
         self.assertTrue(pool._last_ready_reset["ok"])
 
-    async def test_transport_failure_is_not_resent_inside_pool(self):
+    async def test_stalled_generation_is_retried_on_fresh_tab(self):
         pool = WorkerPool()
         worker = FakeWorker([
-            {"success": False, "error": "stalled generation"},
+            {"success": False, "error": "Stalled generation: no output for 150s"},
             {"success": True, "response": "recovered"},
         ])
         pool.workers = [worker]
         pool._initialized = True
         pool._recreate_worker = AsyncMock(return_value=True)
+        pool._prepare_request_configuration = AsyncMock(return_value=(True, None))
 
-        result = await pool.send_message("hello", request_id="retry")
+        result = await pool.send_message("hello", request_id="stall-retry")
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["response"], "recovered")
+        self.assertEqual(result["attempts"], 2)
+        self.assertEqual(worker.calls, 2)
+        pool._recreate_worker.assert_awaited_once()
+        self.assertTrue(self.request_logger.call_args_list[0].kwargs["will_retry"])
+
+    async def test_arbitrary_transport_failure_is_not_resent_inside_pool(self):
+        pool = WorkerPool()
+        worker = FakeWorker([
+            {"success": False, "error": "fetch failed"},
+            {"success": True, "response": "unexpected retry"},
+        ])
+        pool.workers = [worker]
+        pool._initialized = True
+        pool._recreate_worker = AsyncMock(return_value=True)
+
+        result = await pool.send_message("hello", request_id="transport-failure")
 
         self.assertFalse(result["success"])
         self.assertEqual(worker.calls, 1)

@@ -313,6 +313,8 @@ class WorkerPool:
         error = " ".join(str(result.get("error") or "").strip().lower().split())
         if error.startswith("gemini fallback attempt timed out after "):
             return True
+        if error == "stalled generation" or error.startswith("stalled generation:"):
+            return True
         return error in {
             "gemini generation ended without a response",
             "gemini entered a non-copyable terminal response state",
