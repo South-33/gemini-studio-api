@@ -3,7 +3,11 @@ import time
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from worker_pool import WorkerPool
+from worker_pool import (
+    FALLBACK_PRIMARY_ATTEMPT_TIMEOUT_SECONDS,
+    REQUEST_TOTAL_BUDGET_SECONDS,
+    WorkerPool,
+)
 
 
 class FakeWorker:
@@ -271,6 +275,10 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(self.request_logger.call_args_list[0].kwargs["thinking_level"], "Medium")
         self.assertEqual(self.request_logger.call_args_list[1].kwargs["thinking_level"], "High")
+
+    def test_medium_fallback_window_allows_normal_translation_latency(self):
+        self.assertGreaterEqual(FALLBACK_PRIMARY_ATTEMPT_TIMEOUT_SECONDS, 90)
+        self.assertLess(FALLBACK_PRIMARY_ATTEMPT_TIMEOUT_SECONDS, REQUEST_TOTAL_BUDGET_SECONDS)
 
     async def test_fallback_request_stops_after_primary_and_one_fallback_attempt(self):
         pool = WorkerPool()
