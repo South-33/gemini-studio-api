@@ -14,7 +14,6 @@ from gemini_web import GeminiWebAutomation, log
 from request_log import write_request_log
 
 FALLBACK_PRIMARY_ATTEMPT_TIMEOUT_SECONDS = 60
-FALLBACK_SECONDARY_ATTEMPT_TIMEOUT_SECONDS = 210
 
 
 class WorkerPool:
@@ -388,12 +387,13 @@ class WorkerPool:
                             images,
                             request_id=request_id,
                         )
-                        if fallback_thinking_level:
-                            attempt_timeout = (
-                                FALLBACK_PRIMARY_ATTEMPT_TIMEOUT_SECONDS
-                                if attempt == 1
-                                else FALLBACK_SECONDARY_ATTEMPT_TIMEOUT_SECONDS
-                            )
+                        if fallback_thinking_level and attempt == 1:
+                            # Medium is the cheap trial. Bound it tightly, then
+                            # let the High fallback use GeminiWebAutomation's
+                            # own 480s browser timeout. A second, shorter pool
+                            # timeout used to discard healthy High generations
+                            # that were still actively thinking after 210s.
+                            attempt_timeout = FALLBACK_PRIMARY_ATTEMPT_TIMEOUT_SECONDS
                             try:
                                 result = await asyncio.wait_for(send_coro, timeout=attempt_timeout)
                             except asyncio.TimeoutError:
