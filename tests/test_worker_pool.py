@@ -138,6 +138,26 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pool._prepare_request_configuration.await_count, 2)
         self.assertTrue(self.request_logger.call_args_list[0].kwargs["will_retry"])
 
+    async def test_dirty_preflight_is_retried_on_a_fresh_chat(self):
+        pool = WorkerPool()
+        worker = FakeWorker([
+            {"success": False, "error": "Previous generation is still active before send"},
+            {"success": True, "response": "recovered"},
+        ])
+        pool.workers = [worker]
+        pool._initialized = True
+        pool._recreate_worker = AsyncMock(return_value=True)
+        pool._prepare_request_configuration = AsyncMock(return_value=(True, None))
+
+        result = await pool.send_message("hello", request_id="dirty-preflight")
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["response"], "recovered")
+        self.assertEqual(result["attempts"], 2)
+        pool._recreate_worker.assert_awaited_once()
+        self.assertEqual(pool._prepare_request_configuration.await_count, 2)
+        self.assertTrue(self.request_logger.call_args_list[0].kwargs["will_retry"])
+
     async def test_unrecoverable_ready_reset_marks_pool_unavailable(self):
         pool = WorkerPool()
         worker = FakeWorker(prepare_ok=False)

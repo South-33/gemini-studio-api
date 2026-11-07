@@ -311,6 +311,7 @@ class WorkerPool:
         return error in {
             "gemini generation ended without a response",
             "gemini entered a non-copyable terminal response state",
+            "previous generation is still active before send",
         }
 
     async def send_message(
