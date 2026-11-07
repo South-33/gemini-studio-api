@@ -10,10 +10,10 @@ worker.
 - Thinking: `Low`, `Medium`, `High`; default `Medium`
 - Only these model and thinking values are accepted
 - `fallback_thinking_level` is optional. After the bounded native Retry path,
-  a still-failing request can retry once on a fresh chat at that thinking level
-  while keeping the same model family. Fallback requests are bounded to two
-  browser attempts: up to 60 seconds on the primary level and up to 210 seconds
-  on the fallback level.
+  a still-failing request can retry on fresh chats at that thinking level while
+  keeping the same model family. Fallback requests use at most three browser
+  attempts inside one 480-second logical-request budget: the primary level gets
+  up to 120 seconds, and any remaining transient retries use the fallback level.
 - `POST /v1/chat/completions` accepts OpenAI-style `messages`
 - `POST /v1/chat/completions` with `async: true` returns HTTP 202 and a
   `request_id`; poll `GET /v1/chat/completions/{request_id}` until completion
@@ -66,8 +66,9 @@ fallback use at most three browser attempts for Gemini's recognized transient
 refusal or empty-terminal generation states. A recognized Gemini refusal first
 uses Gemini's own retry/regenerate control when the current UI exposes one;
 otherwise recovery recreates the managed chat tab. Requests with
-`fallback_thinking_level` use one primary attempt and one fallback attempt.
-Browser or unrelated transport failures are not silently resent.
+`fallback_thinking_level` use one primary attempt and up to two fallback
+attempts, still bounded by the same 480-second logical-request budget. Browser
+or unrelated transport failures are not silently resent.
 
 ## Install and production startup
 

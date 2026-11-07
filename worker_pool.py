@@ -371,7 +371,12 @@ class WorkerPool:
                 last_error = "unknown"
                 attempt = 0
                 native_retry_used = False
-                max_attempts = 2 if fallback_thinking_level else 3
+                # Keep one logical request inside the same 480s budget. A
+                # Medium request may promote its remaining transient retries
+                # to High; if the first High attempt fails quickly, one more
+                # fresh-tab High attempt can still recover without asking the
+                # caller to resubmit the logical request.
+                max_attempts = 3
                 request_deadline = time.monotonic() + REQUEST_TOTAL_BUDGET_SECONDS
                 for attempt in range(1, max_attempts + 1):
                     remaining_budget = request_deadline - time.monotonic()

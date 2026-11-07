@@ -280,7 +280,7 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(FALLBACK_PRIMARY_ATTEMPT_TIMEOUT_SECONDS, 90)
         self.assertLess(FALLBACK_PRIMARY_ATTEMPT_TIMEOUT_SECONDS, REQUEST_TOTAL_BUDGET_SECONDS)
 
-    async def test_fallback_request_stops_after_primary_and_one_fallback_attempt(self):
+    async def test_fallback_request_can_use_second_high_retry(self):
         pool = WorkerPool()
         worker = FakeWorker([
             {
@@ -291,7 +291,7 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
                 "success": True,
                 "response": "I encountered an error doing what you asked. Could you try again?",
             },
-            {"success": True, "response": "unexpected-third-attempt"},
+            {"success": True, "response": "recovered on second high"},
         ])
         pool.workers = [worker]
         pool._initialized = True
@@ -306,10 +306,43 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
             request_id="bounded-fallback",
         )
 
-        self.assertFalse(result["success"])
-        self.assertEqual(result["attempts"], 2)
+        self.assertTrue(result["success"])
+        self.assertEqual(result["response"], "recovered on second high")
+        self.assertEqual(result["attempts"], 3)
         self.assertEqual(result["effective_thinking_level"], "High")
-        self.assertEqual(worker.calls, 2)
+        self.assertEqual(worker.calls, 3)
+        self.assertEqual(worker.thinking_levels, ["Medium", "High", "High"])
+
+    async def test_fallback_request_stops_after_three_browser_attempts(self):
+        pool = WorkerPool()
+        refusal = {
+            "success": True,
+            "response": "Sorry, something went wrong. Please try your request again.",
+        }
+        worker = FakeWorker([
+            refusal,
+            refusal,
+            refusal,
+            {"success": True, "response": "unexpected-fourth-attempt"},
+        ])
+        pool.workers = [worker]
+        pool._initialized = True
+        pool._recreate_worker = AsyncMock(return_value=True)
+        pool._prepare_request_configuration = AsyncMock(return_value=(True, None))
+
+        result = await pool.send_message(
+            "hello",
+            model="flash",
+            thinking_level="Medium",
+            fallback_thinking_level="High",
+            request_id="bounded-fallback-limit",
+        )
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["attempts"], 3)
+        self.assertEqual(result["effective_thinking_level"], "High")
+        self.assertEqual(worker.calls, 3)
+        self.assertEqual(worker.thinking_levels, ["Medium", "High", "High"])
 
     async def test_failed_retry_recreation_still_runs_final_ready_reset(self):
         pool = WorkerPool()
