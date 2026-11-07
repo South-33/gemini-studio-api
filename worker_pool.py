@@ -13,11 +13,11 @@ from playwright.async_api import Page, async_playwright
 from gemini_web import GeminiWebAutomation, log
 from request_log import write_request_log
 
-# Medium translation/repair requests regularly need a little over one minute
-# even when they complete cleanly. Give the cheap attempt enough time to
-# finish before promoting to High, while preserving a bounded 480s total
-# logical-request budget for the fallback.
-FALLBACK_PRIMARY_ATTEMPT_TIMEOUT_SECONDS = 120
+# Medium translation/repair requests can legitimately stream for two to three
+# minutes even when they complete cleanly. Give the default Medium attempt
+# enough time to finish before promoting to High, while preserving a bounded
+# 480s total logical-request budget for the fallback.
+FALLBACK_PRIMARY_ATTEMPT_TIMEOUT_SECONDS = 180
 REQUEST_TOTAL_BUDGET_SECONDS = 480
 
 

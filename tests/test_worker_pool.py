@@ -277,7 +277,7 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.request_logger.call_args_list[1].kwargs["thinking_level"], "High")
 
     def test_medium_fallback_window_allows_normal_translation_latency(self):
-        self.assertGreaterEqual(FALLBACK_PRIMARY_ATTEMPT_TIMEOUT_SECONDS, 90)
+        self.assertGreaterEqual(FALLBACK_PRIMARY_ATTEMPT_TIMEOUT_SECONDS, 180)
         self.assertLess(FALLBACK_PRIMARY_ATTEMPT_TIMEOUT_SECONDS, REQUEST_TOTAL_BUDGET_SECONDS)
 
     async def test_fallback_request_can_use_second_high_retry(self):
