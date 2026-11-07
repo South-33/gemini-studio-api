@@ -158,6 +158,24 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pool._prepare_request_configuration.await_count, 2)
         self.assertTrue(self.request_logger.call_args_list[0].kwargs["will_retry"])
 
+    @patch("worker_pool.REQUEST_TOTAL_BUDGET_SECONDS", 0.005)
+    async def test_total_request_budget_prevents_retry_outliving_client(self):
+        pool = WorkerPool()
+        worker = FakeWorker([
+            {"success": False, "error": "Gemini generation ended without a response"},
+            {"success": True, "response": "unexpected retry"},
+        ])
+        pool.workers = [worker]
+        pool._initialized = True
+        pool._recreate_worker = AsyncMock(return_value=True)
+
+        result = await pool.send_message("hello", request_id="budget")
+
+        self.assertFalse(result["success"])
+        self.assertIn("request budget exhausted", result["error"].lower())
+        self.assertEqual(worker.calls, 1)
+        pool._recreate_worker.assert_not_awaited()
+
     async def test_unrecoverable_ready_reset_marks_pool_unavailable(self):
         pool = WorkerPool()
         worker = FakeWorker(prepare_ok=False)

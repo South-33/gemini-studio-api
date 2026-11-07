@@ -14,6 +14,7 @@ from gemini_web import GeminiWebAutomation, log
 from request_log import write_request_log
 
 FALLBACK_PRIMARY_ATTEMPT_TIMEOUT_SECONDS = 60
+REQUEST_TOTAL_BUDGET_SECONDS = 480
 
 
 class WorkerPool:
@@ -367,7 +368,12 @@ class WorkerPool:
                 attempt = 0
                 native_retry_used = False
                 max_attempts = 2 if fallback_thinking_level else 3
+                request_deadline = time.monotonic() + REQUEST_TOTAL_BUDGET_SECONDS
                 for attempt in range(1, max_attempts + 1):
+                    remaining_budget = request_deadline - time.monotonic()
+                    if remaining_budget <= 0:
+                        last_error = f"Gemini request budget exhausted after {REQUEST_TOTAL_BUDGET_SECONDS}s"
+                        break
                     effective_thinking_level = (
                         fallback_thinking_level
                         if attempt > 1 and fallback_thinking_level
@@ -388,7 +394,7 @@ class WorkerPool:
                             images,
                             request_id=request_id,
                         )
-                        if fallback_thinking_level and attempt == 1:
+                        if fallback_thinking_level and attempt == 1 and remaining_budget > FALLBACK_PRIMARY_ATTEMPT_TIMEOUT_SECONDS:
                             # Medium is the cheap trial. Bound it tightly, then
                             # let the High fallback use GeminiWebAutomation's
                             # own 480s browser timeout. A second, shorter pool
@@ -403,7 +409,13 @@ class WorkerPool:
                                     "error": f"Gemini fallback attempt timed out after {attempt_timeout}s",
                                 }
                         else:
-                            result = await send_coro
+                            try:
+                                result = await asyncio.wait_for(send_coro, timeout=remaining_budget)
+                            except asyncio.TimeoutError:
+                                result = {
+                                    "success": False,
+                                    "error": f"Gemini request budget exhausted after {REQUEST_TOTAL_BUDGET_SECONDS}s",
+                                }
                     except Exception as exc:
                         result = {"success": False, "error": str(exc)}
                     attempt_finished_at = datetime.now(timezone.utc).isoformat()
