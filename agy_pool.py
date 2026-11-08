@@ -108,12 +108,17 @@ class AgyPool:
         with self._state_lock:
             self._closed = True
             self._initialized = False
+            self._last_error = "Antigravity CLI pool is closed"
             runner = self.runner
         self._executor.shutdown(wait=False, cancel_futures=True)
         if runner is not None:
             close_runner = getattr(runner, "close", None)
             if callable(close_runner):
                 close_runner()
+
+    def is_ready(self) -> bool:
+        with self._state_lock:
+            return self._initialized and not self._closed
 
     def is_model_available(self, family: str, thinking_level: str) -> bool:
         with self._state_lock:
@@ -293,6 +298,18 @@ class AgyPool:
                             use_search=use_search,
                             timeout_seconds=remaining,
                         )
+                    except AgyCliUnavailableError as refresh_exc:
+                        with self._state_lock:
+                            self._initialized = False
+                            self._last_error = str(refresh_exc)
+                        return {
+                            "success": False,
+                            "backend_unavailable": True,
+                            "error": f"Antigravity CLI backend became unavailable: {refresh_exc}",
+                            "queue_wait_ms": wait_ms,
+                            "attempts": attempt,
+                            "effective_thinking_level": effective_thinking,
+                        }
                     except AgyCliTimeoutError as refresh_exc:
                         self._last_error = str(refresh_exc)
                         return {

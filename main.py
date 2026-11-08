@@ -272,7 +272,7 @@ def gemini_backend_ready() -> bool:
 
 
 def agy_backend_ready() -> bool:
-    return bool(agy_pool and agy_pool._initialized)
+    return bool(agy_pool and agy_pool.is_ready())
 
 
 def select_request_backend(
@@ -424,6 +424,17 @@ async def finish_async_job(
     try:
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(None, lambda: future.result(timeout=api_timeout))
+    except asyncio.CancelledError:
+        try:
+            future.cancel()
+        except Exception:
+            pass
+        job["status"] = "error"
+        job["error"] = f"{backend} request was cancelled"
+        trace["status"] = "cancelled"
+        trace["error"] = job["error"]
+        trace["finished_at"] = datetime.now(timezone.utc).isoformat()
+        raise
     except TimeoutError:
         try:
             future.cancel()
@@ -446,6 +457,16 @@ async def finish_async_job(
     finally:
         cleanup_image_paths()
 
+    if not isinstance(result, dict):
+        error = f"{backend} backend returned an invalid result"
+        job["status"] = "error"
+        job["error"] = error
+        trace["status"] = "error"
+        trace["error"] = error
+        trace["finished_at"] = datetime.now(timezone.utc).isoformat()
+        log(f"[{job['request_id']}] Async {backend} error: {error}", "API")
+        return
+
     trace["queue_wait_ms"] = result.get("queue_wait_ms")
     trace["attempts"] = result.get("attempts")
     trace["effective_thinking_level"] = result.get("effective_thinking_level")
@@ -457,7 +478,7 @@ async def finish_async_job(
     trace["finished_at"] = datetime.now(timezone.utc).isoformat()
 
     if not result.get("success"):
-        error = str(result.get("error") or "Gemini request failed")
+        error = str(result.get("error") or f"{backend} request failed")
         timed_out = bool(result.get("timed_out"))
         job["status"] = "timeout" if timed_out else "failed"
         job["error"] = error
@@ -469,7 +490,15 @@ async def finish_async_job(
         )
         return
 
-    content = str(result.get("response") or "")
+    content = result.get("response")
+    if not isinstance(content, str):
+        error = f"{backend} backend returned a non-text response"
+        job["status"] = "error"
+        job["error"] = error
+        trace["status"] = "error"
+        trace["error"] = error
+        log(f"[{job['request_id']}] Async {backend} error: {error}", "API")
+        return
     response = build_completion_payload(
         trace_id=str(job["request_id"]),
         model=model,
@@ -875,6 +904,15 @@ async def openai_chat(request: Request):
             lambda: future.result(timeout=api_timeout)
         )
         log(f"{backend} backend returned", "API")
+    except asyncio.CancelledError:
+        try:
+            future.cancel()
+        except Exception:
+            pass
+        trace["status"] = "cancelled"
+        trace["error"] = f"{backend} request was cancelled"
+        trace["finished_at"] = datetime.now(timezone.utc).isoformat()
+        raise
     except TimeoutError:
         try:
             future.cancel()
@@ -895,20 +933,34 @@ async def openai_chat(request: Request):
     finally:
         cleanup_image_paths()
 
-    if not result["success"]:
+    if not isinstance(result, dict):
+        error = f"{backend} backend returned an invalid result"
+        trace["status"] = "error"
+        trace["error"] = error
+        trace["finished_at"] = datetime.now(timezone.utc).isoformat()
+        raise HTTPException(status_code=500, detail=error)
+
+    if not result.get("success"):
         timed_out = bool(result.get("timed_out"))
         backend_unavailable = bool(result.get("backend_unavailable"))
+        error = str(result.get("error") or f"{backend} request failed")
         trace["status"] = "timeout" if timed_out else "failed"
-        trace["error"] = result.get("error")
+        trace["error"] = error
         trace["queue_wait_ms"] = result.get("queue_wait_ms")
         trace["attempts"] = result.get("attempts")
         trace["effective_thinking_level"] = result.get("effective_thinking_level")
         trace["request_logs"] = result.get("request_logs") or []
         trace["finished_at"] = datetime.now(timezone.utc).isoformat()
         status_code = 504 if timed_out else (503 if backend_unavailable else 500)
-        raise HTTPException(status_code=status_code, detail=result.get("error"))
+        raise HTTPException(status_code=status_code, detail=error)
 
-    content = result["response"] or ""
+    content = result.get("response")
+    if not isinstance(content, str):
+        error = f"{backend} backend returned a non-text response"
+        trace["status"] = "error"
+        trace["error"] = error
+        trace["finished_at"] = datetime.now(timezone.utc).isoformat()
+        raise HTTPException(status_code=500, detail=error)
     completion_tokens_est = estimate_text_tokens(content)
     trace["status"] = "ok"
     trace["queue_wait_ms"] = result.get("queue_wait_ms")

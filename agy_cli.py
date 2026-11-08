@@ -41,6 +41,14 @@ REQUIRED_CLI_FLAGS = (
     "--log-file",
     "--print-timeout",
 )
+
+AUTH_ERROR_MARKERS = (
+    "authentication required",
+    "not authenticated",
+    "please authenticate",
+)
+
+
 class AgyCliError(RuntimeError):
     """Antigravity CLI could not produce a successful model response."""
 
@@ -76,6 +84,11 @@ class AgyResult:
 
 def _version_key(value: str) -> tuple[int, ...]:
     return tuple(int(part) for part in value.split("."))
+
+
+def _is_authentication_error(detail: str) -> bool:
+    normalized = detail.lower()
+    return any(marker in normalized for marker in AUTH_ERROR_MARKERS)
 
 
 def parse_model_slugs(lines: Iterable[str]) -> Dict[tuple[str, str], str]:
@@ -304,6 +317,8 @@ class AgyCliRunner:
             raise AgyCliError(f"Could not run agy models: {exc}") from exc
         if completed.returncode != 0:
             detail = completed.stderr.strip() or completed.stdout.strip() or "unknown error"
+            if _is_authentication_error(detail):
+                raise AgyCliUnavailableError(detail)
             raise AgyCliError(f"agy models failed: {detail}")
 
         lines = completed.stdout.splitlines()
@@ -503,6 +518,8 @@ class AgyCliRunner:
 
         if result_payload is None:
             detail = completed.stderr.strip() or completed.stdout.strip() or "no result event"
+            if _is_authentication_error(detail):
+                raise AgyCliUnavailableError(detail)
             raise AgyCliError(f"Antigravity CLI returned no result: {detail}")
 
         status = str(result_payload.get("status") or "").upper()
@@ -515,6 +532,8 @@ class AgyCliRunner:
             detail = str(result_payload.get("error") or completed.stderr.strip() or status or "unknown error")
             usage = result_payload.get("usage")
             total_tokens = usage.get("total_tokens") if isinstance(usage, dict) else None
+            if total_tokens == 0 and _is_authentication_error(detail):
+                raise AgyCliUnavailableError(detail)
             if "invalid model selection" in detail.lower() and total_tokens == 0:
                 raise AgyModelSelectionError(detail, model_slug=model_slug)
             raise AgyCliError(f"Antigravity CLI request failed: {detail}")

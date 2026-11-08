@@ -220,12 +220,15 @@ class FakeAgyApiPool:
             "active_request": False,
             "active_requests": 0,
             "queued_requests": 0,
-            "max_concurrency": 3,
-            "max_queue": 9,
+            "max_concurrency": 4,
+            "max_queue": 12,
             "models": [{"family": "flash", "thinking_level": "medium", "model": "gemini-3.8-flash-medium"}],
             "model_ids": ["gemini-3.8-flash-medium", "claude-sonnet-4-6"],
             "last_error": None,
         }
+
+    def is_ready(self):
+        return self._initialized
 
     def submit(self, prompt, **kwargs):
         self.submissions.append((prompt, kwargs))
@@ -837,11 +840,90 @@ class AgyApiTests(unittest.IsolatedAsyncioTestCase):
         finally:
             main.async_jobs.pop(request_id, None)
 
+    async def test_async_malformed_backend_result_finishes_as_error(self):
+        future = Future()
+        future.set_result(None)
+        request = FakeApiRequest({
+            "backend": "agy",
+            "async": True,
+            "model": "flash",
+            "messages": [{"role": "user", "content": "hello"}],
+        })
+
+        with patch.object(main.agy_pool, "submit", return_value=future):
+            response = await main.openai_chat(request)
+        payload = json.loads(response.body)
+        request_id = payload["request_id"]
+        job = main.async_jobs[request_id]
+        try:
+            await job["_task"]
+            self.assertEqual(job["status"], "error")
+            self.assertIn("invalid result", job["error"])
+        finally:
+            main.async_jobs.pop(request_id, None)
+
+    async def test_sync_malformed_backend_result_returns_500(self):
+        future = Future()
+        future.set_result(None)
+        request = FakeApiRequest({
+            "backend": "agy",
+            "model": "flash",
+            "messages": [{"role": "user", "content": "hello"}],
+        })
+
+        with patch.object(main.agy_pool, "submit", return_value=future):
+            with self.assertRaises(main.HTTPException) as raised:
+                await main.openai_chat(request)
+
+        self.assertEqual(raised.exception.status_code, 500)
+        self.assertIn("invalid result", raised.exception.detail)
+
+    async def test_async_task_cancellation_cancels_queued_backend_future(self):
+        future = Future()
+        request = FakeApiRequest({
+            "backend": "agy",
+            "async": True,
+            "model": "flash",
+            "messages": [{"role": "user", "content": "hello"}],
+        })
+
+        with patch.object(main.agy_pool, "submit", return_value=future):
+            response = await main.openai_chat(request)
+        payload = json.loads(response.body)
+        request_id = payload["request_id"]
+        job = main.async_jobs[request_id]
+        try:
+            await asyncio.sleep(0)
+            job["_task"].cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await job["_task"]
+            self.assertTrue(future.cancelled())
+            self.assertEqual(job["status"], "error")
+        finally:
+            main.async_jobs.pop(request_id, None)
+
+    async def test_sync_task_cancellation_cancels_queued_backend_future(self):
+        future = Future()
+        request = FakeApiRequest({
+            "backend": "agy",
+            "model": "flash",
+            "messages": [{"role": "user", "content": "hello"}],
+        })
+
+        with patch.object(main.agy_pool, "submit", return_value=future):
+            task = asyncio.create_task(main.openai_chat(request))
+            await asyncio.sleep(0)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        self.assertTrue(future.cancelled())
+
 
 class FakeStartupAgyPool:
     def __init__(self):
-        self.max_concurrency = 3
-        self.max_queue = 9
+        self.max_concurrency = 4
+        self.max_queue = 12
         self.closed = False
 
     def init(self):

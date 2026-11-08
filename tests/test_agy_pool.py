@@ -329,6 +329,28 @@ class AgyPoolTests(unittest.TestCase):
         self.assertEqual(runner.refresh_count, refreshes_after_init + 1)
         pool.close()
 
+    def test_auth_failure_after_stale_model_refresh_disables_pool(self):
+        runner = FakeRunner([
+            AgyModelSelectionError(
+                "invalid model selection: stale slug",
+                model_slug="gemini-3.8-flash-medium",
+            ),
+            AgyCliUnavailableError("authentication required"),
+        ])
+        pool = AgyPool(runner)
+        pool.init()
+
+        result = pool.submit(
+            "hello",
+            model="flash",
+            thinking_level="Medium",
+        ).result(timeout=1)
+
+        self.assertFalse(result["success"])
+        self.assertTrue(result["backend_unavailable"])
+        self.assertFalse(pool.diagnostics()["available"])
+        pool.close()
+
     def test_concurrent_stale_model_failures_share_one_refresh(self):
         barrier = threading.Barrier(3)
 
