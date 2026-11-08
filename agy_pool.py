@@ -19,15 +19,13 @@ from agy_cli import (
 
 
 AGY_REQUEST_TOTAL_BUDGET_SECONDS = 480
-# Local load testing found little throughput gain at 5 concurrent processes,
-# while latency rose materially and one request regained high agent overhead.
-# Keep 3 as the efficient default; operators can raise it deliberately.
-DEFAULT_AGY_MAX_CONCURRENCY = 3
+# Final isolated-agent load tests show 4 concurrent processes improve throughput
+# over 3 for both normal and search workloads; 5 becomes materially slower.
+DEFAULT_AGY_MAX_CONCURRENCY = 4
 MAX_AGY_MAX_CONCURRENCY = 8
-# Three waiting waves fit the slowest measured mixed/search workload inside the
-# 275s synchronous API budget. A deeper default mostly holds requests that will
-# time out before useful execution; async-heavy deployments can raise it.
-DEFAULT_AGY_MAX_QUEUE = 9
+# Keep three waiting waves behind the four default workers. This absorbs bursts
+# without recreating the deep queues that mostly hold work until it times out.
+DEFAULT_AGY_MAX_QUEUE = 12
 MAX_AGY_MAX_QUEUE = 1000
 
 
@@ -111,11 +109,11 @@ class AgyPool:
             self._closed = True
             self._initialized = False
             runner = self.runner
+        self._executor.shutdown(wait=False, cancel_futures=True)
         if runner is not None:
             close_runner = getattr(runner, "close", None)
             if callable(close_runner):
                 close_runner()
-        self._executor.shutdown(wait=False, cancel_futures=True)
 
     def is_model_available(self, family: str, thinking_level: str) -> bool:
         with self._state_lock:
@@ -175,8 +173,11 @@ class AgyPool:
             self._queued_requests = max(0, self._queued_requests - 1)
 
     @staticmethod
-    def _is_transient_refusal(response: str) -> bool:
+    def _is_transient_refusal(response: str, prompt: str = "") -> bool:
         normalized = " ".join((response or "").strip().lower().split())
+        normalized_prompt = " ".join((prompt or "").strip().lower().split())
+        if normalized and normalized in normalized_prompt:
+            return False
         return (
             normalized.startswith("i'm having a hard time fulfilling your request.")
             and "something else instead?" in normalized
@@ -322,7 +323,7 @@ class AgyPool:
                     }
 
                 last_response = result.response
-                if not self._is_transient_refusal(last_response):
+                if not self._is_transient_refusal(last_response, prompt):
                     self._last_error = None
                     return {
                         "success": True,

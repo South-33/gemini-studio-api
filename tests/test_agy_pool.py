@@ -236,6 +236,24 @@ class AgyPoolTests(unittest.TestCase):
         self.assertEqual(len(runner.calls), 1)
         pool.close()
 
+    def test_requested_transient_phrase_is_returned_without_retry(self):
+        phrase = "Sorry, something went wrong. Please try your request again."
+        runner = FakeRunner([phrase])
+        pool = AgyPool(runner)
+        pool.init()
+        result = pool.submit(
+            f"Reply with exactly: {phrase}",
+            model="flash",
+            thinking_level="Medium",
+            fallback_thinking_level="High",
+        ).result(timeout=1)
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["response"], phrase)
+        self.assertEqual(result["attempts"], 1)
+        self.assertEqual(len(runner.calls), 1)
+        pool.close()
+
     def test_cli_error_is_not_blindly_retried(self):
         runner = FakeRunner([AgyCliError("quota exhausted")])
         pool = AgyPool(runner)

@@ -166,8 +166,9 @@ class AgyCliRunner:
             return
         try:
             if os.name == "nt":
+                taskkill = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "taskkill.exe"
                 subprocess.run(
-                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    [str(taskkill), "/PID", str(process.pid), "/T", "/F"],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     timeout=5,
