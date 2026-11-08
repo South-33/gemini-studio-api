@@ -1,6 +1,8 @@
+import os
 import time
 import threading
 import unittest
+from unittest.mock import patch
 
 from agy_cli import (
     AgyCliError,
@@ -86,12 +88,11 @@ class AgyPoolTests(unittest.TestCase):
         pool.close()
 
     def test_default_concurrency_is_bounded(self):
-        pool = AgyPool(FakeRunner())
-        self.assertGreaterEqual(pool.max_concurrency, 1)
-        self.assertLessEqual(pool.max_concurrency, 8)
-        self.assertGreaterEqual(pool.max_queue, 0)
-        self.assertLessEqual(pool.max_queue, 1000)
-        pool.close()
+        with patch.dict(os.environ, {}, clear=True):
+            pool = AgyPool(FakeRunner())
+            self.assertEqual(pool.max_concurrency, 3)
+            self.assertEqual(pool.max_queue, 9)
+            pool.close()
 
     def test_full_queue_rejects_without_spawning_more_work(self):
         runner = FakeRunner(["one"])

@@ -19,13 +19,15 @@ from agy_cli import (
 
 
 AGY_REQUEST_TOTAL_BUDGET_SECONDS = 480
-# Final isolated-agent load tests show 4 concurrent processes improve throughput
-# over 3 for both normal and search workloads; 5 becomes materially slower.
-DEFAULT_AGY_MAX_CONCURRENCY = 4
+# Repeated clean load tests across 1-5 processes put 3 at the best stable
+# throughput/latency point. Four was slower in both benchmark orders and five
+# degraded further; operators can still raise the limit deliberately.
+DEFAULT_AGY_MAX_CONCURRENCY = 3
 MAX_AGY_MAX_CONCURRENCY = 8
-# Keep three waiting waves behind the four default workers. This absorbs bursts
-# without recreating the deep queues that mostly hold work until it times out.
-DEFAULT_AGY_MAX_QUEUE = 12
+# Three waiting waves absorb bursts while keeping the slowest observed search
+# workload inside the 275s synchronous budget. Async-heavy deployments can
+# raise this deliberately.
+DEFAULT_AGY_MAX_QUEUE = 9
 MAX_AGY_MAX_QUEUE = 1000
 
 
