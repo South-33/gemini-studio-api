@@ -220,8 +220,8 @@ class FakeAgyApiPool:
             "active_request": False,
             "active_requests": 0,
             "queued_requests": 0,
-            "max_concurrency": 4,
-            "max_queue": 12,
+            "max_concurrency": 3,
+            "max_queue": 9,
             "models": [{"family": "flash", "thinking_level": "medium", "model": "gemini-3.8-flash-medium"}],
             "model_ids": ["gemini-3.8-flash-medium", "claude-sonnet-4-6"],
             "last_error": None,
@@ -922,8 +922,8 @@ class AgyApiTests(unittest.IsolatedAsyncioTestCase):
 
 class FakeStartupAgyPool:
     def __init__(self):
-        self.max_concurrency = 4
-        self.max_queue = 12
+        self.max_concurrency = 3
+        self.max_queue = 9
         self.closed = False
 
     def init(self):
