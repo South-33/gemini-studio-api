@@ -31,6 +31,7 @@ def log(msg: str, tag: str = "Server"):
     print(f"[{ts}] [{tag}] {msg}", file=sys.stderr, flush=True)
 
 from gemini_models import MODEL_FAMILIES, normalize_model, normalize_thinking_level
+from agy_pool import AgyPool, AgyQueueFullError, AGY_REQUEST_TOTAL_BUDGET_SECONDS
 from worker_pool import WorkerPool
 
 # Configuration
@@ -45,6 +46,7 @@ CONTROL_PLANE_URL = "https://believable-unplagiarised-josette.ngrok-free.dev"
 
 # Global State
 worker_pool: Optional[WorkerPool] = None
+agy_pool: Optional[AgyPool] = None
 browser_loop: Optional[asyncio.AbstractEventLoop] = None
 browser_thread: Optional[threading.Thread] = None
 recent_requests = deque(maxlen=max(20, RECENT_REQUEST_LIMIT))
@@ -63,22 +65,82 @@ async def init_browser_thread():
     worker_pool = WorkerPool()
     # Empty cookies - we use persistent browser session instead
     future = asyncio.run_coroutine_threadsafe(worker_pool.init(), browser_loop)
-    return future.result(timeout=120)
+    try:
+        return await asyncio.wait_for(asyncio.wrap_future(future), timeout=120)
+    except asyncio.TimeoutError:
+        future.cancel()
+        return False
+    except asyncio.CancelledError:
+        future.cancel()
+        raise
+
+
+def stop_browser_runtime() -> None:
+    if browser_loop and browser_loop.is_running():
+        browser_loop.call_soon_threadsafe(browser_loop.stop)
+    if browser_thread:
+        browser_thread.join(timeout=5)
+
+
+async def initialize_gemini_backend() -> bool:
+    """Initialize Gemini Web without making a healthy Agy backend wait on it."""
+
+    try:
+        ready = await init_browser_thread()
+    except asyncio.CancelledError:
+        stop_browser_runtime()
+        raise
+    except Exception as exc:
+        log(f"Gemini Web backend startup failed: {exc}", "API")
+        stop_browser_runtime()
+        return False
+
+    if ready:
+        log("Gemini worker ready; concurrent requests will queue", "API")
+        return True
+
+    log("Gemini Web backend unavailable; Antigravity may still serve requests", "API")
+    stop_browser_runtime()
+    return False
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    success = await init_browser_thread()
-    if not success:
-        if browser_loop:
-            browser_loop.call_soon_threadsafe(browser_loop.stop)
-        if browser_thread:
-            browser_thread.join(timeout=5)
-        raise RuntimeError("Worker pool failed to initialize")
+    global agy_pool
+    agy_pool = AgyPool()
+    try:
+        agy_ready = await asyncio.to_thread(agy_pool.init)
+    except Exception as exc:
+        agy_ready = False
+        log(f"Antigravity CLI backend startup failed: {exc}", "API")
 
-    log("Gemini worker ready; concurrent requests will queue", "API")
+    if agy_ready:
+        log(
+            f"Antigravity CLI backend ready; concurrency={agy_pool.max_concurrency} queue={agy_pool.max_queue}",
+            "API",
+        )
+    else:
+        log("Antigravity CLI backend unavailable", "API")
+
+    browser_init_task: Optional[asyncio.Task] = None
+    if agy_ready:
+        browser_init_task = asyncio.create_task(initialize_gemini_backend())
+    else:
+        browser_ready = await initialize_gemini_backend()
+        if not browser_ready:
+            agy_pool.close()
+            raise RuntimeError("No model backend could initialize")
+
     try:
         yield
     finally:
+        if agy_pool:
+            agy_pool.close()
+        if browser_init_task and not browser_init_task.done():
+            browser_init_task.cancel()
+            try:
+                await browser_init_task
+            except asyncio.CancelledError:
+                pass
         try:
             if worker_pool and browser_loop and browser_loop.is_running():
                 future = asyncio.run_coroutine_threadsafe(worker_pool.close(), browser_loop)
@@ -86,10 +148,7 @@ async def lifespan(app: FastAPI):
         except Exception as exc:
             log(f"Browser cleanup warning: {exc}", "API")
         finally:
-            if browser_loop and browser_loop.is_running():
-                browser_loop.call_soon_threadsafe(browser_loop.stop)
-            if browser_thread:
-                browser_thread.join(timeout=5)
+            stop_browser_runtime()
 
 
 app = FastAPI(title="Gemini Studio API", lifespan=lifespan)
@@ -146,27 +205,154 @@ def build_completion_payload(
     model: str,
     content: str,
     prompt_tokens_est: int,
+    prompt_chars: int = 0,
+    backend: str = "gemini",
+    actual_usage: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     completion_tokens_est = estimate_text_tokens(content)
+    usage: Dict[str, Any]
+    if isinstance(actual_usage, dict) and isinstance(actual_usage.get("input_tokens"), int):
+        prompt_tokens = int(actual_usage.get("input_tokens") or 0)
+        completion_tokens = int(actual_usage.get("output_tokens") or 0)
+        total_tokens = int(actual_usage.get("total_tokens") or (prompt_tokens + completion_tokens))
+        usage = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+            "thinking_tokens": int(actual_usage.get("thinking_tokens") or 0),
+            "cache_read_tokens": int(actual_usage.get("cache_read_tokens") or 0),
+            "prompt_chars": prompt_chars,
+            "completion_chars": len(content),
+            "token_estimate": False,
+        }
+    else:
+        usage = {
+            "prompt_tokens": prompt_tokens_est,
+            "completion_tokens": completion_tokens_est,
+            "total_tokens": prompt_tokens_est + completion_tokens_est,
+            "prompt_chars": prompt_chars,
+            "completion_chars": len(content),
+            "token_estimate": True,
+        }
     return {
         "id": f"chatcmpl-{int(time.time())}",
         "object": "chat.completion",
         "created": int(time.time()),
         "model": model,
+        "backend": backend,
         "request_id": trace_id,
         "choices": [{
             "index": 0,
             "message": {"role": "assistant", "content": content},
             "finish_reason": "stop",
         }],
-        "usage": {
-            "prompt_tokens": prompt_tokens_est,
-            "completion_tokens": completion_tokens_est,
-            "total_tokens": prompt_tokens_est + completion_tokens_est,
-            "completion_chars": len(content),
-            "token_estimate": True,
-        },
+        "usage": usage,
     }
+
+
+def gemini_backend_ready() -> bool:
+    if not worker_pool or not worker_pool._initialized:
+        return False
+    if browser_loop is None:
+        return True
+    is_running = getattr(browser_loop, "is_running", None)
+    return bool(callable(is_running) and is_running())
+
+
+def agy_backend_ready() -> bool:
+    return bool(agy_pool and agy_pool._initialized)
+
+
+def select_request_backend(
+    *,
+    requested_backend: str,
+    model: str,
+    thinking_level: str,
+    fallback_thinking_level: Optional[str],
+    has_images: bool,
+) -> tuple[str, str, str]:
+    """Resolve the execution backend and concrete API model.
+
+    ``auto`` means Agy-first. Fallback to Gemini Web happens only before any
+    model call starts, for unsupported request shape/model/backend availability.
+    """
+
+    agy_model = model.strip().lower()
+    if not agy_model:
+        raise HTTPException(status_code=400, detail="model must not be empty")
+
+    if requested_backend == "agy":
+        if not agy_backend_ready():
+            detail = agy_pool.diagnostics().get("last_error") if agy_pool else "not initialized"
+            raise HTTPException(status_code=503, detail=f"Antigravity CLI backend is unavailable: {detail}")
+        if has_images:
+            raise HTTPException(status_code=400, detail="Antigravity CLI backend does not support image attachments yet")
+        if not agy_pool.is_model_available(agy_model, thinking_level):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Antigravity CLI does not currently expose {agy_model}/{thinking_level}",
+            )
+        if fallback_thinking_level and agy_model not in MODEL_FAMILIES:
+            raise HTTPException(
+                status_code=400,
+                detail="fallback_thinking_level requires a stable Gemini family alias such as 'flash'",
+            )
+        if fallback_thinking_level and not agy_pool.is_model_available(agy_model, fallback_thinking_level):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Antigravity CLI does not currently expose fallback {agy_model}/{fallback_thinking_level}",
+            )
+        return "agy", agy_model, "explicit"
+
+    if requested_backend == "gemini":
+        if not gemini_backend_ready():
+            raise HTTPException(status_code=503, detail="Gemini Web backend is not initialized")
+        try:
+            return "gemini", normalize_model(model), "explicit"
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # No backend tag: prefer Agy when it can serve the request as-is.
+    agy_can_serve = (
+        agy_backend_ready()
+        and not has_images
+        and agy_pool.is_model_available(agy_model, thinking_level)
+        and (not fallback_thinking_level or agy_model in MODEL_FAMILIES)
+        and (
+            not fallback_thinking_level
+            or agy_pool.is_model_available(agy_model, fallback_thinking_level)
+        )
+    )
+    if agy_can_serve:
+        return "agy", agy_model, "agy_preferred"
+
+    try:
+        gemini_model = normalize_model(model)
+    except ValueError as exc:
+        if not agy_backend_ready() and not gemini_backend_ready():
+            raise HTTPException(status_code=503, detail="No model backend is available") from exc
+        raise HTTPException(
+            status_code=400,
+            detail=f"No available backend can serve model {model!r}",
+        ) from exc
+
+    if gemini_backend_ready():
+        if has_images:
+            reason = "images_require_gemini"
+        elif not agy_backend_ready():
+            reason = "agy_unavailable"
+        else:
+            reason = "agy_request_unsupported"
+        return "gemini", gemini_model, reason
+
+    if has_images:
+        raise HTTPException(status_code=503, detail="Image requests require the Gemini Web backend, which is unavailable")
+    if agy_backend_ready():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Antigravity CLI cannot serve {agy_model}/{thinking_level} and Gemini Web is unavailable",
+        )
+    raise HTTPException(status_code=503, detail="No model backend is available")
 
 
 def remember_async_job(job: Dict[str, Any]) -> None:
@@ -187,11 +373,13 @@ def async_job_response(job: Dict[str, Any]) -> JSONResponse:
     if status in {"failed", "error", "timeout"}:
         return JSONResponse(status_code=200, content={
             "request_id": job["request_id"],
+            "backend": job.get("backend"),
             "status": status,
-            "error": str(job.get("error") or "Gemini request failed"),
+            "error": str(job.get("error") or "Model request failed"),
         })
     return JSONResponse(status_code=202, content={
         "request_id": job["request_id"],
+        "backend": job.get("backend"),
         "status": status,
     })
 
@@ -205,8 +393,10 @@ async def finish_async_job(
     cleanup_image_paths,
     model: str,
     prompt_tokens_est: int,
+    prompt_chars: int,
+    backend: str,
 ) -> None:
-    """Finish a browser request after the submit HTTP request has returned."""
+    """Finish a queued backend request after the submit HTTP request returned."""
     try:
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(None, lambda: future.result(timeout=api_timeout))
@@ -216,10 +406,10 @@ async def finish_async_job(
         except Exception:
             pass
         job["status"] = "timeout"
-        job["error"] = f"Browser operation timed out after {api_timeout}s"
+        job["error"] = f"{backend} operation timed out after {api_timeout}s"
         trace["status"] = "timeout"
         trace["finished_at"] = datetime.now(timezone.utc).isoformat()
-        log(f"[{job['request_id']}] Async browser timeout after {api_timeout}s", "API")
+        log(f"[{job['request_id']}] Async {backend} timeout after {api_timeout}s", "API")
         return
     except Exception as exc:
         job["status"] = "error"
@@ -227,7 +417,7 @@ async def finish_async_job(
         trace["status"] = "error"
         trace["error"] = str(exc)
         trace["finished_at"] = datetime.now(timezone.utc).isoformat()
-        log(f"[{job['request_id']}] Async browser error: {exc}", "API")
+        log(f"[{job['request_id']}] Async {backend} error: {exc}", "API")
         return
     finally:
         cleanup_image_paths()
@@ -236,15 +426,23 @@ async def finish_async_job(
     trace["attempts"] = result.get("attempts")
     trace["effective_thinking_level"] = result.get("effective_thinking_level")
     trace["request_logs"] = result.get("request_logs") or []
+    trace["prompt_transport"] = result.get("prompt_transport")
+    trace["agy_model"] = result.get("agy_model")
+    trace["agy_usage"] = result.get("agy_usage")
+    trace["agy_tools_used"] = result.get("agy_tools_used") or []
     trace["finished_at"] = datetime.now(timezone.utc).isoformat()
 
     if not result.get("success"):
         error = str(result.get("error") or "Gemini request failed")
-        job["status"] = "failed"
+        timed_out = bool(result.get("timed_out"))
+        job["status"] = "timeout" if timed_out else "failed"
         job["error"] = error
-        trace["status"] = "failed"
+        trace["status"] = "timeout" if timed_out else "failed"
         trace["error"] = error
-        log(f"[{job['request_id']}] Async request failed: {error}", "API")
+        log(
+            f"[{job['request_id']}] Async request {'timed out' if timed_out else 'failed'}: {error}",
+            "API",
+        )
         return
 
     content = str(result.get("response") or "")
@@ -253,6 +451,9 @@ async def finish_async_job(
         model=model,
         content=content,
         prompt_tokens_est=prompt_tokens_est,
+        prompt_chars=prompt_chars,
+        backend=backend,
+        actual_usage=result.get("agy_usage"),
     )
     job["status"] = "ok"
     job["response"] = response
@@ -269,6 +470,41 @@ async def list_models():
     """List available Gemini Web models."""
     return {
         "data": [{"id": name, "object": "model", "provider": "gemini-web"} for name in MODEL_FAMILIES]
+    }
+
+
+@app.get("/v1/backends")
+async def list_backends():
+    """Report the execution backends without changing the existing model list."""
+    agy_diag = agy_pool.diagnostics() if agy_pool else {
+        "available": False,
+        "active_request": False,
+        "queued_requests": 0,
+        "models": [],
+        "last_error": "not initialized",
+    }
+    return {
+        "default_policy": "agy-first",
+        "data": [
+            {
+                "id": "gemini",
+                "available": gemini_backend_ready(),
+                "transport": "gemini-web",
+            },
+            {
+                "id": "agy",
+                "available": bool(agy_diag.get("available")),
+                "transport": "antigravity-cli",
+                "models": agy_diag.get("models") or [],
+                "model_ids": agy_diag.get("model_ids") or [],
+                "max_concurrency": int(agy_diag.get("max_concurrency") or 0),
+                "max_queue": int(agy_diag.get("max_queue") or 0),
+                "active_requests": int(agy_diag.get("active_requests") or 0),
+                "active_request": bool(agy_diag.get("active_request")),
+                "queued_requests": int(agy_diag.get("queued_requests") or 0),
+                "last_error": agy_diag.get("last_error"),
+            },
+        ]
     }
 
 
@@ -314,9 +550,16 @@ async def openai_chat(request: Request):
     respond_async = body.get("async", False)
     if not isinstance(respond_async, bool):
         raise HTTPException(status_code=400, detail="async must be a boolean")
-    
-    if not worker_pool:
-        raise HTTPException(status_code=503, detail="Worker pool not initialized")
+
+    backend_raw = body.get("backend")
+    if backend_raw is None:
+        requested_backend = "auto"
+    else:
+        if not isinstance(backend_raw, str):
+            raise HTTPException(status_code=400, detail="backend must be a string")
+        requested_backend = backend_raw.strip().lower()
+        if requested_backend not in {"gemini", "agy"}:
+            raise HTTPException(status_code=400, detail="backend must be 'gemini' or 'agy'")
     
     source = extract_request_source(request, body)
     trace_id = source["request_id"]
@@ -344,7 +587,6 @@ async def openai_chat(request: Request):
         raise HTTPException(status_code=400, detail="use_search must be a boolean")
 
     try:
-        base_model = normalize_model(model)
         thinking_level = normalize_thinking_level(thinking_level_explicit or "medium")
         fallback_thinking_level = (
             normalize_thinking_level(fallback_thinking_level_explicit)
@@ -417,11 +659,26 @@ async def openai_chat(request: Request):
     if not prompt.strip() and not image_paths:
         raise HTTPException(status_code=400, detail="Request contains no text or image content")
 
+    try:
+        backend, base_model, backend_reason = select_request_backend(
+            requested_backend=requested_backend,
+            model=model,
+            thinking_level=thinking_level,
+            fallback_thinking_level=fallback_thinking_level,
+            has_images=bool(image_paths),
+        )
+    except HTTPException:
+        cleanup_image_paths()
+        raise
+
     trace = {
         "request_id": trace_id,
         "project": source["project"],
         "client": source["client"],
         "ip": source["ip"],
+        "backend_requested": requested_backend,
+        "backend": backend,
+        "backend_reason": backend_reason,
         "model": model,
         "resolved_model": base_model,
         "thinking_level": thinking_level,
@@ -430,7 +687,11 @@ async def openai_chat(request: Request):
         "started_at": datetime.now(timezone.utc).isoformat(),
     }
     recent_requests.append(trace)
-    log(f"[{trace_id}] Source: project={source['project']} client={source['client']} ip={source['ip']}", "API")
+    log(
+        f"[{trace_id}] Source: project={source['project']} client={source['client']} ip={source['ip']} "
+        f"backend={backend} requested={requested_backend} reason={backend_reason}",
+        "API",
+    )
     log(
         f"Model: {base_model} | Thinking: {thinking_level}"
         f" | Fallback: {fallback_thinking_level or '-'} | Messages: {len(messages)} | Raw: {model}",
@@ -448,31 +709,80 @@ async def openai_chat(request: Request):
         f"Prompt stats: chars={prompt_chars} tokens_est={prompt_tokens_est} images={len(image_paths)}",
         "API",
     )
-    log("Dispatching to browser thread...", "API")
-    coro = worker_pool.send_message(
-        prompt, 
-        model=base_model, 
-        thinking_level=thinking_level, 
-        fallback_thinking_level=fallback_thinking_level,
-        use_search=use_search, 
-        images=image_paths,
-        request_id=trace_id,
-        request_context={
-            "project": source["project"],
-            "client": source["client"],
-            "ip": source["ip"],
-            "raw_model": model,
-            "fallback_thinking_level": fallback_thinking_level,
-            "message_count": len(messages),
-            "image_count": len(image_paths),
-            "prompt_tokens_est": prompt_tokens_est,
-        },
-    )
-    future = asyncio.run_coroutine_threadsafe(coro, browser_loop)
+
+    def submit_gemini_request(gemini_model: str):
+        log("Dispatching to Gemini Web browser thread...", "API")
+        coro = worker_pool.send_message(
+            prompt,
+            model=gemini_model,
+            thinking_level=thinking_level,
+            fallback_thinking_level=fallback_thinking_level,
+            use_search=use_search,
+            images=image_paths,
+            request_id=trace_id,
+            request_context={
+                "project": source["project"],
+                "client": source["client"],
+                "ip": source["ip"],
+                "raw_model": model,
+                "fallback_thinking_level": fallback_thinking_level,
+                "message_count": len(messages),
+                "image_count": len(image_paths),
+                "prompt_tokens_est": prompt_tokens_est,
+            },
+        )
+        return asyncio.run_coroutine_threadsafe(coro, browser_loop)
+
+    if backend == "agy":
+        agy_timeout = (
+            AGY_REQUEST_TOTAL_BUDGET_SECONDS
+            if respond_async
+            else min(AGY_REQUEST_TOTAL_BUDGET_SECONDS, max(1, PUBLIC_API_TIMEOUT_SECONDS - 15))
+        )
+        log(f"Dispatching to Antigravity CLI queue (budget={agy_timeout}s)...", "API")
+        try:
+            future = agy_pool.submit(
+                prompt,
+                model=base_model,
+                thinking_level=thinking_level,
+                fallback_thinking_level=fallback_thinking_level,
+                use_search=use_search,
+                timeout_seconds=agy_timeout,
+            )
+        except AgyQueueFullError as exc:
+            gemini_spill_model = None
+            if requested_backend == "auto" and gemini_backend_ready():
+                try:
+                    gemini_spill_model = normalize_model(model)
+                except ValueError:
+                    gemini_spill_model = None
+
+            if gemini_spill_model:
+                backend = "gemini"
+                base_model = gemini_spill_model
+                backend_reason = "agy_queue_full"
+                trace["backend"] = backend
+                trace["resolved_model"] = base_model
+                trace["backend_reason"] = backend_reason
+                log(f"[{trace_id}] Agy queue full; spilling untagged request to Gemini Web", "API")
+                future = submit_gemini_request(base_model)
+            else:
+                cleanup_image_paths()
+                trace["status"] = "rejected"
+                trace["error"] = str(exc)
+                trace["finished_at"] = datetime.now(timezone.utc).isoformat()
+                raise HTTPException(
+                    status_code=429,
+                    detail=str(exc),
+                    headers={"Retry-After": "5"},
+                ) from exc
+    else:
+        future = submit_gemini_request(base_model)
 
     if respond_async:
         job: Dict[str, Any] = {
             "request_id": trace_id,
+            "backend": backend,
             "status": "started",
             "started_at": trace["started_at"],
         }
@@ -485,6 +795,8 @@ async def openai_chat(request: Request):
             cleanup_image_paths=cleanup_image_paths,
             model=model,
             prompt_tokens_est=prompt_tokens_est,
+            prompt_chars=prompt_chars,
+            backend=backend,
         ))
         job["_task"] = task
         log(f"[{trace_id}] Async request accepted; poll /v1/chat/completions/{trace_id}", "API")
@@ -493,15 +805,12 @@ async def openai_chat(request: Request):
     api_timeout = PUBLIC_API_TIMEOUT_SECONDS
     
     try:
-        log(
-            f"Waiting for queued browser request (api_timeout={api_timeout}s)...",
-            "API"
-        )
+        log(f"Waiting for queued {backend} request (api_timeout={api_timeout}s)...", "API")
         result = await asyncio.get_event_loop().run_in_executor(
             None, 
             lambda: future.result(timeout=api_timeout)
         )
-        log("Browser thread returned", "API")
+        log(f"{backend} backend returned", "API")
     except TimeoutError:
         try:
             future.cancel()
@@ -509,10 +818,10 @@ async def openai_chat(request: Request):
             pass
         trace["status"] = "timeout"
         trace["finished_at"] = datetime.now(timezone.utc).isoformat()
-        log(f"BROWSER TIMEOUT after {api_timeout}s - request stuck in browser thread", "API")
+        log(f"{backend.upper()} TIMEOUT after {api_timeout}s", "API")
         raise HTTPException(
             status_code=504,
-            detail=f"Gemini request failed: API request timed out after {api_timeout}s",
+            detail=f"{backend} request failed: API request timed out after {api_timeout}s",
         )
     except Exception as e:
         trace["status"] = "error"
@@ -523,14 +832,15 @@ async def openai_chat(request: Request):
         cleanup_image_paths()
 
     if not result["success"]:
-        trace["status"] = "failed"
+        timed_out = bool(result.get("timed_out"))
+        trace["status"] = "timeout" if timed_out else "failed"
         trace["error"] = result.get("error")
         trace["queue_wait_ms"] = result.get("queue_wait_ms")
         trace["attempts"] = result.get("attempts")
         trace["effective_thinking_level"] = result.get("effective_thinking_level")
         trace["request_logs"] = result.get("request_logs") or []
         trace["finished_at"] = datetime.now(timezone.utc).isoformat()
-        raise HTTPException(status_code=500, detail=result.get("error"))
+        raise HTTPException(status_code=504 if timed_out else 500, detail=result.get("error"))
 
     content = result["response"] or ""
     completion_tokens_est = estimate_text_tokens(content)
@@ -540,6 +850,10 @@ async def openai_chat(request: Request):
     trace["effective_thinking_level"] = result.get("effective_thinking_level")
     trace["response_chars"] = len(content)
     trace["request_logs"] = result.get("request_logs") or []
+    trace["prompt_transport"] = result.get("prompt_transport")
+    trace["agy_model"] = result.get("agy_model")
+    trace["agy_usage"] = result.get("agy_usage")
+    trace["agy_tools_used"] = result.get("agy_tools_used") or []
     trace["response_tokens_est"] = completion_tokens_est
     trace["finished_at"] = datetime.now(timezone.utc).isoformat()
     log(
@@ -547,26 +861,15 @@ async def openai_chat(request: Request):
         "API",
     )
     
-    return {
-        "id": f"chatcmpl-{int(time.time())}",
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": model,
-        "request_id": trace_id,
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": content},
-            "finish_reason": "stop"
-        }],
-        "usage": {
-            "prompt_tokens": prompt_tokens_est,
-            "completion_tokens": completion_tokens_est,
-            "total_tokens": prompt_tokens_est + completion_tokens_est,
-            "prompt_chars": prompt_chars,
-            "completion_chars": len(content),
-            "token_estimate": True,
-        }
-    }
+    return build_completion_payload(
+        trace_id=trace_id,
+        model=model,
+        content=content,
+        prompt_tokens_est=prompt_tokens_est,
+        prompt_chars=prompt_chars,
+        backend=backend,
+        actual_usage=result.get("agy_usage"),
+    )
 
 
 @app.get("/v1/chat/completions/{request_id}")
@@ -601,15 +904,24 @@ def public_request_trace(trace: Dict) -> Dict:
 @app.get("/health")
 async def health(response: Response):
     ready_workers = ready_worker_count()
-    active_request = bool(worker_pool and worker_pool._initialized and worker_pool._active_request)
+    gemini_active = bool(worker_pool and worker_pool._initialized and worker_pool._active_request)
     queued_requests = int(getattr(worker_pool, "_queued_requests", 0) or 0) if worker_pool else 0
     browser_state = getattr(worker_pool, "_browser_state", "unavailable") if worker_pool else "unavailable"
     pool_ready = bool(worker_pool and worker_pool._initialized)
-    is_ready = pool_ready and (
+    gemini_ready = gemini_backend_ready() and (
         ready_workers > 0
-        or active_request
+        or gemini_active
         or browser_state in {"cold", "starting"}
     )
+    agy_diag = agy_pool.diagnostics() if agy_pool else {
+        "available": False,
+        "active_requests": 0,
+        "queued_requests": 0,
+    }
+    agy_ready = bool(agy_diag.get("available"))
+    agy_active = int(agy_diag.get("active_requests") or 0)
+    is_ready = gemini_ready or agy_ready
+    active_request = gemini_active or agy_active > 0
     response.status_code = 200 if is_ready else 503
     return {
         "status": "busy" if active_request else ("ok" if is_ready else "degraded"),
@@ -619,6 +931,18 @@ async def health(response: Response):
         "active_request": active_request,
         "queued_requests": queued_requests,
         "browser_state": browser_state,
+        "backends": {
+            "gemini": {
+                "ready": gemini_ready,
+                "active": gemini_active,
+                "queued_requests": queued_requests,
+            },
+            "agy": {
+                "ready": agy_ready,
+                "active_requests": agy_active,
+                "queued_requests": int(agy_diag.get("queued_requests") or 0),
+            },
+        },
     }
 
 
@@ -648,23 +972,29 @@ async def get_live_pool_diagnostics() -> Dict[str, Any]:
 
 @app.get("/v1/diagnostics")
 async def diagnostics():
-    if not worker_pool:
-        return {"status": "not_initialized"}
-
-    pool_diag = await get_live_pool_diagnostics()
+    pool_diag = await get_live_pool_diagnostics() if worker_pool else {
+        "initialized": False,
+        "browser_state": "unavailable",
+    }
     ready_workers = ready_worker_count()
     browser_state = pool_diag.get("browser_state")
-    is_ready = bool(
-        worker_pool._initialized
+    gemini_ready = bool(
+        gemini_backend_ready()
         and (
             ready_workers
             or worker_pool._active_request
             or browser_state in {"cold", "starting"}
         )
     )
+    agy_diag = agy_pool.diagnostics() if agy_pool else {
+        "available": False,
+        "last_error": "not initialized",
+    }
+    is_ready = gemini_ready or bool(agy_diag.get("available"))
     return {
         "status": "ok" if is_ready else "degraded",
         "pool": pool_diag,
+        "agy": agy_diag,
         "recent_requests": [public_request_trace(trace) for trace in recent_requests],
     }
 

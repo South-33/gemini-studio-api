@@ -11,11 +11,43 @@ This is the project's AGENTS.md
 - Develop locally, commit and push, then deploy on production with Git only.
 - The API has one queued Gemini Web worker. Do not add provider abstractions or
   multiple workers.
+- Antigravity is an explicit second execution backend, selected per request with
+  `backend: "agy"`; use a bounded local process pool plus overflow queue, not a
+  provider framework or unbounded process spawning.
+- When `backend` is omitted, route Agy-first. Use Gemini Web only as a
+  pre-execution fallback when Agy cannot serve the request or its queue is full.
+  Never replay a request through Gemini after an Agy model call has started.
+- Explicit `backend: "agy"` and `backend: "gemini"` requests are strict and
+  must not silently switch providers.
+- Backend startup is independent: Gemini Web failure must not take down a
+  healthy Antigravity backend, and Antigravity failure must not take down Gemini Web.
+- A healthy Agy backend must not wait for Gemini Web warmup before the API starts
+  serving. Warm Gemini Web in the background when Agy is ready; if Agy fails,
+  Gemini Web remains the blocking startup fallback.
+- Antigravity processes share one sterile runtime workspace with immutable
+  `api-model` (no tools) and `api-search` (web search/read only) agents. Send
+  CLI logs to the OS null device. Do not return to per-request workspaces:
+  they pollute Agy's workspace conversation cache. Send prompts only through
+  stream-json stdin; do not use command-line prompt transport or prompt files.
+- Force UTF-8 for Antigravity subprocess pipes. Windows may otherwise use a
+  legacy code page and corrupt or reject non-ASCII prompts.
+- Override personal Antigravity settings per request with `--settings`. Normal
+  API calls get no tools; `use_search: true` gets only web search/read tools.
+  Deny writes, commands, unsandboxed execution, MCP, and browser actuation; do
+  not expose local-file tools to the custom API agent; keep G1 credit fallback
+  disabled.
+- Keep Antigravity on the signed-in provider by overriding `modelProvider` to
+  its default for API sessions; personal API-key provider settings must not
+  silently change quota or billing behavior.
+- Treat `finished_reason: print_timeout` as failure even if the CLI reports
+  `status: SUCCESS`; discard partial output. Refresh `agy models` once only for
+  zero-token invalid-model failures on stable Gemini aliases, never exact IDs.
 - The public ngrok path has a 5-minute idle timeout. Long Gemini work must use
   async submit-and-poll requests so browser thinking is not capped by the
   tunnel and a caller retry cannot duplicate a still-running request.
-- API models are exactly `flash-lite`, `flash`, `pro`, and `argon`. Thinking
-  levels are exactly `Low`, `Medium`, and `High`. Do not add aliases.
+- Gemini Web model aliases are exactly `flash-lite`, `flash`, `pro`, and
+  `argon`, with `Low`, `Medium`, and `High`. Antigravity may additionally accept
+  exact model IDs returned by `agy models`; do not invent aliases for them.
 - Model numbers shown by Gemini are disposable UI version labels. Ignore them
   completely for matching and API behavior; only the family names matter.
 - Match Gemini's visible model family text and exact thinking labels; never use
