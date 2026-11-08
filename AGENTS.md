@@ -36,6 +36,9 @@ This is the project's AGENTS.md
   Deny writes, commands, unsandboxed execution, MCP, and browser actuation; do
   not expose local-file tools to the custom API agent; keep G1 credit fallback
   disabled.
+- Fail Agy initialization when active global Antigravity hooks or enabled
+  plugins are present; either can inject behavior outside the custom agent's
+  tool allowlist. Disabled hooks/plugins are safe to ignore.
 - Keep Antigravity on the signed-in provider by overriding `modelProvider` to
   its default for API sessions; personal API-key provider settings must not
   silently change quota or billing behavior.

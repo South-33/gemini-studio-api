@@ -147,6 +147,14 @@ personal `GEMINI_API_KEY` provider cannot silently change billing; and only URL
 reads are allowed for search-enabled requests. The custom agent itself exposes
 no local-file tools. The user's persistent Antigravity settings are not modified.
 
+At startup, the Agy backend also verifies that no active global Antigravity
+hooks or enabled plugins can inject behavior outside this API policy. Disabled
+hooks/plugins are allowed. If an active global hook or enabled plugin is found,
+only the Agy backend is marked unavailable and diagnostics report the reason;
+Gemini Web can continue serving requests. Global MCP configuration is not
+inherited by the API agent because MCP tools are not exposed and `mcp(*)` is
+denied by the session policy.
+
 Antigravity output is read from `--output-format stream-json`; only the final
 `result` event becomes the API response. When Antigravity reports token usage, the OpenAI-style
 response exposes those real counts with `token_estimate: false`. Image
