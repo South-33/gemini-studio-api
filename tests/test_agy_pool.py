@@ -2,7 +2,13 @@ import time
 import threading
 import unittest
 
-from agy_cli import AgyCliError, AgyCliTimeoutError, AgyModelSelectionError, AgyResult
+from agy_cli import (
+    AgyCliError,
+    AgyCliTimeoutError,
+    AgyCliUnavailableError,
+    AgyModelSelectionError,
+    AgyResult,
+)
 from agy_pool import AgyPool, AgyQueueFullError
 
 
@@ -13,28 +19,28 @@ class FakeRunner:
         self.active = 0
         self.max_active = 0
         self.refresh_count = 0
+        self.models = None
 
     def refresh_models(self):
         self.refresh_count += 1
-        return {
+        self.models = {
             ("flash", "medium"): "gemini-3.8-flash-medium",
             ("flash", "high"): "gemini-3.8-flash-high",
         }
+        return dict(self.models)
 
     def check_capabilities(self):
         return None
 
-    def check_environment_isolation(self):
-        return None
-
     def available_model_slugs(self):
-        return ["gemini-3.8-flash-medium", "gemini-3.8-flash-high", "claude-sonnet-4-6"]
+        mapping = self.models or self.refresh_models()
+        return [*mapping.values(), "claude-sonnet-4-6"]
 
     def resolve_model(self, family, thinking_level):
         normalized = family.lower()
         if normalized == "flash":
             key = ("flash", thinking_level.lower())
-            mapping = self.refresh_models()
+            mapping = self.models or self.refresh_models()
             if key in mapping:
                 return mapping[key]
         for model in self.available_model_slugs():
@@ -144,9 +150,34 @@ class AgyPoolTests(unittest.TestCase):
         pool.close()
 
         self.assertFalse(pool.diagnostics()["available"])
+        self.assertFalse(pool.init())
         with self.assertRaises(RuntimeError):
             pool.submit("late", model="flash", thinking_level="Medium")
         self.assertEqual(pool.diagnostics()["queued_requests"], 0)
+
+    def test_close_during_init_cannot_resurrect_pool(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        class BlockingInitRunner(FakeRunner):
+            def check_capabilities(self):
+                started.set()
+                release.wait(timeout=1)
+
+        runner = BlockingInitRunner()
+        pool = AgyPool(runner, max_concurrency=1, max_queue=1)
+        result = []
+        thread = threading.Thread(target=lambda: result.append(pool.init()))
+        thread.start()
+        self.assertTrue(started.wait(timeout=1))
+
+        pool.close()
+        release.set()
+        thread.join(timeout=2)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result, [False])
+        self.assertFalse(pool.diagnostics()["available"])
 
     def test_queue_wait_consumes_request_budget_before_model_call(self):
         runner = FakeRunner(["unexpected"])
@@ -160,11 +191,11 @@ class AgyPoolTests(unittest.TestCase):
             None,
             False,
             1,
-            time.time() - 5,
             time.monotonic() - 5,
         )
 
         self.assertFalse(result["success"])
+        self.assertTrue(result["timed_out"])
         self.assertIn("exceeded", result["error"])
         self.assertEqual(runner.calls, [])
         pool.close()
@@ -189,6 +220,22 @@ class AgyPoolTests(unittest.TestCase):
         self.assertEqual([call[2] for call in runner.calls], ["Medium", "High"])
         pool.close()
 
+    def test_same_thinking_fallback_does_not_duplicate_request(self):
+        runner = FakeRunner(["Sorry, something went wrong. Please try your request again."])
+        pool = AgyPool(runner)
+        pool.init()
+        result = pool.submit(
+            "hello",
+            model="flash",
+            thinking_level="Medium",
+            fallback_thinking_level="Medium",
+        ).result(timeout=1)
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["attempts"], 1)
+        self.assertEqual(len(runner.calls), 1)
+        pool.close()
+
     def test_cli_error_is_not_blindly_retried(self):
         runner = FakeRunner([AgyCliError("quota exhausted")])
         pool = AgyPool(runner)
@@ -203,6 +250,23 @@ class AgyPoolTests(unittest.TestCase):
         self.assertFalse(result["success"])
         self.assertEqual(result["attempts"], 1)
         self.assertEqual(len(runner.calls), 1)
+        pool.close()
+
+    def test_runtime_unavailable_error_disables_pool_for_future_routing(self):
+        runner = FakeRunner([AgyCliUnavailableError("binary vanished")])
+        pool = AgyPool(runner)
+        pool.init()
+
+        result = pool.submit(
+            "hello",
+            model="flash",
+            thinking_level="Medium",
+        ).result(timeout=1)
+
+        self.assertFalse(result["success"])
+        self.assertIn("became unavailable", result["error"])
+        self.assertFalse(pool.diagnostics()["available"])
+        self.assertFalse(pool.is_model_available("flash", "Medium"))
         pool.close()
 
     def test_cli_timeout_is_not_retried_and_is_marked(self):
@@ -225,7 +289,10 @@ class AgyPoolTests(unittest.TestCase):
 
     def test_stale_stable_model_refreshes_once_then_retries(self):
         runner = FakeRunner([
-            AgyModelSelectionError("invalid model selection: stale slug"),
+            AgyModelSelectionError(
+                "invalid model selection: stale slug",
+                model_slug="gemini-3.8-flash-medium",
+            ),
             "recovered",
         ])
         pool = AgyPool(runner)
@@ -242,6 +309,58 @@ class AgyPoolTests(unittest.TestCase):
         self.assertEqual(result["attempts"], 1)
         self.assertEqual(len(runner.calls), 2)
         self.assertEqual(runner.refresh_count, refreshes_after_init + 1)
+        pool.close()
+
+    def test_concurrent_stale_model_failures_share_one_refresh(self):
+        barrier = threading.Barrier(3)
+
+        class RotatingRunner(FakeRunner):
+            def refresh_models(self):
+                self.refresh_count += 1
+                version = "3.7" if self.refresh_count == 1 else "3.8"
+                self.models = {
+                    ("flash", "medium"): f"gemini-{version}-flash-medium",
+                    ("flash", "high"): f"gemini-{version}-flash-high",
+                }
+                return dict(self.models)
+
+            def run_prompt(self, prompt, *, family, thinking_level, use_search, timeout_seconds):
+                slug = self.resolve_model(family, thinking_level)
+                self.calls.append((prompt, family, thinking_level, use_search, timeout_seconds, slug))
+                if slug == "gemini-3.7-flash-medium":
+                    barrier.wait(timeout=1)
+                    raise AgyModelSelectionError(
+                        "invalid model selection: stale slug",
+                        model_slug=slug,
+                    )
+                return AgyResult(
+                    response="recovered",
+                    conversation_id="conv",
+                    usage={"input_tokens": 10},
+                    duration_seconds=0.1,
+                    model_slug=slug,
+                    prompt_transport="stdin",
+                    prompt_chars=len(prompt),
+                    effective_thinking_level=thinking_level,
+                    tools_used=(),
+                )
+
+        runner = RotatingRunner()
+        pool = AgyPool(runner, max_concurrency=3, max_queue=0)
+        self.assertTrue(pool.init())
+        refreshes_after_init = runner.refresh_count
+        futures = [
+            pool.submit(f"request-{index}", model="flash", thinking_level="Medium")
+            for index in range(3)
+        ]
+        results = [future.result(timeout=2) for future in futures]
+
+        self.assertTrue(all(result["success"] for result in results))
+        self.assertEqual(runner.refresh_count, refreshes_after_init + 1)
+        self.assertEqual(
+            [call[5] for call in runner.calls].count("gemini-3.8-flash-medium"),
+            3,
+        )
         pool.close()
 
     def test_exact_model_selection_error_is_not_retried(self):

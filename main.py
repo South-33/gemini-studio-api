@@ -39,6 +39,7 @@ PUBLIC_API_TIMEOUT_SECONDS = 290
 ASYNC_JOB_TIMEOUT_SECONDS = 2700
 RECENT_REQUEST_LIMIT = 200
 ASYNC_JOB_LIMIT = 200
+TERMINAL_ASYNC_JOB_STATUSES = {"ok", "failed", "error", "timeout"}
 IMAGE_TOKEN_ESTIMATE = 300
 ROOT = Path(__file__).resolve().parent
 ENDPOINT_STATE = ROOT / "runtime_endpoint.json"
@@ -107,30 +108,28 @@ async def initialize_gemini_backend() -> bool:
 async def lifespan(app: FastAPI):
     global agy_pool
     agy_pool = AgyPool()
-    try:
-        agy_ready = await asyncio.to_thread(agy_pool.init)
-    except Exception as exc:
-        agy_ready = False
-        log(f"Antigravity CLI backend startup failed: {exc}", "API")
-
-    if agy_ready:
-        log(
-            f"Antigravity CLI backend ready; concurrency={agy_pool.max_concurrency} queue={agy_pool.max_queue}",
-            "API",
-        )
-    else:
-        log("Antigravity CLI backend unavailable", "API")
-
     browser_init_task: Optional[asyncio.Task] = None
-    if agy_ready:
-        browser_init_task = asyncio.create_task(initialize_gemini_backend())
-    else:
-        browser_ready = await initialize_gemini_backend()
-        if not browser_ready:
-            agy_pool.close()
-            raise RuntimeError("No model backend could initialize")
-
     try:
+        try:
+            agy_ready = await asyncio.to_thread(agy_pool.init)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            agy_ready = False
+            log(f"Antigravity CLI backend startup failed: {exc}", "API")
+
+        if agy_ready:
+            log(
+                f"Antigravity CLI backend ready; concurrency={agy_pool.max_concurrency} queue={agy_pool.max_queue}",
+                "API",
+            )
+            browser_init_task = asyncio.create_task(initialize_gemini_backend())
+        else:
+            log("Antigravity CLI backend unavailable", "API")
+            browser_ready = await initialize_gemini_backend()
+            if not browser_ready:
+                raise RuntimeError("No model backend could initialize")
+
         yield
     finally:
         if agy_pool:
@@ -211,16 +210,28 @@ def build_completion_payload(
 ) -> Dict[str, Any]:
     completion_tokens_est = estimate_text_tokens(content)
     usage: Dict[str, Any]
-    if isinstance(actual_usage, dict) and isinstance(actual_usage.get("input_tokens"), int):
-        prompt_tokens = int(actual_usage.get("input_tokens") or 0)
-        completion_tokens = int(actual_usage.get("output_tokens") or 0)
-        total_tokens = int(actual_usage.get("total_tokens") or (prompt_tokens + completion_tokens))
+
+    def valid_token_count(value: Any) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+    has_actual_usage = bool(
+        isinstance(actual_usage, dict)
+        and valid_token_count(actual_usage.get("input_tokens"))
+        and valid_token_count(actual_usage.get("output_tokens"))
+    )
+    if has_actual_usage:
+        prompt_tokens = int(actual_usage["input_tokens"])
+        completion_tokens = int(actual_usage["output_tokens"])
+        raw_total = actual_usage.get("total_tokens")
+        total_tokens = int(raw_total) if valid_token_count(raw_total) else prompt_tokens + completion_tokens
+        raw_thinking = actual_usage.get("thinking_tokens")
+        raw_cache = actual_usage.get("cache_read_tokens")
         usage = {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "total_tokens": total_tokens,
-            "thinking_tokens": int(actual_usage.get("thinking_tokens") or 0),
-            "cache_read_tokens": int(actual_usage.get("cache_read_tokens") or 0),
+            "thinking_tokens": int(raw_thinking) if valid_token_count(raw_thinking) else 0,
+            "cache_read_tokens": int(raw_cache) if valid_token_count(raw_cache) else 0,
             "prompt_chars": prompt_chars,
             "completion_chars": len(content),
             "token_estimate": False,
@@ -234,10 +245,11 @@ def build_completion_payload(
             "completion_chars": len(content),
             "token_estimate": True,
         }
+    created = int(time.time())
     return {
-        "id": f"chatcmpl-{int(time.time())}",
+        "id": f"chatcmpl-{uuid.uuid4().hex}",
         "object": "chat.completion",
-        "created": int(time.time()),
+        "created": created,
         "model": model,
         "backend": backend,
         "request_id": trace_id,
@@ -355,15 +367,27 @@ def select_request_backend(
     raise HTTPException(status_code=503, detail="No model backend is available")
 
 
+def make_async_job_capacity() -> bool:
+    """Evict terminal jobs only; never lose a poll handle for active work."""
+
+    while len(async_jobs) >= ASYNC_JOB_LIMIT:
+        terminal_id = next(
+            (
+                request_id
+                for request_id, job in async_jobs.items()
+                if str(job.get("status") or "started") in TERMINAL_ASYNC_JOB_STATUSES
+            ),
+            None,
+        )
+        if terminal_id is None:
+            return False
+        async_jobs.pop(terminal_id, None)
+    return True
+
+
 def remember_async_job(job: Dict[str, Any]) -> None:
-    """Keep a bounded in-memory result cache for long-running browser jobs."""
-    request_id = str(job["request_id"])
-    async_jobs[request_id] = job
-    while len(async_jobs) > ASYNC_JOB_LIMIT:
-        oldest = next(iter(async_jobs))
-        if oldest == request_id and len(async_jobs) == 1:
-            break
-        async_jobs.pop(oldest, None)
+    """Store one async job after capacity has been reserved."""
+    async_jobs[str(job["request_id"])] = job
 
 
 def async_job_response(job: Dict[str, Any]) -> JSONResponse:
@@ -621,16 +645,23 @@ async def openai_chat(request: Request):
                 part_type = part.get("type", "text")
                 if part_type == "text":
                     text_content = part.get('text', '')
+                    if not isinstance(text_content, str):
+                        cleanup_image_paths()
+                        raise HTTPException(status_code=400, detail="Text content must be a string")
                     if text_content:
-                        prompt += str(text_content) + "\n"
+                        prompt += text_content + "\n"
                 elif part_type == "image_url":
                     image_spec = part.get("image_url")
                     image_url = image_spec.get("url", "") if isinstance(image_spec, dict) else ""
+                    if not isinstance(image_url, str):
+                        cleanup_image_paths()
+                        raise HTTPException(status_code=400, detail="image_url.url must be a string")
                     if image_url.startswith("data:image/"):
                         try:
                             header, base64_data = image_url.split(",", 1)
-                            image_bytes = base64.b64decode(base64_data, validate=True)
-                            mime_type = header.split(";")[0].split(":")[1]
+                            if not header.lower().endswith(";base64"):
+                                raise ValueError("Image data URL must use base64 encoding")
+                            mime_type = header.split(";")[0].split(":")[1].lower()
                             ext = {
                                 "image/png": "png",
                                 "image/jpeg": "jpg",
@@ -639,10 +670,10 @@ async def openai_chat(request: Request):
                             }.get(mime_type)
                             if not ext:
                                 raise ValueError(f"Unsupported image MIME type: {mime_type}")
-                            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}")
-                            temp_file.write(image_bytes)
-                            temp_file.close()
-                            image_paths.append(temp_file.name)
+                            image_bytes = base64.b64decode(base64_data, validate=True)
+                            with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as temp_file:
+                                image_paths.append(temp_file.name)
+                                temp_file.write(image_bytes)
                         except Exception as e:
                             cleanup_image_paths()
                             raise HTTPException(status_code=400, detail=f"Invalid image attachment: {e}") from e
@@ -652,9 +683,12 @@ async def openai_chat(request: Request):
                 else:
                     cleanup_image_paths()
                     raise HTTPException(status_code=400, detail=f"Unsupported message content type: {part_type}")
-        else:
+        elif isinstance(content, str):
             if content:
-                prompt += str(content) + "\n"
+                prompt += content + "\n"
+        else:
+            cleanup_image_paths()
+            raise HTTPException(status_code=400, detail="Message content must be a string or array")
 
     if not prompt.strip() and not image_paths:
         raise HTTPException(status_code=400, detail="Request contains no text or image content")
@@ -670,6 +704,14 @@ async def openai_chat(request: Request):
     except HTTPException:
         cleanup_image_paths()
         raise
+
+    if respond_async and not make_async_job_capacity():
+        cleanup_image_paths()
+        raise HTTPException(
+            status_code=429,
+            detail=f"Async job capacity is full ({ASYNC_JOB_LIMIT} active jobs)",
+            headers={"Retry-After": "5"},
+        )
 
     trace = {
         "request_id": trace_id,
@@ -731,7 +773,18 @@ async def openai_chat(request: Request):
                 "prompt_tokens_est": prompt_tokens_est,
             },
         )
-        return asyncio.run_coroutine_threadsafe(coro, browser_loop)
+        try:
+            return asyncio.run_coroutine_threadsafe(coro, browser_loop)
+        except Exception:
+            coro.close()
+            raise
+
+    def gemini_dispatch_unavailable(exc: Exception) -> HTTPException:
+        cleanup_image_paths()
+        trace["status"] = "error"
+        trace["error"] = str(exc)
+        trace["finished_at"] = datetime.now(timezone.utc).isoformat()
+        return HTTPException(status_code=503, detail="Gemini Web backend became unavailable during dispatch")
 
     if backend == "agy":
         agy_timeout = (
@@ -749,7 +802,8 @@ async def openai_chat(request: Request):
                 use_search=use_search,
                 timeout_seconds=agy_timeout,
             )
-        except AgyQueueFullError as exc:
+        except (AgyQueueFullError, RuntimeError) as exc:
+            queue_full = isinstance(exc, AgyQueueFullError)
             gemini_spill_model = None
             if requested_backend == "auto" and gemini_backend_ready():
                 try:
@@ -760,24 +814,34 @@ async def openai_chat(request: Request):
             if gemini_spill_model:
                 backend = "gemini"
                 base_model = gemini_spill_model
-                backend_reason = "agy_queue_full"
+                backend_reason = "agy_queue_full" if queue_full else "agy_unavailable"
                 trace["backend"] = backend
                 trace["resolved_model"] = base_model
                 trace["backend_reason"] = backend_reason
-                log(f"[{trace_id}] Agy queue full; spilling untagged request to Gemini Web", "API")
-                future = submit_gemini_request(base_model)
+                log(
+                    f"[{trace_id}] Agy {'queue full' if queue_full else 'became unavailable'}; "
+                    "spilling untagged request to Gemini Web",
+                    "API",
+                )
+                try:
+                    future = submit_gemini_request(base_model)
+                except Exception as dispatch_exc:
+                    raise gemini_dispatch_unavailable(dispatch_exc) from dispatch_exc
             else:
                 cleanup_image_paths()
                 trace["status"] = "rejected"
                 trace["error"] = str(exc)
                 trace["finished_at"] = datetime.now(timezone.utc).isoformat()
                 raise HTTPException(
-                    status_code=429,
+                    status_code=429 if queue_full else 503,
                     detail=str(exc),
-                    headers={"Retry-After": "5"},
+                    headers={"Retry-After": "5"} if queue_full else None,
                 ) from exc
     else:
-        future = submit_gemini_request(base_model)
+        try:
+            future = submit_gemini_request(base_model)
+        except Exception as dispatch_exc:
+            raise gemini_dispatch_unavailable(dispatch_exc) from dispatch_exc
 
     if respond_async:
         job: Dict[str, Any] = {
@@ -833,6 +897,7 @@ async def openai_chat(request: Request):
 
     if not result["success"]:
         timed_out = bool(result.get("timed_out"))
+        backend_unavailable = bool(result.get("backend_unavailable"))
         trace["status"] = "timeout" if timed_out else "failed"
         trace["error"] = result.get("error")
         trace["queue_wait_ms"] = result.get("queue_wait_ms")
@@ -840,7 +905,8 @@ async def openai_chat(request: Request):
         trace["effective_thinking_level"] = result.get("effective_thinking_level")
         trace["request_logs"] = result.get("request_logs") or []
         trace["finished_at"] = datetime.now(timezone.utc).isoformat()
-        raise HTTPException(status_code=504 if timed_out else 500, detail=result.get("error"))
+        status_code = 504 if timed_out else (503 if backend_unavailable else 500)
+        raise HTTPException(status_code=status_code, detail=result.get("error"))
 
     content = result["response"] or ""
     completion_tokens_est = estimate_text_tokens(content)
@@ -907,7 +973,6 @@ async def health(response: Response):
     gemini_active = bool(worker_pool and worker_pool._initialized and worker_pool._active_request)
     queued_requests = int(getattr(worker_pool, "_queued_requests", 0) or 0) if worker_pool else 0
     browser_state = getattr(worker_pool, "_browser_state", "unavailable") if worker_pool else "unavailable"
-    pool_ready = bool(worker_pool and worker_pool._initialized)
     gemini_ready = gemini_backend_ready() and (
         ready_workers > 0
         or gemini_active

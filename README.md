@@ -115,7 +115,7 @@ browser worker. It starts one fresh Antigravity print-mode conversation per API
 request. Up to three requests run in parallel by default; additional requests
 wait in a bounded queue. Set `AGY_MAX_CONCURRENCY` to change the parallel limit
 from 1 to 8, and `AGY_MAX_QUEUE` to change the waiting limit. The defaults are 3
-and 24. Queue wait counts against the request time budget, so a stale queued
+and 9. Queue wait counts against the request time budget, so a stale queued
 request does not start a new model call after its caller budget is exhausted.
 
 The API discovers current Antigravity model IDs with `agy models`. A caller can
@@ -127,8 +127,8 @@ IDs define their own reasoning behavior. The API does not pass `--effort`, since
 some Antigravity models reject that flag.
 
 All CLI processes run from one sterile runtime workspace with `--sandbox` and
-slash-command expansion disabled. The workspace contains only two immutable API
-agent definitions: one with no tools and one with search/read tools. CLI log
+slash-command expansion disabled. The workspace contains only two static API
+agent definitions: one with no tools and one with web search only. CLI log
 output is sent to the OS null device so request logs are never persisted. Prompts are
 never put on the Windows command line or written to `prompt.txt`; every request
 is one NDJSON user event over stdin with `--input-format stream-json`. This also
@@ -137,23 +137,24 @@ pipes use UTF-8 explicitly so non-ASCII prompts do not depend on the Windows
 process code page.
 
 Normal requests use the tiny `api-model` agent with no tools. `use_search: true`
-uses the separate `api-search` agent with only `search_web` and
-`read_url_content`. Each CLI
+uses the separate `api-search` agent with only `search_web`. Each CLI
 process also receives session-only `--settings` that override the user's global
 Antigravity preferences: permissions use `request-review`; writes, commands,
 unsandboxed execution, MCP, and browser actuation are denied; G1 credit fallback
 is disabled; `modelProvider` is reset to the signed-in Antigravity default so a
-personal `GEMINI_API_KEY` provider cannot silently change billing; and only URL
-reads are allowed for search-enabled requests. The custom agent itself exposes
+personal `GEMINI_API_KEY` provider cannot silently change billing; and arbitrary
+URL reads are denied even for search-enabled requests. The custom agents expose
 no local-file tools. The user's persistent Antigravity settings are not modified.
+Headless stream-json calls do not use interactive prompt history, so the API does
+not override `historySize` or trim the user's normal CLI history.
+Personal status-line and terminal-title scripts are disabled for API sessions so
+headless calls cannot execute decorative shell commands from CLI preferences.
 
-At startup, the Agy backend also verifies that no active global Antigravity
-hooks or enabled plugins can inject behavior outside this API policy. Disabled
-hooks/plugins are allowed. If an active global hook or enabled plugin is found,
-only the Agy backend is marked unavailable and diagnostics report the reason;
-Gemini Web can continue serving requests. Global MCP configuration is not
-inherited by the API agent because MCP tools are not exposed and `mcp(*)` is
-denied by the session policy.
+The custom API agents explicitly set `inheritCustomizations: false` and
+`inheritMcp: false`, with no skills. This keeps inherited global/workspace
+rules, skills, hooks, and MCP configuration out of API conversations without
+requiring the user's normal Antigravity setup to be disabled. MCP tool use is
+also denied by the session policy.
 
 Antigravity output is read from `--output-format stream-json`; only the final
 `result` event becomes the API response. When Antigravity reports token usage, the OpenAI-style
@@ -163,7 +164,7 @@ handle them.
 
 Tool events are audited before a response is accepted. A normal request fails
 if Antigravity attempts any tool. A `use_search: true` request fails if it tries
-anything outside the search/read allowlist or if `search_web` does not complete
+anything outside the search allowlist or if `search_web` does not complete
 successfully. Successful tool names are retained in request diagnostics.
 
 For a request with `fallback_thinking_level`, Antigravity retries only when the

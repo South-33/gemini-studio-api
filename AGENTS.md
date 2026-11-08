@@ -24,24 +24,28 @@ This is the project's AGENTS.md
 - A healthy Agy backend must not wait for Gemini Web warmup before the API starts
   serving. Warm Gemini Web in the background when Agy is ready; if Agy fails,
   Gemini Web remains the blocking startup fallback.
-- Antigravity processes share one sterile runtime workspace with immutable
-  `api-model` (no tools) and `api-search` (web search/read only) agents. Send
+- Antigravity processes share one sterile runtime workspace with static
+  `api-model` (no tools) and `api-search` (web search only) agents. Send
   CLI logs to the OS null device. Do not return to per-request workspaces:
   they pollute Agy's workspace conversation cache. Send prompts only through
   stream-json stdin; do not use command-line prompt transport or prompt files.
 - Force UTF-8 for Antigravity subprocess pipes. Windows may otherwise use a
   legacy code page and corrupt or reject non-ASCII prompts.
 - Override personal Antigravity settings per request with `--settings`. Normal
-  API calls get no tools; `use_search: true` gets only web search/read tools.
-  Deny writes, commands, unsandboxed execution, MCP, and browser actuation; do
-  not expose local-file tools to the custom API agent; keep G1 credit fallback
-  disabled.
-- Fail Agy initialization when active global Antigravity hooks or enabled
-  plugins are present; either can inject behavior outside the custom agent's
-  tool allowlist. Disabled hooks/plugins are safe to ignore.
+  API calls get no tools; `use_search: true` gets only `search_web`.
+  Deny writes, commands, arbitrary URL reads, unsandboxed execution, MCP, and
+  browser actuation; do not expose local-file tools to the custom API agent;
+  keep G1 credit fallback disabled.
+- Keep both API custom agents isolated with `inheritCustomizations: false`,
+  `inheritMcp: false`, and no skills. Do not make the API depend on the user's
+  global Antigravity customization state.
 - Keep Antigravity on the signed-in provider by overriding `modelProvider` to
   its default for API sessions; personal API-key provider settings must not
   silently change quota or billing behavior.
+- Do not set `historySize` for API sessions. Headless stream-json calls do not
+  need interactive history, and `historySize: 0` can clear shared CLI history.
+- Disable personal `statusLine` and `title` command scripts in per-request Agy
+  settings; headless API sessions must not execute CLI decoration hooks.
 - Treat `finished_reason: print_timeout` as failure even if the CLI reports
   `status: SUCCESS`; discard partial output. Refresh `agy models` once only for
   zero-token invalid-model failures on stable Gemini aliases, never exact IDs.
