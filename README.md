@@ -185,7 +185,9 @@ If all active Antigravity slots and the waiting queue are full, new `agy`
 requests are rejected immediately with HTTP 429 and `Retry-After: 5` instead of
 creating more CLI processes.
 
-## Install and production startup
+## Legacy Windows production startup
+
+South Server is now an Ubuntu host. Gemini Studio API is **not currently deployed there**, and the launcher still contains Windows-specific production behavior. The instructions below document the retired Windows deployment only; do not use `ops/windows/` on South Server or treat this section as current production state.
 
 ```powershell
 pip install -r requirements.txt
@@ -193,12 +195,12 @@ playwright install chromium
 powershell -ExecutionPolicy Bypass -File .\ops\windows\install_autostart.ps1
 ```
 
-The installer creates a `Gemini Studio API.lnk` shortcut in the signed-in user's
+The legacy installer creates a `Gemini Studio API.lnk` shortcut in the signed-in user's
 Explorer Startup folder. Windows auto-login starts `launcher.py` when the real
 desktop shell opens. `launcher.py` owns the API, headed Chromium, Cloudflare
 Quick Tunnel, and ngrok as one Windows process tree. Neither Task Scheduler nor
 the HKCU `Run` key is used for persistent production autostart: both were
-observed to relaunch the service during SSH maintenance on this host.
+observed to relaunch the service during SSH maintenance on the retired Windows host.
 
 The fixed ngrok URL is the control plane. `GET /v1/endpoint` on that URL
 publishes the current Cloudflare Quick Tunnel URL, which is the preferred data
@@ -212,7 +214,7 @@ launcher in the desktop session. That task is deleted immediately and is not a
 production autostart mechanism.
 The browser profile is stored in `.browser_session/` and must not be committed.
 
-Headed Chromium needs an interactive desktop. The production host is configured
+Headed Chromium needs an interactive desktop. The retired Windows host was configured
 to provide that desktop automatically after reboot. After five minutes without
 API requests, Chromium closes completely; the next request starts it again with
 the same persistent profile. If an RDP disconnect suspends the browser, run

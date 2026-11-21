@@ -2,13 +2,10 @@ This is the project's AGENTS.md
 
 # Project instructions
 
-- Production is the Windows host reached through SSH alias `southserver`.
-- The server's visible identity is `SouthServer`. The existing Windows login
-  name/profile path (`nyxy`, `C:\\Users\\nyxy`) is intentionally retained as
-  internal legacy state because the signed-in browser, SSH, RDP, and task state
-  already depend on that SID/profile. Do not rename or migrate the profile just
-  for cosmetic consistency.
-- Develop locally, commit and push, then deploy on production with Git only.
+- The current server is **South Server**, an Ubuntu host reached through SSH alias `southserver` with Linux user `southserver`.
+- This repository is not currently deployed on South Server. The previous Windows/`nyxy` production deployment is retired; do not treat its profile, RDP, Explorer Startup, Task Scheduler, or `ops/windows/` instructions as current server state.
+- The launcher still contains Windows-specific production behavior. Do not claim a Linux production deployment until that path is explicitly ported and validated on South Server.
+- Develop locally and use Git for any future South Server deployment.
 - The API has one queued Gemini Web worker. Do not add provider abstractions or
   multiple workers.
 - Antigravity is an explicit second execution backend, selected per request with
@@ -70,17 +67,10 @@ This is the project's AGENTS.md
   or other low-resource modes because Gemini can render incompletely.
 - `.browser_session/` and `logs/` are private runtime state and must not be
   committed.
-- Production autostart lives in the signed-in user's Explorer Startup folder as
-  `Gemini Studio API.lnk` and starts `launcher.py` with the interactive desktop.
-  Do not move it back to Task Scheduler or HKCU `Run`: both were observed to
-  relaunch the headed browser during SSH maintenance on this host. Keep the
-  launcher mutex in the Windows `Global\` namespace as a second single-owner
-  guard across sessions.
+- `ops/windows/` and the Explorer Startup behavior are retained only as legacy Windows deployment code. They are not the South Server startup mechanism.
 - Public transport uses two tunnels to the same local API: Cloudflare Quick
   Tunnel is the preferred data plane and the fixed ngrok domain is the control
   plane plus emergency fallback. `GET /v1/endpoint` on ngrok publishes the
   current `trycloudflare.com` URL. Quick Tunnel URLs are runtime state and must
   never be hardcoded into callers or committed.
-- `ops/windows/install_autostart.ps1` may use a transient interactive bootstrap
-  task when invoked from SSH. It must be deleted immediately; persistent
-  autostart remains only the Explorer Startup shortcut.
+- Do not run `ops/windows/install_autostart.ps1` on South Server.
