@@ -1,559 +1,237 @@
 import asyncio
+import json
+import stat
+import tempfile
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-from worker_pool import (
-    FALLBACK_PRIMARY_ATTEMPT_TIMEOUT_SECONDS,
-    REQUEST_TOTAL_BUDGET_SECONDS,
-    WorkerPool,
-)
+from worker_pool import WorkerPool
+
+
+TRANSIENT = "I'm having a hard time fulfilling your request. Can I help with something else instead?"
 
 
 class FakeWorker:
-    def __init__(self, results=None, prepare_ok=True, native_retry_result=None):
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
         self._initialized = True
         self._generation_in_progress = False
-        self._results = list(results or [])
-        self.active = 0
-        self.max_active = 0
-        self.calls = 0
-        self.prepare_calls = 0
-        self.ready = True
-        self.started_ready = []
-        self.prepare_ok = prepare_ok
-        self.configuration_results = []
-        self.diagnostic_reasons = []
-        self.thinking_levels = []
-        self.native_retry_result = native_retry_result
-        self.native_retry_calls = 0
+        self._current_selected_model = None
+        self._current_selected_thinking_level = None
 
-    async def ensure_configuration(self, *_args, **_kwargs):
-        if self.configuration_results:
-            return self.configuration_results.pop(0)
-        return True, False
-
-    async def send_message(self, *_args, **_kwargs):
-        self.thinking_levels.append(_args[2] if len(_args) > 2 else None)
-        self.started_ready.append(self.ready)
-        self.ready = False
-        self.calls += 1
-        self.active += 1
-        self.max_active = max(self.max_active, self.active)
-        await asyncio.sleep(0.01)
-        self.active -= 1
-        if self._results:
-            return self._results.pop(0)
-        return {"success": True, "response": "ok"}
-
-    def get_request_log(self):
-        return []
-
-    async def _save_diagnostic_artifacts(self, reason, request_id=None):
-        self.diagnostic_reasons.append((reason, request_id))
+    async def send_message(self, prompt, model, thinking, use_search, images, request_id=None):
+        self.calls.append((prompt, model, thinking, use_search, tuple(images or []), request_id))
+        return self.responses.pop(0)
 
     async def retry_last_response_native(self):
-        self.native_retry_calls += 1
-        return self.native_retry_result
+        return None
 
-    async def prepare_next_request(self):
-        self.prepare_calls += 1
-        self.ready = self.prepare_ok
-        return self.prepare_ok
+    async def _save_diagnostic_artifacts(self, *args, **kwargs):
+        return None
 
     async def close(self):
-        self._initialized = False
+        return None
 
 
 class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
-    def setUp(self):
-        patcher = patch("worker_pool.write_request_log", return_value="request_test.json")
-        self.request_logger = patcher.start()
-        self.addCleanup(patcher.stop)
+    def test_runtime_browser_detection_handles_chromium_rewritten_argv(self):
+        prefix = f"--user-data-dir={WorkerPool._state_dir() / 'runtime-test'}"
+        rewritten = f"/chrome --no-sandbox {prefix} --remote-debugging-port=0".encode()
+        nul_argv = b"/chrome\0--no-sandbox\0" + prefix.encode() + b"\0"
+        child = rewritten + b" --type=renderer"
 
-    async def test_concurrent_requests_are_serialized(self):
+        self.assertTrue(WorkerPool._is_runtime_browser_command(rewritten))
+        self.assertTrue(WorkerPool._is_runtime_browser_command(nul_argv))
+        self.assertFalse(WorkerPool._is_runtime_browser_command(child))
+
+    async def test_auth_required_browser_is_eventually_released(self):
+        pool = WorkerPool(idle_browser_seconds=60, idle_poll_seconds=0.01)
+        await pool.init()
+        pool._browser_state = "auth_required"
+        pool._last_activity = time.time() - 901
+        pool._close_browser_context = AsyncMock()
+        for _ in range(50):
+            if pool._close_browser_context.await_count:
+                break
+            await asyncio.sleep(0.01)
+        pool._close_browser_context.assert_awaited()
+        await pool.close()
+
+    def test_linux_browser_args_avoid_unstable_gpu_path(self):
+        args = WorkerPool._browser_args()
+        self.assertIn("--ozone-platform=x11", args)
+        self.assertIn("--disable-gpu", args)
+        self.assertIn("--window-size=1280,720", args)
+        self.assertNotIn("--start-maximized", args)
+        self.assertNotIn("--disable-crashpad-for-testing", args)
+        self.assertIn("--disable-background-mode", args)
+        self.assertIn("--disable-background-timer-throttling", args)
+
+    def test_runtime_profiles_are_disposable_and_unique(self):
+        with tempfile.TemporaryDirectory() as raw:
+            state_dir = Path(raw)
+            with patch.object(WorkerPool, "_state_dir", return_value=state_dir):
+                first = WorkerPool._new_runtime_profile()
+                second = WorkerPool._new_runtime_profile()
+            self.assertNotEqual(first, second)
+            self.assertTrue(first.name.startswith("runtime-"))
+            self.assertTrue(second.name.startswith("runtime-"))
+            self.assertEqual(first.parent, state_dir)
+            self.assertEqual(second.parent, state_dir)
+
+    async def test_auth_state_is_saved_and_loaded_separately_from_runtime_profile(self):
+        class FakeSession:
+            def __init__(self):
+                self.set_cookies = None
+
+            async def send(self, method, params=None):
+                if method == "Storage.getCookies":
+                    return {
+                        "cookies": [
+                            {
+                                "name": "SID",
+                                "value": "secret",
+                                "domain": ".google.com",
+                                "path": "/",
+                                "secure": True,
+                                "httpOnly": True,
+                                "sameSite": "Lax",
+                                "expires": 9999999999,
+                                "size": 100,
+                            },
+                            {
+                                "name": "other",
+                                "value": "drop",
+                                "domain": ".example.com",
+                                "path": "/",
+                            },
+                        ]
+                    }
+                if method == "Storage.setCookies":
+                    self.set_cookies = params["cookies"]
+                    return {}
+                raise AssertionError(method)
+
+        with tempfile.TemporaryDirectory() as raw:
+            state_dir = Path(raw)
+            with patch.object(WorkerPool, "_state_dir", return_value=state_dir):
+                pool = WorkerPool()
+                pool.browser_cdp_session = FakeSession()
+                await pool._save_auth_state()
+                auth_state = WorkerPool._auth_state_path()
+                self.assertTrue(auth_state.is_file())
+                self.assertEqual(
+                    stat.S_IMODE(auth_state.stat().st_mode),
+                    0o600,
+                )
+                payload = json.loads(auth_state.read_text(encoding="utf-8"))
+                self.assertEqual([cookie["name"] for cookie in payload["cookies"]], ["SID"])
+                self.assertNotIn("size", payload["cookies"][0])
+
+                restored = FakeSession()
+                pool.browser_cdp_session = restored
+                await pool._load_auth_state()
+                self.assertEqual(restored.set_cookies, payload["cookies"])
+
+    async def test_clipboard_permission_uses_browser_cdp_session(self):
+        class FakeSession:
+            def __init__(self):
+                self.calls = []
+
+            async def send(self, method, params=None):
+                self.calls.append((method, params))
+                return {}
+
         pool = WorkerPool()
-        worker = FakeWorker()
-        pool.workers = [worker]
-        pool._initialized = True
-
-        first, second = await asyncio.gather(
-            pool.send_message("one", request_id="one"),
-            pool.send_message("two", request_id="two"),
-        )
-
-        self.assertTrue(first["success"])
-        self.assertTrue(second["success"])
-        self.assertEqual(worker.max_active, 1)
-        self.assertEqual(worker.started_ready, [True, True])
-        self.assertEqual(worker.prepare_calls, 2)
-        self.assertEqual(pool._queued_requests, 0)
-
-    async def test_success_prepares_next_clean_chat_before_returning(self):
-        pool = WorkerPool()
-        worker = FakeWorker()
-        pool.workers = [worker]
-        pool._initialized = True
-
-        result = await pool.send_message("one", request_id="one")
-
-        self.assertTrue(result["success"])
-        self.assertTrue(result["ready_for_next_request"])
-        self.assertEqual(worker.prepare_calls, 1)
-        self.assertTrue(pool._last_ready_reset["ok"])
-
-    async def test_stalled_generation_is_retried_on_fresh_tab(self):
-        pool = WorkerPool()
-        worker = FakeWorker([
-            {"success": False, "error": "Stalled generation: no output for 150s"},
-            {"success": True, "response": "recovered"},
-        ])
-        pool.workers = [worker]
-        pool._initialized = True
-        pool._recreate_worker = AsyncMock(return_value=True)
-        pool._prepare_request_configuration = AsyncMock(return_value=(True, None))
-
-        result = await pool.send_message("hello", request_id="stall-retry")
-
-        self.assertTrue(result["success"])
-        self.assertEqual(result["response"], "recovered")
-        self.assertEqual(result["attempts"], 2)
-        self.assertEqual(worker.calls, 2)
-        pool._recreate_worker.assert_awaited_once()
-        self.assertTrue(self.request_logger.call_args_list[0].kwargs["will_retry"])
-
-    async def test_arbitrary_transport_failure_is_not_resent_inside_pool(self):
-        pool = WorkerPool()
-        worker = FakeWorker([
-            {"success": False, "error": "fetch failed"},
-            {"success": True, "response": "unexpected retry"},
-        ])
-        pool.workers = [worker]
-        pool._initialized = True
-        pool._recreate_worker = AsyncMock(return_value=True)
-
-        result = await pool.send_message("hello", request_id="transport-failure")
-
-        self.assertFalse(result["success"])
-        self.assertEqual(worker.calls, 1)
-        pool._recreate_worker.assert_not_awaited()
-
-    async def test_empty_terminal_generation_is_retried_on_a_fresh_chat(self):
-        pool = WorkerPool()
-        worker = FakeWorker([
-            {"success": False, "error": "Gemini generation ended without a response"},
-            {"success": True, "response": "recovered"},
-        ])
-        pool.workers = [worker]
-        pool._initialized = True
-        pool._recreate_worker = AsyncMock(return_value=True)
-        pool._prepare_request_configuration = AsyncMock(return_value=(True, None))
-
-        result = await pool.send_message("hello", request_id="empty-terminal")
-
-        self.assertTrue(result["success"])
-        self.assertEqual(result["response"], "recovered")
-        self.assertEqual(result["attempts"], 2)
+        session = FakeSession()
+        pool.browser_cdp_session = session
+        await pool._grant_clipboard_permissions()
         self.assertEqual(
-            worker.diagnostic_reasons,
-            [("transient_generation_failure", "empty-terminal")],
+            [params["permission"]["name"] for _, params in session.calls],
+            ["clipboard-read", "clipboard-write"],
         )
-        pool._recreate_worker.assert_awaited_once()
-        self.assertEqual(pool._prepare_request_configuration.await_count, 2)
-        self.assertTrue(self.request_logger.call_args_list[0].kwargs["will_retry"])
 
-    async def test_dirty_preflight_is_retried_on_a_fresh_chat(self):
+    async def test_failed_ready_reset_keeps_pool_recoverable(self):
         pool = WorkerPool()
-        worker = FakeWorker([
-            {"success": False, "error": "Previous generation is still active before send"},
-            {"success": True, "response": "recovered"},
-        ])
+        await pool.init()
+        worker = FakeWorker([])
+        worker.prepare_next_request = AsyncMock(return_value=False)
         pool.workers = [worker]
-        pool._initialized = True
-        pool._recreate_worker = AsyncMock(return_value=True)
-        pool._prepare_request_configuration = AsyncMock(return_value=(True, None))
-
-        result = await pool.send_message("hello", request_id="dirty-preflight")
-
-        self.assertTrue(result["success"])
-        self.assertEqual(result["response"], "recovered")
-        self.assertEqual(result["attempts"], 2)
-        pool._recreate_worker.assert_awaited_once()
-        self.assertEqual(pool._prepare_request_configuration.await_count, 2)
-        self.assertTrue(self.request_logger.call_args_list[0].kwargs["will_retry"])
-
-    @patch("worker_pool.REQUEST_TOTAL_BUDGET_SECONDS", 0.005)
-    async def test_total_request_budget_prevents_retry_outliving_client(self):
-        pool = WorkerPool()
-        worker = FakeWorker([
-            {"success": False, "error": "Gemini generation ended without a response"},
-            {"success": True, "response": "unexpected retry"},
-        ])
-        pool.workers = [worker]
-        pool._initialized = True
-        pool._recreate_worker = AsyncMock(return_value=True)
-
-        result = await pool.send_message("hello", request_id="budget")
-
-        self.assertFalse(result["success"])
-        self.assertIn("request budget exhausted", result["error"].lower())
-        self.assertEqual(worker.calls, 1)
-        pool._recreate_worker.assert_not_awaited()
-
-    async def test_unrecoverable_ready_reset_marks_pool_unavailable(self):
-        pool = WorkerPool()
-        worker = FakeWorker(prepare_ok=False)
-        pool.workers = [worker]
-        pool._initialized = True
+        pool._browser_state = "warm"
         pool._recreate_worker = AsyncMock(return_value=False)
+        pool._close_browser_context = AsyncMock()
 
-        result = await pool.send_message("hello", request_id="reset-failure")
+        self.assertFalse(await pool._ensure_ready_after_request("test"))
+        self.assertTrue(pool._initialized)
+        pool._close_browser_context.assert_awaited_once_with("error", "test")
+        await pool.close()
 
-        self.assertTrue(result["success"])
-        self.assertFalse(result["ready_for_next_request"])
-        self.assertFalse(pool._initialized)
-
-    async def test_generic_gemini_refusal_is_retried_on_a_fresh_chat(self):
+    async def test_init_is_truly_lazy(self):
         pool = WorkerPool()
+        self.assertTrue(await pool.init())
+        self.assertIsNone(pool.playwright)
+        self.assertIsNone(pool.context)
+        self.assertEqual(pool._browser_state, "stopped")
+        await pool.close()
+
+    async def test_retry_keeps_same_model_and_thinking(self):
+        pool = WorkerPool()
+        await pool.init()
         worker = FakeWorker([
-            {
-                "success": True,
-                "response": "I'm having a hard time fulfilling your request. Can I help with something else instead?",
-            },
-            {"success": True, "response": "expected"},
+            {"success": True, "response": TRANSIENT},
+            {"success": True, "response": "done"},
         ])
         pool.workers = [worker]
-        pool._initialized = True
-        pool._recreate_worker = AsyncMock(return_value=True)
+        pool._browser_state = "warm"
+        pool._ensure_browser_ready = AsyncMock(return_value=True)
         pool._prepare_request_configuration = AsyncMock(return_value=(True, None))
-
-        result = await pool.send_message("hello", request_id="transient-refusal")
-
-        self.assertTrue(result["success"])
-        self.assertEqual(result["response"], "expected")
-        self.assertEqual(result["attempts"], 2)
-        self.assertEqual(worker.diagnostic_reasons, [("transient_refusal", "transient-refusal")])
-        pool._recreate_worker.assert_awaited_once()
-        self.assertEqual(pool._prepare_request_configuration.await_count, 2)
-        self.assertEqual(self.request_logger.call_count, 2)
-        self.assertIn("hard time fulfilling", self.request_logger.call_args_list[0].kwargs["result"]["response"])
-        self.assertTrue(self.request_logger.call_args_list[0].kwargs["will_retry"])
-        self.assertEqual(self.request_logger.call_args_list[1].kwargs["attempt"], 2)
-
-    async def test_generic_refusal_can_recover_with_native_retry_without_resend(self):
-        pool = WorkerPool()
-        worker = FakeWorker(
-            [{"success": True, "response": "Sorry, something went wrong. Please try your request again."}],
-            native_retry_result={
-                "success": True,
-                "response": "recovered in place",
-                "raw_response": "recovered in place",
-                "native_retry": True,
-            },
-        )
-        pool.workers = [worker]
-        pool._initialized = True
         pool._recreate_worker = AsyncMock(return_value=True)
-
-        result = await pool.send_message("hello", request_id="native-retry-recovery")
-
-        self.assertTrue(result["success"])
-        self.assertEqual(result["response"], "recovered in place")
-        self.assertEqual(result["attempts"], 1)
-        self.assertEqual(worker.calls, 1)
-        self.assertEqual(worker.native_retry_calls, 1)
-        pool._recreate_worker.assert_not_awaited()
-
-    async def test_transient_medium_failure_promotes_retry_to_high(self):
-        pool = WorkerPool()
-        worker = FakeWorker([
-            {
-                "success": True,
-                "response": "Sorry, something went wrong. Please try your request again.",
-            },
-            {"success": True, "response": "recovered"},
-        ])
-        pool.workers = [worker]
-        pool._initialized = True
-        pool._recreate_worker = AsyncMock(return_value=True)
-        pool._prepare_request_configuration = AsyncMock(return_value=(True, None))
-
-        result = await pool.send_message(
-            "hello",
-            model="flash",
-            thinking_level="Medium",
-            fallback_thinking_level="High",
-            request_id="medium-to-high",
-        )
-
-        self.assertTrue(result["success"])
-        self.assertEqual(result["effective_thinking_level"], "High")
-        self.assertEqual(worker.thinking_levels, ["Medium", "High"])
-        self.assertEqual(
-            pool._prepare_request_configuration.call_args_list[1].args[:2],
-            ("flash", "High"),
-        )
-        self.assertEqual(self.request_logger.call_args_list[0].kwargs["thinking_level"], "Medium")
-        self.assertEqual(self.request_logger.call_args_list[1].kwargs["thinking_level"], "High")
-
-    def test_medium_fallback_window_allows_normal_translation_latency(self):
-        self.assertGreaterEqual(FALLBACK_PRIMARY_ATTEMPT_TIMEOUT_SECONDS, 180)
-        self.assertLess(FALLBACK_PRIMARY_ATTEMPT_TIMEOUT_SECONDS, REQUEST_TOTAL_BUDGET_SECONDS)
-
-    async def test_fallback_request_can_use_second_high_retry(self):
-        pool = WorkerPool()
-        worker = FakeWorker([
-            {
-                "success": True,
-                "response": "Sorry, something went wrong. Please try your request again.",
-            },
-            {
-                "success": True,
-                "response": "I encountered an error doing what you asked. Could you try again?",
-            },
-            {"success": True, "response": "recovered on second high"},
-        ])
-        pool.workers = [worker]
-        pool._initialized = True
-        pool._recreate_worker = AsyncMock(return_value=True)
-        pool._prepare_request_configuration = AsyncMock(return_value=(True, None))
-
-        result = await pool.send_message(
-            "hello",
-            model="flash",
-            thinking_level="Medium",
-            fallback_thinking_level="High",
-            request_id="bounded-fallback",
-        )
-
-        self.assertTrue(result["success"])
-        self.assertEqual(result["response"], "recovered on second high")
-        self.assertEqual(result["attempts"], 3)
-        self.assertEqual(result["effective_thinking_level"], "High")
-        self.assertEqual(worker.calls, 3)
-        self.assertEqual(worker.thinking_levels, ["Medium", "High", "High"])
-
-    async def test_fallback_request_stops_after_three_browser_attempts(self):
-        pool = WorkerPool()
-        refusal = {
-            "success": True,
-            "response": "Sorry, something went wrong. Please try your request again.",
-        }
-        worker = FakeWorker([
-            refusal,
-            refusal,
-            refusal,
-            {"success": True, "response": "unexpected-fourth-attempt"},
-        ])
-        pool.workers = [worker]
-        pool._initialized = True
-        pool._recreate_worker = AsyncMock(return_value=True)
-        pool._prepare_request_configuration = AsyncMock(return_value=(True, None))
-
-        result = await pool.send_message(
-            "hello",
-            model="flash",
-            thinking_level="Medium",
-            fallback_thinking_level="High",
-            request_id="bounded-fallback-limit",
-        )
-
-        self.assertFalse(result["success"])
-        self.assertEqual(result["attempts"], 3)
-        self.assertEqual(result["effective_thinking_level"], "High")
-        self.assertEqual(worker.calls, 3)
-        self.assertEqual(worker.thinking_levels, ["Medium", "High", "High"])
-
-    async def test_failed_retry_recreation_still_runs_final_ready_reset(self):
-        pool = WorkerPool()
-        worker = FakeWorker([
-            {"success": False, "error": "Gemini fallback attempt timed out after 60s"},
-        ])
-        pool.workers = [worker]
-        pool._initialized = True
-        pool._recreate_worker = AsyncMock(return_value=False)
         pool._ensure_ready_after_request = AsyncMock(return_value=True)
 
         result = await pool.send_message(
-            "hello",
-            model="flash",
+            "review",
+            model="neon",
             thinking_level="Medium",
-            fallback_thinking_level="High",
-            request_id="fallback-timeout-cleanup",
+            request_id="r1",
         )
-
-        self.assertFalse(result["success"])
-        pool._recreate_worker.assert_awaited_once()
-        pool._ensure_ready_after_request.assert_awaited_once_with(
-            "request fallback-timeout-cleanup failed"
-        )
-        self.assertEqual(result["attempts"], 1)
-        self.assertEqual(result["effective_thinking_level"], "Medium")
-        self.assertEqual(worker.thinking_levels, ["Medium"])
-
-    async def test_request_log_disk_failure_does_not_fail_completion(self):
-        self.request_logger.side_effect = OSError("disk unavailable")
-        pool = WorkerPool()
-        pool.workers = [FakeWorker()]
-        pool._initialized = True
-
-        result = await pool.send_message("hello", request_id="disk-error")
-
         self.assertTrue(result["success"])
-        self.assertEqual(result["response"], "ok")
+        self.assertEqual([call[1:3] for call in worker.calls], [
+            ("neon", "Medium"),
+            ("neon", "Medium"),
+        ])
+        await pool.close()
 
-    async def test_request_log_receives_full_context_and_timing(self):
+    async def test_requests_are_serialized(self):
         pool = WorkerPool()
-        pool.workers = [FakeWorker()]
-        pool._initialized = True
-        context = {
-            "project": "borderclash",
-            "client": "borderclash-convex",
-            "raw_model": "flash",
-            "message_count": 1,
-            "image_count": 0,
-            "prompt_tokens_est": 12,
-        }
+        await pool.init()
+        active = 0
+        max_active = 0
 
-        result = await pool.send_message(
-            "full prompt",
-            model="flash",
-            thinking_level="Medium",
-            use_search=True,
-            request_id="trace-me",
-            request_context=context,
-        )
+        class SlowWorker(FakeWorker):
+            async def send_message(self, *args, **kwargs):
+                nonlocal active, max_active
+                active += 1
+                max_active = max(max_active, active)
+                await asyncio.sleep(0.02)
+                active -= 1
+                return {"success": True, "response": "ok"}
 
-        self.assertTrue(result["success"])
-        kwargs = self.request_logger.call_args.kwargs
-        self.assertEqual(kwargs["prompt"], "full prompt")
-        self.assertEqual(kwargs["request_context"], context)
-        self.assertEqual(kwargs["model"], "flash")
-        self.assertEqual(kwargs["thinking_level"], "Medium")
-        self.assertTrue(kwargs["use_search"])
-        self.assertTrue(kwargs["search_instruction_present"])
-        self.assertGreaterEqual(kwargs["attempt_duration_ms"], 0)
-        self.assertIn("attempt_started_at", kwargs)
-        self.assertIn("attempt_finished_at", kwargs)
-
-    async def test_model_family_change_recreates_tab_before_send(self):
-        pool = WorkerPool()
-        first = FakeWorker()
-        second = FakeWorker()
-        first.configuration_results = [(True, True)]
-        second.configuration_results = [(True, False), (True, False)]
-        pool.workers = [first]
-        pool._initialized = True
-
-        async def recreate(_reason):
-            pool.workers = [second]
-            return True
-
-        pool._recreate_worker = AsyncMock(side_effect=recreate)
-
-        result = await pool.send_message(
-            "hello",
-            model="flash",
-            thinking_level="Medium",
-            request_id="switch-model",
-        )
-
-        self.assertTrue(result["success"])
-        self.assertEqual(first.calls, 0)
-        self.assertEqual(second.calls, 1)
-        pool._recreate_worker.assert_awaited_once()
-
-    async def test_cold_browser_warms_before_next_request(self):
-        pool = WorkerPool()
-        pool._initialized = True
-        pool._browser_state = "cold"
-        worker = FakeWorker()
-
-        async def warm(_reason):
-            pool.workers = [worker]
-            pool._browser_state = "warm"
-            return True
-
-        pool._warm_browser = AsyncMock(side_effect=warm)
-
-        result = await pool.send_message("hello", request_id="wake")
-
-        self.assertTrue(result["success"])
-        self.assertEqual(worker.calls, 1)
-        pool._warm_browser.assert_awaited_once()
-
-    async def test_concurrent_cold_requests_share_one_browser_warmup(self):
-        pool = WorkerPool()
-        pool._initialized = True
-        pool._browser_state = "cold"
-        worker = FakeWorker()
-
-        async def warm(_reason):
-            await asyncio.sleep(0.01)
-            pool.workers = [worker]
-            pool._browser_state = "warm"
-            return True
-
-        pool._warm_browser = AsyncMock(side_effect=warm)
-
-        first, second = await asyncio.gather(
-            pool.send_message("one", request_id="cold-one"),
-            pool.send_message("two", request_id="cold-two"),
-        )
-
-        self.assertTrue(first["success"])
-        self.assertTrue(second["success"])
-        self.assertEqual(worker.max_active, 1)
-        self.assertEqual(pool._warm_browser.await_count, 1)
-
-    async def test_idle_watchdog_closes_browser_without_disabling_pool(self):
-        pool = WorkerPool(idle_browser_seconds=0.01, idle_poll_seconds=0.01)
-        pool._initialized = True
+        worker = SlowWorker([])
+        pool.workers = [worker]
         pool._browser_state = "warm"
-        pool.workers = [FakeWorker()]
-        context = AsyncMock()
-        pool.context = context
-        pool._last_activity = time.time() - 1
+        pool._ensure_browser_ready = AsyncMock(return_value=True)
+        pool._prepare_request_configuration = AsyncMock(return_value=(True, None))
+        pool._ensure_ready_after_request = AsyncMock(return_value=True)
 
-        task = asyncio.create_task(pool._idle_watchdog())
-        await asyncio.sleep(0.12)
-        task.cancel()
-        with self.assertRaises(asyncio.CancelledError):
-            await task
-
-        self.assertTrue(pool._initialized)
-        self.assertEqual(pool._browser_state, "cold")
-        self.assertEqual(pool.workers, [])
-        context.close.assert_awaited_once()
-
-    async def test_idle_watchdog_does_not_close_with_a_queued_request(self):
-        pool = WorkerPool(idle_browser_seconds=0.01, idle_poll_seconds=0.01)
-        pool._initialized = True
-        pool._browser_state = "warm"
-        pool.workers = [FakeWorker()]
-        context = AsyncMock()
-        pool.context = context
-        pool._queued_requests = 1
-        pool._last_activity = time.time() - 1
-
-        task = asyncio.create_task(pool._idle_watchdog())
-        await asyncio.sleep(0.12)
-        task.cancel()
-        with self.assertRaises(asyncio.CancelledError):
-            await task
-
-        self.assertEqual(pool._browser_state, "warm")
-        context.close.assert_not_awaited()
-
-    def test_known_gemini_error_replies_are_transient(self):
-        for response in (
-            "I'm having a hard time fulfilling your request. Can I help with something else instead?",
-            "I'm having a hard time fulfilling your request. Can I help you with something else instead?",
-            "Sorry, something went wrong. Please try your request again.",
-            "I encountered an error doing what you asked. Could you try again?",
-            "I seem to be encountering an error. Can I try something else for you?",
-        ):
-            self.assertTrue(WorkerPool._is_transient_gemini_refusal(response))
+        await asyncio.gather(
+            pool.send_message("a", model="neon", thinking_level="Medium"),
+            pool.send_message("b", model="neon", thinking_level="Medium"),
+        )
+        self.assertEqual(max_active, 1)
+        await pool.close()
 
 
 if __name__ == "__main__":

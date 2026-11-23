@@ -3,29 +3,39 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import shutil
+import signal
+import subprocess
+import tempfile
 import time
-from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from playwright.async_api import Page, async_playwright
 
 from gemini_web import GeminiWebAutomation, log
-from request_log import write_request_log
 
-# Medium translation/repair requests can legitimately stream for two to three
-# minutes even when they complete cleanly. Give the default Medium attempt
-# enough time to finish before promoting to High, while preserving a bounded
-# 480s total logical-request budget for the fallback.
-FALLBACK_PRIMARY_ATTEMPT_TIMEOUT_SECONDS = 180
 REQUEST_TOTAL_BUDGET_SECONDS = 480
+BROWSER_CONNECT_TIMEOUT_SECONDS = 15
+AUTH_REQUIRED_IDLE_SECONDS = 900
+BROWSER_SCOPE_MEMORY_HIGH = "1536M"
+BROWSER_SCOPE_MEMORY_MAX = "2G"
+BROWSER_SCOPE_SWAP_MAX = "256M"
+BROWSER_SCOPE_TASKS_MAX = "512"
 
 
 class WorkerPool:
     """Serialize requests through one tab and recreate it after concrete failures."""
 
-    def __init__(self, idle_browser_seconds: float = 300, idle_poll_seconds: float = 10):
+    def __init__(self, idle_browser_seconds: float = 60, idle_poll_seconds: float = 5):
         self.playwright = None
+        self.browser = None
+        self.browser_process: subprocess.Popen | None = None
+        self.browser_scope_unit: str | None = None
+        self.browser_profile_dir: Path | None = None
+        self.browser_cdp_session = None
         self.context = None
         self.workers: List[GeminiWebAutomation] = []
         self._request_lock = asyncio.Lock()
@@ -51,63 +61,487 @@ class WorkerPool:
     def worker(self) -> Optional[GeminiWebAutomation]:
         return self.workers[0] if self.workers else None
 
-    async def init(self) -> bool:
-        """Start Playwright, warm one browser, and begin idle browser lifecycle."""
-        try:
-            self.playwright = await async_playwright().start()
-            self._initialized = True
-            if not await self._warm_browser("startup"):
-                raise RuntimeError("Gemini browser failed to initialize")
-            self._last_activity = time.time()
-            self._idle_task = asyncio.create_task(self._idle_watchdog())
-            return True
-        except Exception as exc:
-            log(f"Startup failed: {exc}", "Worker")
-            await self.close()
-            return False
+    async def init(self, cleanup_stale_browser: bool = False) -> bool:
+        """Initialize the pool without starting Chrome.
+
+        Gemini Studio API is normally idle. Starting Playwright and Chrome only
+        when a request arrives keeps the resident service small.
+        """
+        if cleanup_stale_browser:
+            await asyncio.to_thread(self._cleanup_stale_browser_processes)
+        self._initialized = True
+        self._last_activity = time.time()
+        self._idle_task = asyncio.create_task(self._idle_watchdog())
+        return True
 
     @staticmethod
     def _browser_args() -> List[str]:
         return [
             "--disable-blink-features=AutomationControlled",
-            "--start-maximized",
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-setuid-sandbox",
+            "--ozone-platform=x11",
+            "--disable-gpu",
+            "--window-size=1280,720",
+            "--disable-background-mode",
             "--disable-background-timer-throttling",
             "--disable-backgrounding-occluded-windows",
             "--disable-renderer-backgrounding",
             "--disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling,BatterySaverModeAvailability",
         ]
 
+    @staticmethod
+    def _browser_environment() -> dict[str, str]:
+        """Refresh desktop-session variables when Chromium is launched."""
+        environment = dict(os.environ)
+        if os.name != "posix":
+            return environment
+        try:
+            result = subprocess.run(
+                ["systemctl", "--user", "show-environment"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return environment
+        if result.returncode != 0:
+            return environment
+        wanted = {
+            "DISPLAY",
+            "XAUTHORITY",
+            "WAYLAND_DISPLAY",
+            "XDG_RUNTIME_DIR",
+            "DBUS_SESSION_BUS_ADDRESS",
+        }
+        for line in result.stdout.splitlines():
+            key, separator, value = line.partition("=")
+            if separator and key in wanted and value:
+                environment[key] = value
+        return environment
+
+    @staticmethod
+    def _state_dir() -> Path:
+        return Path(__file__).resolve().parent / ".browser_session"
+
+    @classmethod
+    def _auth_state_path(cls) -> Path:
+        return cls._state_dir() / "auth.json"
+
+    @classmethod
+    def _new_runtime_profile(cls) -> Path:
+        state_dir = cls._state_dir()
+        state_dir.mkdir(mode=0o700, exist_ok=True)
+        try:
+            state_dir.chmod(0o700)
+        except OSError:
+            pass
+        return Path(tempfile.mkdtemp(prefix="runtime-", dir=state_dir))
+
+    @staticmethod
+    def _scope_for_pid(pid: int) -> str | None:
+        try:
+            content = Path(f"/proc/{pid}/cgroup").read_text(encoding="utf-8")
+        except OSError:
+            return None
+        for line in content.splitlines():
+            cgroup_path = line.rsplit(":", 1)[-1].strip()
+            unit = Path(cgroup_path).name
+            if unit.endswith(".scope"):
+                return unit
+        return None
+
+    @classmethod
+    def _is_runtime_browser_command(cls, command: bytes) -> bool:
+        normalized = command.replace(b"\0", b" ")
+        profile_prefix = f"--user-data-dir={cls._state_dir() / 'runtime-'}".encode()
+        return profile_prefix in normalized and b" --type=" not in normalized
+
+    @classmethod
+    def _runtime_browser_pids(cls) -> list[int]:
+        pids: list[int] = []
+        proc = Path("/proc")
+        if not proc.exists():
+            return pids
+        for entry in proc.iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                command = (entry / "cmdline").read_bytes()
+            except OSError:
+                continue
+            if not cls._is_runtime_browser_command(command):
+                continue
+            pids.append(int(entry.name))
+        return pids
+
+    @staticmethod
+    def _stop_user_scope(unit: str) -> None:
+        try:
+            result = subprocess.run(
+                ["systemctl", "--user", "stop", unit],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=6,
+                check=False,
+            )
+            if result.returncode == 0:
+                return
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        try:
+            subprocess.run(
+                [
+                    "systemctl",
+                    "--user",
+                    "kill",
+                    "--kill-whom=all",
+                    "--signal=SIGKILL",
+                    unit,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    @classmethod
+    def _cleanup_stale_browser_processes(cls) -> None:
+        cleaned = 0
+        initial = cls._runtime_browser_pids()
+        for pid in initial:
+            scope = cls._scope_for_pid(pid)
+            if scope:
+                cls._stop_user_scope(scope)
+                cleaned += 1
+                continue
+            try:
+                os.killpg(pid, signal.SIGKILL)
+                cleaned += 1
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+
+        deadline = time.monotonic() + 6
+        remaining = cls._runtime_browser_pids()
+        while remaining and time.monotonic() < deadline:
+            time.sleep(0.1)
+            remaining = cls._runtime_browser_pids()
+
+        for pid in remaining:
+            try:
+                os.killpg(pid, signal.SIGKILL)
+                cleaned += 1
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+
+        if not cls._runtime_browser_pids():
+            state_dir = cls._state_dir()
+            for runtime_dir in state_dir.glob("runtime-*"):
+                if runtime_dir.is_dir():
+                    shutil.rmtree(runtime_dir, ignore_errors=True)
+        if cleaned:
+            log(f"Retired {cleaned} stale Chromium runtime(s)", "Worker")
+
+    @staticmethod
+    def _is_google_cookie(cookie: dict[str, Any]) -> bool:
+        domain = str(cookie.get("domain") or "").lstrip(".").lower()
+        return domain == "google.com" or domain.endswith(".google.com")
+
+    @staticmethod
+    def _cookie_param(cookie: dict[str, Any]) -> dict[str, Any]:
+        result = {
+            key: cookie[key]
+            for key in (
+                "name",
+                "value",
+                "domain",
+                "path",
+                "secure",
+                "httpOnly",
+                "sameSite",
+            )
+            if key in cookie
+        }
+        expires = cookie.get("expires")
+        if isinstance(expires, (int, float)) and expires > 0:
+            result["expires"] = expires
+        return result
+
+    async def _load_auth_state(self) -> None:
+        auth_state = self._auth_state_path()
+        if not auth_state.is_file() or not self.browser_cdp_session:
+            return
+        try:
+            payload = json.loads(auth_state.read_text(encoding="utf-8"))
+            cookies = payload.get("cookies") if isinstance(payload, dict) else None
+            if not isinstance(cookies, list):
+                raise ValueError("auth cookie file has no cookies array")
+            await self.browser_cdp_session.send(
+                "Storage.setCookies",
+                {"cookies": cookies},
+            )
+            log(f"Loaded {len(cookies)} saved Gemini auth cookie(s)", "Worker")
+        except Exception as exc:
+            log(f"Saved Gemini authentication state could not be loaded: {exc}", "Worker")
+
+    async def _save_auth_state(self) -> None:
+        if not self.browser_cdp_session:
+            return
+        auth_state = self._auth_state_path()
+        auth_state.parent.mkdir(mode=0o700, exist_ok=True)
+        temporary = auth_state.with_suffix(".tmp")
+        try:
+            response = await self.browser_cdp_session.send(
+                "Storage.getCookies",
+            )
+            cookies = [
+                self._cookie_param(cookie)
+                for cookie in response.get("cookies", [])
+                if isinstance(cookie, dict) and self._is_google_cookie(cookie)
+            ]
+            temporary.write_text(
+                json.dumps({"cookies": cookies}, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            temporary.chmod(0o600)
+            os.replace(temporary, auth_state)
+            log(f"Saved {len(cookies)} Gemini auth cookie(s)", "Worker")
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    async def _grant_clipboard_permissions(self) -> None:
+        if not self.browser_cdp_session:
+            raise RuntimeError("Chromium browser CDP session is unavailable")
+        for permission in (
+            {"name": "clipboard-read"},
+            {"name": "clipboard-write", "allowWithoutSanitization": True},
+        ):
+            await self.browser_cdp_session.send(
+                "Browser.setPermission",
+                {
+                    "permission": permission,
+                    "setting": "granted",
+                    "origin": "https://gemini.google.com",
+                },
+            )
+
+    def _configure_browser_scope(self) -> None:
+        process = self.browser_process
+        if process is None:
+            raise RuntimeError("Chromium process is unavailable")
+        scope = self._scope_for_pid(process.pid)
+        if not scope:
+            # Chromium normally moves itself into an app scope on this host.
+            # If it remains in the API service cgroup, the service-level
+            # MemoryMax/TasksMax limits already provide containment.
+            self.browser_scope_unit = None
+            return
+        result = subprocess.run(
+            [
+                "systemctl",
+                "--user",
+                "set-property",
+                "--runtime",
+                scope,
+                f"MemoryHigh={BROWSER_SCOPE_MEMORY_HIGH}",
+                f"MemoryMax={BROWSER_SCOPE_MEMORY_MAX}",
+                f"MemorySwapMax={BROWSER_SCOPE_SWAP_MAX}",
+                f"TasksMax={BROWSER_SCOPE_TASKS_MAX}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "unknown systemd error").strip()
+            raise RuntimeError(f"Could not apply Chromium scope limits: {detail}")
+        self.browser_scope_unit = scope
+
+    async def _launch_browser_context(self) -> None:
+        """Launch Chromium directly, then attach Playwright over local CDP.
+
+        """
+        if self.playwright is None:
+            raise RuntimeError("Playwright is not initialized")
+
+        await asyncio.to_thread(self._cleanup_stale_browser_processes)
+        profile_dir = self._new_runtime_profile()
+        self.browser_profile_dir = profile_dir
+        active_port = profile_dir / "DevToolsActivePort"
+        active_port.unlink(missing_ok=True)
+
+        command = [
+            self.playwright.chromium.executable_path,
+            "--no-sandbox",
+            f"--user-data-dir={profile_dir}",
+            "--remote-debugging-address=127.0.0.1",
+            "--remote-debugging-port=0",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-default-apps",
+            *self._browser_args(),
+            "about:blank",
+        ]
+        self.browser_process = subprocess.Popen(
+            command,
+            cwd=profile_dir,
+            env=self._browser_environment(),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+        deadline = time.monotonic() + BROWSER_CONNECT_TIMEOUT_SECONDS
+        port: str | None = None
+        while time.monotonic() < deadline:
+            if self.browser_process.poll() is not None:
+                raise RuntimeError(
+                    f"Chromium exited during startup with code "
+                    f"{self.browser_process.returncode}"
+                )
+            try:
+                lines = active_port.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                lines = []
+            if lines and lines[0].isdigit():
+                port = lines[0]
+                break
+            await asyncio.sleep(0.1)
+
+        if port is None:
+            raise RuntimeError("Chromium did not publish a DevTools endpoint")
+
+        connect_deadline = time.monotonic() + 8
+        last_connect_error: Exception | None = None
+        while time.monotonic() < connect_deadline:
+            if self.browser_process.poll() is not None:
+                raise RuntimeError(
+                    f"Chromium exited before CDP attach with code "
+                    f"{self.browser_process.returncode}"
+                )
+            try:
+                self.browser = await self.playwright.chromium.connect_over_cdp(
+                    f"http://127.0.0.1:{port}",
+                    timeout=2_000,
+                )
+                break
+            except Exception as exc:
+                last_connect_error = exc
+                await asyncio.sleep(0.2)
+        if self.browser is None:
+            raise RuntimeError(f"Chromium CDP attach failed: {last_connect_error}")
+        scope_deadline = time.monotonic() + 3
+        while time.monotonic() < scope_deadline:
+            scope = self._scope_for_pid(self.browser_process.pid)
+            if scope and scope.startswith("app-org.chromium.Chromium-"):
+                break
+            await asyncio.sleep(0.1)
+        await asyncio.to_thread(self._configure_browser_scope)
+        if not self.browser.contexts:
+            raise RuntimeError("Chromium exposed no persistent browser context")
+        self.context = self.browser.contexts[0]
+        self.browser_cdp_session = await self.browser.new_browser_cdp_session()
+        await self._load_auth_state()
+        await self._grant_clipboard_permissions()
+
+    def _stop_browser_process(self) -> None:
+        process = self.browser_process
+        self.browser_process = None
+        scope = self.browser_scope_unit
+        self.browser_scope_unit = None
+        profile_dir = self.browser_profile_dir
+        self.browser_profile_dir = None
+        if scope:
+            self._stop_user_scope(scope)
+        if process is None:
+            if profile_dir:
+                shutil.rmtree(profile_dir, ignore_errors=True)
+            return
+        process_group = process.pid
+        try:
+            os.killpg(process_group, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            pass
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(process_group, 0)
+            except ProcessLookupError:
+                break
+            except OSError:
+                break
+            time.sleep(0.1)
+        try:
+            os.killpg(process_group, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=2)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        if profile_dir:
+            shutil.rmtree(profile_dir, ignore_errors=True)
+
     async def _warm_browser(self, reason: str) -> bool:
-        """Launch Chromium on demand with the persistent authenticated profile."""
+        """Launch Chromium on demand with a disposable profile and saved auth."""
         if self.worker and self.context and self._browser_state == "warm":
             return True
-        if not self._initialized or not self.playwright:
+        if not self._initialized:
             return False
 
         started = time.time()
         self._browser_state = "starting"
         try:
-            log(
-                f"Launching Chromium ({reason}) with native viewport and background throttling disabled",
-                "Worker",
+            reuse_auth_browser = bool(
+                self.context
+                and self.browser_process
+                and self.browser_process.poll() is None
+                and self._last_browser_start
+                and self._last_browser_start.get("auth_required")
             )
-            profile_dir = os.path.join(os.path.dirname(__file__), ".browser_session")
-            self.context = await self.playwright.chromium.launch_persistent_context(
-                profile_dir,
-                headless=False,
-                args=self._browser_args(),
-                permissions=["clipboard-read", "clipboard-write"],
-                no_viewport=True,
-            )
-            page = await self._replace_restored_pages()
+            if reuse_auth_browser:
+                pages = [page for page in self.context.pages if not page.is_closed()]
+                page = pages[-1] if pages else await self.context.new_page()
+                log(f"Rechecking Gemini authentication ({reason})", "Worker")
+            else:
+                if self.playwright is None:
+                    self.playwright = await async_playwright().start()
+                log(
+                    f"Launching Chromium ({reason}) with background throttling disabled",
+                    "Worker",
+                )
+                await self._launch_browser_context()
+                page = await self._replace_restored_pages()
             worker = await self._initialize_page(page)
             if not worker:
-                raise RuntimeError("Gemini page did not become ready")
+                last_error = GeminiWebAutomation.get_all_errors().get(1) or {}
+                detail = str(last_error.get("error") or "Gemini page did not become ready")
+                if "authentication required" in detail.lower():
+                    self._browser_state = "auth_required"
+                    self._last_browser_start = {
+                        "ok": False,
+                        "auth_required": True,
+                        "reason": reason,
+                        "error": detail,
+                        "duration_ms": int((time.time() - started) * 1000),
+                        "at_unix": int(time.time()),
+                    }
+                    log(detail, "Worker")
+                    return False
+                raise RuntimeError(detail)
 
             self.workers = [worker]
+            await self._save_auth_state()
             self._browser_state = "warm"
             self._browser_start_count += 1
             self._last_browser_start = {
@@ -144,13 +578,24 @@ class WorkerPool:
                 await worker.close()
             except Exception as exc:
                 log(f"Worker close warning: {exc}", "Worker")
-        if self.context:
+        if self.browser:
             try:
-                await self.context.close()
+                await self.browser.close()
             except Exception as exc:
-                log(f"Browser context close warning: {exc}", "Worker")
+                log(f"Browser close warning: {exc}", "Worker")
             finally:
-                self.context = None
+                self.browser = None
+        self.browser_cdp_session = None
+        self.context = None
+        if self.browser_process:
+            await asyncio.to_thread(self._stop_browser_process)
+        if state in {"cold", "error", "stopped"} and self.playwright:
+            try:
+                await self.playwright.stop()
+            except Exception as exc:
+                log(f"Playwright stop warning: {exc}", "Worker")
+            finally:
+                self.playwright = None
         self._browser_state = state
         if state == "cold":
             self._browser_stop_count += 1
@@ -168,21 +613,31 @@ class WorkerPool:
             while self._initialized:
                 await asyncio.sleep(self._idle_poll_seconds)
                 idle_for = time.time() - self._last_activity
+                idle_limit = (
+                    AUTH_REQUIRED_IDLE_SECONDS
+                    if self._browser_state == "auth_required"
+                    else self._idle_browser_seconds
+                )
                 if (
-                    self._browser_state != "warm"
+                    self._browser_state not in {"warm", "auth_required"}
                     or self._active_request
                     or self._queued_requests
-                    or idle_for < self._idle_browser_seconds
+                    or idle_for < idle_limit
                     or self._request_lock.locked()
                 ):
                     continue
                 async with self._request_lock:
                     idle_for = time.time() - self._last_activity
+                    idle_limit = (
+                        AUTH_REQUIRED_IDLE_SECONDS
+                        if self._browser_state == "auth_required"
+                        else self._idle_browser_seconds
+                    )
                     if (
-                        self._browser_state == "warm"
+                        self._browser_state in {"warm", "auth_required"}
                         and not self._active_request
                         and not self._queued_requests
-                        and idle_for >= self._idle_browser_seconds
+                        and idle_for >= idle_limit
                     ):
                         await self._close_browser_context(
                             "cold",
@@ -194,7 +649,7 @@ class WorkerPool:
             log(f"Idle browser watchdog error: {exc}", "Worker")
 
     async def _replace_restored_pages(self) -> Page:
-        """Create the managed page before closing pages restored by Chromium."""
+        """Create the managed page before closing restored Chromium pages."""
         restored = [page for page in self.context.pages if not page.is_closed()]
         managed = await self.context.new_page()
         for page in restored:
@@ -219,6 +674,9 @@ class WorkerPool:
                 log("New Gemini page did not reach a clean /app state", "Worker")
             except Exception as exc:
                 log(f"New Gemini page readiness failed: {exc}", "Worker")
+        last_error = GeminiWebAutomation.get_all_errors().get(1) or {}
+        if "authentication required" in str(last_error.get("error") or "").lower():
+            return None
         try:
             await page.close()
         except Exception:
@@ -311,8 +769,6 @@ class WorkerPool:
         if WorkerPool._is_transient_gemini_refusal(response):
             return True
         error = " ".join(str(result.get("error") or "").strip().lower().split())
-        if error.startswith("gemini fallback attempt timed out after "):
-            return True
         if error == "stalled generation" or error.startswith("stalled generation:"):
             return True
         return error in {
@@ -326,17 +782,15 @@ class WorkerPool:
         prompt: str,
         model: str | None = None,
         thinking_level: str | None = None,
-        fallback_thinking_level: str | None = None,
         use_search: bool = False,
         images: List[str] | None = None,
         request_id: str | None = None,
-        request_context: Dict[str, Any] | None = None,
     ) -> Dict:
+        """Serialize one logical Gemini request with bounded recovery."""
         if not self._initialized:
             return {"success": False, "error": "Gemini worker pool is not ready"}
 
         queued_at = time.time()
-        queued_at_iso = datetime.now(timezone.utc).isoformat()
         self._queued_requests += 1
         waiting = True
         try:
@@ -349,272 +803,164 @@ class WorkerPool:
 
                 self._active_request = True
                 if not await self._ensure_browser_ready(f"request {request_id}"):
+                    startup_error = str(
+                        (self._last_browser_start or {}).get("error")
+                        or "browser could not be started"
+                    )
                     return {
                         "success": False,
-                        "error": "Gemini request failed: browser could not be started",
+                        "error": f"Gemini request failed: {startup_error}",
+                        "backend_unavailable": "authentication required" in startup_error.lower(),
+                        "auth_required": "authentication required" in startup_error.lower(),
                         "queue_wait_ms": wait_ms,
                         "attempts": 0,
                     }
-                configured, configuration_error = await self._prepare_request_configuration(
-                    model,
-                    thinking_level,
-                    request_id,
+
+                configured, error = await self._prepare_request_configuration(
+                    model, thinking_level, request_id
                 )
                 if not configured:
                     return {
                         "success": False,
-                        "error": f"Gemini request failed: {configuration_error}",
+                        "error": f"Gemini request failed: {error}",
                         "queue_wait_ms": wait_ms,
                         "attempts": 0,
                     }
 
-                attempt_logs: List[str] = []
-                request_log_files: List[str] = []
                 last_error = "unknown"
-                attempt = 0
                 native_retry_used = False
-                # Keep one logical request inside the same 480s budget. A
-                # Medium request may promote its remaining transient retries
-                # to High; if the first High attempt fails quickly, one more
-                # fresh-tab High attempt can still recover without asking the
-                # caller to resubmit the logical request.
                 max_attempts = 3
                 request_deadline = time.monotonic() + REQUEST_TOTAL_BUDGET_SECONDS
+
                 for attempt in range(1, max_attempts + 1):
-                    remaining_budget = request_deadline - time.monotonic()
-                    if remaining_budget <= 0:
-                        last_error = f"Gemini request budget exhausted after {REQUEST_TOTAL_BUDGET_SECONDS}s"
+                    remaining = request_deadline - time.monotonic()
+                    if remaining <= 0:
+                        last_error = (
+                            f"Gemini request budget exhausted after "
+                            f"{REQUEST_TOTAL_BUDGET_SECONDS}s"
+                        )
                         break
-                    effective_thinking_level = (
-                        fallback_thinking_level
-                        if attempt > 1 and fallback_thinking_level
-                        else thinking_level
-                    )
+
                     worker = self.worker
                     if not worker:
                         last_error = "Gemini worker disappeared"
                         break
-                    attempt_started = time.time()
-                    attempt_started_at = datetime.now(timezone.utc).isoformat()
+
                     try:
-                        send_coro = worker.send_message(
-                            prompt,
-                            model,
-                            effective_thinking_level,
-                            use_search,
-                            images,
-                            request_id=request_id,
+                        result = await asyncio.wait_for(
+                            worker.send_message(
+                                prompt,
+                                model,
+                                thinking_level,
+                                use_search,
+                                images,
+                                request_id=request_id,
+                            ),
+                            timeout=remaining,
                         )
-                        if fallback_thinking_level and attempt == 1 and remaining_budget > FALLBACK_PRIMARY_ATTEMPT_TIMEOUT_SECONDS:
-                            # Medium is the cheap trial. Bound it tightly, then
-                            # let the High fallback use GeminiWebAutomation's
-                            # own 480s browser timeout. A second, shorter pool
-                            # timeout used to discard healthy High generations
-                            # that were still actively thinking after 210s.
-                            attempt_timeout = FALLBACK_PRIMARY_ATTEMPT_TIMEOUT_SECONDS
-                            try:
-                                result = await asyncio.wait_for(send_coro, timeout=attempt_timeout)
-                            except asyncio.TimeoutError:
-                                result = {
-                                    "success": False,
-                                    "error": f"Gemini fallback attempt timed out after {attempt_timeout}s",
-                                }
-                        else:
-                            try:
-                                result = await asyncio.wait_for(send_coro, timeout=remaining_budget)
-                            except asyncio.TimeoutError:
-                                result = {
-                                    "success": False,
-                                    "error": f"Gemini request budget exhausted after {REQUEST_TOTAL_BUDGET_SECONDS}s",
-                                }
+                    except asyncio.TimeoutError:
+                        result = {
+                            "success": False,
+                            "error": (
+                                f"Gemini request budget exhausted after "
+                                f"{REQUEST_TOTAL_BUDGET_SECONDS}s"
+                            ),
+                        }
                     except Exception as exc:
                         result = {"success": False, "error": str(exc)}
-                    attempt_finished_at = datetime.now(timezone.utc).isoformat()
-                    attempt_duration_ms = int((time.time() - attempt_started) * 1000)
 
                     if (
                         not native_retry_used
                         and result.get("success")
-                        and self._is_transient_gemini_refusal(str(result.get("response") or ""))
+                        and self._is_transient_gemini_refusal(
+                            str(result.get("response") or "")
+                        )
                     ):
                         native_retry_used = True
                         native_retry = getattr(worker, "retry_last_response_native", None)
-                        native_result = None
                         if callable(native_retry):
                             try:
-                                native_result = await native_retry()
+                                retried = await native_retry()
                             except Exception as exc:
                                 log(
-                                    f"[{request_id}] Native Gemini retry failed ({type(exc).__name__}); using fresh-tab retry",
+                                    f"[{request_id}] Native retry failed "
+                                    f"({type(exc).__name__}); using fresh-tab recovery",
                                     "Worker",
                                 )
-                        if native_result is not None:
-                            result = native_result
-                            attempt_finished_at = datetime.now(timezone.utc).isoformat()
-                            attempt_duration_ms = int((time.time() - attempt_started) * 1000)
+                            else:
+                                if retried is not None:
+                                    result = retried
 
-                    request_log = worker.get_request_log()
-                    if request_log:
-                        attempt_logs.append(f"--- Attempt {attempt} ---")
-                        attempt_logs.extend(request_log)
-
+                    response = str(result.get("response") or "")
                     retryable = self._is_retryable_response_rejection(result)
-                    search_instruction_present = GeminiWebAutomation._needs_search_hint(prompt, use_search)
-                    if result.get("success") and str(result.get("response") or "").strip():
-                        response = str(result.get("response") or "")
+                    if result.get("success") and response.strip():
                         if not self._is_transient_gemini_refusal(response):
                             result["queue_wait_ms"] = wait_ms
                             result["attempts"] = attempt
-                            result["effective_thinking_level"] = effective_thinking_level
-                            result["ready_for_next_request"] = await self._ensure_ready_after_request(
-                                f"request {request_id} completed"
-                            )
-                            try:
-                                request_file = await asyncio.to_thread(
-                                    write_request_log,
-                                    request_id=request_id,
-                                    attempt=attempt,
-                                    prompt=prompt,
-                                    result=result,
-                                    model=model,
-                                    thinking_level=effective_thinking_level,
-                                    use_search=use_search,
-                                    search_instruction_present=search_instruction_present,
-                                    queue_wait_ms=wait_ms,
-                                    queued_at=queued_at_iso,
-                                    attempt_started_at=attempt_started_at,
-                                    attempt_finished_at=attempt_finished_at,
-                                    attempt_duration_ms=attempt_duration_ms,
-                                    browser_log=request_log,
-                                    request_context=request_context,
-                                    retryable=False,
-                                    will_retry=False,
-                                    ready_for_next_request=result["ready_for_next_request"],
-                                    ready_state=self._last_ready_reset,
+                            result["effective_thinking_level"] = thinking_level
+                            result["ready_for_next_request"] = (
+                                await self._ensure_ready_after_request(
+                                    f"request {request_id} completed"
                                 )
-                                request_log_files.append(request_file)
-                                log(f"[{request_id}] Attempt {attempt} saved: logs/requests/{request_file}", "Worker")
-                            except Exception as exc:
-                                log(f"[{request_id}] Request logging failed ({type(exc).__name__}); request handling continues", "Worker")
-                            result["request_logs"] = request_log_files
+                            )
                             return result
                         last_error = "Gemini returned its generic transient refusal"
                     else:
-                        last_error = result.get("error") or "Empty response"
+                        last_error = str(result.get("error") or "Empty response")
 
-                    ready_after_failure = None
                     if attempt < max_attempts and retryable:
-                        is_refusal = self._is_transient_gemini_refusal(str(result.get("response") or ""))
-                        diagnostic_reason = "transient_refusal" if is_refusal else "transient_generation_failure"
+                        reason = (
+                            "transient_refusal"
+                            if self._is_transient_gemini_refusal(response)
+                            else "transient_generation_failure"
+                        )
                         try:
-                            await worker._save_diagnostic_artifacts(diagnostic_reason, request_id=request_id)
+                            await worker._save_diagnostic_artifacts(
+                                reason, request_id=request_id
+                            )
                         except Exception as exc:
                             log(
-                                f"[{request_id}] Transient Gemini diagnostics failed ({type(exc).__name__}); continuing retry",
+                                f"[{request_id}] Diagnostics failed "
+                                f"({type(exc).__name__}); continuing recovery",
                                 "Worker",
                             )
+
                         log(
-                            f"[{request_id}] Transient Gemini failure; recreating tab before retry {attempt + 1}/{max_attempts}"
-                            f" thinking={effective_thinking_level}->{fallback_thinking_level or thinking_level}",
+                            f"[{request_id}] Transient Gemini failure; "
+                            f"recreating tab before retry {attempt + 1}/{max_attempts}",
                             "Worker",
                         )
-                        ready_for_retry = await self._recreate_worker(
-                            f"transient Gemini retry {attempt + 1}/{max_attempts} for request {request_id}"
+                        ready = await self._recreate_worker(
+                            f"retry {attempt + 1}/{max_attempts} for request {request_id}"
                         )
-                        if ready_for_retry:
-                            configured, configuration_error = await self._prepare_request_configuration(
-                                model,
-                                fallback_thinking_level or thinking_level,
-                                request_id,
+                        if ready:
+                            configured, error = await self._prepare_request_configuration(
+                                model, thinking_level, request_id
                             )
-                            if not configured:
-                                ready_for_retry = False
-                                last_error = f"Gemini request failed: {configuration_error}"
-                        try:
-                            request_file = await asyncio.to_thread(
-                                write_request_log,
-                                request_id=request_id,
-                                attempt=attempt,
-                                prompt=prompt,
-                                result=result,
-                                model=model,
-                                thinking_level=effective_thinking_level,
-                                use_search=use_search,
-                                search_instruction_present=search_instruction_present,
-                                queue_wait_ms=wait_ms,
-                                queued_at=queued_at_iso,
-                                attempt_started_at=attempt_started_at,
-                                attempt_finished_at=attempt_finished_at,
-                                attempt_duration_ms=attempt_duration_ms,
-                                browser_log=request_log,
-                                request_context=request_context,
-                                retryable=True,
-                                will_retry=bool(ready_for_retry),
-                                ready_for_next_request=ready_for_retry,
-                                ready_state=self._last_ready_reset,
-                            )
-                            request_log_files.append(request_file)
-                            log(f"[{request_id}] Attempt {attempt} saved: logs/requests/{request_file}", "Worker")
-                        except Exception as exc:
-                            log(f"[{request_id}] Request logging failed ({type(exc).__name__}); request handling continues", "Worker")
-                        if ready_for_retry:
-                            continue
-                        # A failed retry recreation is not a clean final state.
-                        # Fall through to the canonical ready reset below so it
-                        # can recreate once more or mark the pool unavailable.
-                        ready_after_failure = None
+                            if configured:
+                                continue
+                            last_error = f"Gemini request failed: {error}"
 
-                    if ready_after_failure is None:
-                        ready_after_failure = await self._ensure_ready_after_request(f"request {request_id} failed")
-                    try:
-                        request_file = await asyncio.to_thread(
-                            write_request_log,
-                            request_id=request_id,
-                            attempt=attempt,
-                            prompt=prompt,
-                            result=result,
-                            model=model,
-                            thinking_level=effective_thinking_level,
-                            use_search=use_search,
-                            search_instruction_present=search_instruction_present,
-                            queue_wait_ms=wait_ms,
-                            queued_at=queued_at_iso,
-                            attempt_started_at=attempt_started_at,
-                            attempt_finished_at=attempt_finished_at,
-                            attempt_duration_ms=attempt_duration_ms,
-                            browser_log=request_log,
-                            request_context=request_context,
-                            retryable=retryable,
-                            will_retry=False,
-                            ready_for_next_request=ready_after_failure,
-                            ready_state=self._last_ready_reset,
-                        )
-                        request_log_files.append(request_file)
-                        log(f"[{request_id}] Attempt {attempt} saved: logs/requests/{request_file}", "Worker")
-                    except Exception as exc:
-                        log(f"[{request_id}] Request logging failed ({type(exc).__name__}); request handling continues", "Worker")
+                    await self._ensure_ready_after_request(
+                        f"request {request_id} failed"
+                    )
                     break
 
                 log(f"[{request_id}] Request failed: {last_error}", "Worker")
                 return {
                     "success": False,
                     "error": f"Gemini request failed: {last_error}",
-                    "attempt_logs": attempt_logs,
-                    "request_logs": request_log_files,
                     "queue_wait_ms": wait_ms,
-                    "attempts": max(1, attempt),
-                    "effective_thinking_level": (
-                        fallback_thinking_level
-                        if attempt > 1 and fallback_thinking_level
-                        else thinking_level
-                    ),
+                    "attempts": max(1, locals().get("attempt", 0)),
+                    "effective_thinking_level": thinking_level,
                 }
         finally:
             if waiting:
-                self._queued_requests -= 1
+                self._queued_requests = max(0, self._queued_requests - 1)
             else:
                 self._active_request = False
             self._last_activity = time.time()
+
 
     async def _ensure_ready_after_request(self, reason: str) -> bool:
         """Leave the serialized worker in a clean state before releasing it."""
@@ -637,8 +983,11 @@ class WorkerPool:
                 error = None
 
         if not ok:
-            self._initialized = False
             error = error or "worker could not be restored to ready state"
+            # A poisoned tab should not poison the resident API process. Drop
+            # the whole browser runtime and let the next request cold-start a
+            # clean one under the same serialized request lock.
+            await self._close_browser_context("error", reason)
 
         self._last_ready_reset = {
             "ok": ok,
@@ -665,7 +1014,11 @@ class WorkerPool:
             "browser_stop_count": self._browser_stop_count,
             "last_browser_start": self._last_browser_start,
             "last_browser_stop": self._last_browser_stop,
-            "browser_channel": "chromium",
+            "browser_channel": "playwright-chromium-cdp",
+            "browser_pid": self.browser_process.pid if self.browser_process else None,
+            "browser_scope_unit": self.browser_scope_unit,
+            "auth_state_present": self._auth_state_path().is_file(),
+            "runtime_profile_active": bool(self.browser_profile_dir),
             "startup_pages_closed": self._startup_pages_closed,
             "worker_recreation_count": self._worker_recreation_count,
             "last_worker_recreation": self._last_worker_recreation,

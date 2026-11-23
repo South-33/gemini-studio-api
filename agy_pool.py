@@ -1,4 +1,4 @@
-"""Bounded parallel Antigravity CLI execution for the API backend."""
+"""Bounded Antigravity execution pool."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import os
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Any, Dict
+from typing import Any
 
 from agy_cli import (
     AgyCliError,
@@ -14,388 +14,296 @@ from agy_cli import (
     AgyCliTimeoutError,
     AgyCliUnavailableError,
     AgyModelSelectionError,
-    MODEL_FAMILIES,
 )
 
 
-AGY_REQUEST_TOTAL_BUDGET_SECONDS = 480
-# Repeated clean load tests across 1-5 processes put 3 at the best stable
-# throughput/latency point. Four was slower in both benchmark orders and five
-# degraded further; operators can still raise the limit deliberately.
-DEFAULT_AGY_MAX_CONCURRENCY = 3
-MAX_AGY_MAX_CONCURRENCY = 8
-# Three waiting waves absorb bursts while keeping the slowest observed search
-# workload inside the 275s synchronous budget. Async-heavy deployments can
-# raise this deliberately.
-DEFAULT_AGY_MAX_QUEUE = 9
-MAX_AGY_MAX_QUEUE = 1000
+REQUEST_BUDGET_SECONDS = 480
+DEFAULT_MAX_CONCURRENCY = 3
+DEFAULT_MAX_QUEUE = 6
+MAX_CONCURRENCY = 8
+MAX_QUEUE = 100
 
 
 class AgyQueueFullError(RuntimeError):
-    """The bounded Antigravity queue cannot accept another request."""
+    """The bounded Antigravity queue cannot accept more work."""
 
 
 class AgyPool:
-    """Run a small number of independent Antigravity CLI requests in parallel.
-
-    Each request starts a fresh CLI conversation from the same sterile runtime
-    workspace. Requests beyond the configured process limit wait in the
-    executor queue instead of creating unbounded CLI processes.
-    """
-
     def __init__(
         self,
         runner: AgyCliRunner | None = None,
         max_concurrency: int | None = None,
         max_queue: int | None = None,
     ):
+        configured_concurrency = max_concurrency
+        if configured_concurrency is None:
+            try:
+                configured_concurrency = int(
+                    os.environ.get("AGY_MAX_CONCURRENCY", DEFAULT_MAX_CONCURRENCY)
+                )
+            except ValueError:
+                configured_concurrency = DEFAULT_MAX_CONCURRENCY
+
+        configured_queue = max_queue
+        if configured_queue is None:
+            try:
+                configured_queue = int(
+                    os.environ.get("AGY_MAX_QUEUE", DEFAULT_MAX_QUEUE)
+                )
+            except ValueError:
+                configured_queue = DEFAULT_MAX_QUEUE
+
+        self.max_concurrency = max(
+            1, min(MAX_CONCURRENCY, int(configured_concurrency))
+        )
+        self.max_queue = max(0, min(MAX_QUEUE, int(configured_queue)))
         self.runner = runner
-        configured = max_concurrency
-        if configured is None:
-            try:
-                configured = int(os.environ.get("AGY_MAX_CONCURRENCY", DEFAULT_AGY_MAX_CONCURRENCY))
-            except ValueError:
-                configured = DEFAULT_AGY_MAX_CONCURRENCY
-        self.max_concurrency = max(1, min(MAX_AGY_MAX_CONCURRENCY, int(configured)))
-        queue_limit = max_queue
-        if queue_limit is None:
-            try:
-                queue_limit = int(os.environ.get("AGY_MAX_QUEUE", DEFAULT_AGY_MAX_QUEUE))
-            except ValueError:
-                queue_limit = DEFAULT_AGY_MAX_QUEUE
-        self.max_queue = max(0, min(MAX_AGY_MAX_QUEUE, int(queue_limit)))
-        self._executor = ThreadPoolExecutor(max_workers=self.max_concurrency, thread_name_prefix="agy-api")
+        self._executor = ThreadPoolExecutor(
+            max_workers=self.max_concurrency,
+            thread_name_prefix="agy-api",
+        )
         self._state_lock = threading.Lock()
-        self._model_refresh_lock = threading.Lock()
+        self._init_lock = threading.Lock()
+        self._refresh_lock = threading.Lock()
         self._closed = False
         self._initialized = False
-        self._models: Dict[tuple[str, str], str] = {}
-        self._available_model_slugs: list[str] = []
-        self._active_requests = 0
-        self._queued_requests = 0
+        self._models: list[str] = []
+        self._active = 0
+        self._queued = 0
         self._last_error: str | None = None
 
     def init(self) -> bool:
-        try:
+        with self._init_lock:
             with self._state_lock:
                 if self._closed:
-                    self._last_error = "Antigravity CLI pool is closed"
                     return False
+                if self._initialized:
+                    return True
+            try:
                 if self.runner is None:
                     self.runner = AgyCliRunner()
-                runner = self.runner
+                self.runner.check_capabilities()
+                models = self.runner.refresh_models()
+            except Exception as exc:
+                with self._state_lock:
+                    self._initialized = False
+                    self._models = []
+                    self._last_error = str(exc)
+                return False
 
-            runner.check_capabilities()
-            models = runner.refresh_models()
-            available_model_slugs = runner.available_model_slugs()
             with self._state_lock:
                 if self._closed:
                     return False
-                self._models = models
-                self._available_model_slugs = available_model_slugs
-                self._initialized = bool(available_model_slugs)
+                self._models = list(models)
+                self._initialized = True
                 self._last_error = None
-        except Exception as exc:
-            with self._state_lock:
-                self._initialized = False
-                self._models = {}
-                self._available_model_slugs = []
-                if not self._closed:
-                    self._last_error = str(exc)
-            return False
-        with self._state_lock:
-            return self._initialized
+            return True
 
     def close(self) -> None:
         with self._state_lock:
             self._closed = True
             self._initialized = False
-            self._last_error = "Antigravity CLI pool is closed"
             runner = self.runner
         self._executor.shutdown(wait=False, cancel_futures=True)
         if runner is not None:
-            close_runner = getattr(runner, "close", None)
-            if callable(close_runner):
-                close_runner()
+            runner.close()
 
     def is_ready(self) -> bool:
         with self._state_lock:
             return self._initialized and not self._closed
 
-    def is_model_available(self, family: str, thinking_level: str) -> bool:
+    def available_models(self) -> list[str]:
         with self._state_lock:
-            if self._closed or not self._initialized or not self.runner:
-                return False
-            runner = self.runner
-        try:
-            runner.resolve_model(family, thinking_level)
-            return True
-        except AgyCliError:
-            return False
+            return list(self._models)
+
+    def has_model(self, model: str) -> bool:
+        normalized = (model or "").strip().lower()
+        return any(candidate.lower() == normalized for candidate in self.available_models())
 
     def submit(
         self,
         prompt: str,
         *,
         model: str,
-        thinking_level: str,
-        fallback_thinking_level: str | None = None,
         use_search: bool = False,
-        timeout_seconds: int = AGY_REQUEST_TOTAL_BUDGET_SECONDS,
-    ) -> Future:
-        queued_monotonic = time.monotonic()
+        timeout_seconds: int = REQUEST_BUDGET_SECONDS,
+    ) -> Future[dict[str, Any]]:
+        queued_at = time.monotonic()
         with self._state_lock:
-            if self._closed:
-                raise RuntimeError("Antigravity CLI pool is closed")
-            outstanding = self._active_requests + self._queued_requests
+            if self._closed or not self._initialized:
+                raise RuntimeError(
+                    f"Antigravity backend is unavailable: {self._last_error or 'not initialized'}"
+                )
+            outstanding = self._active + self._queued
             if outstanding >= self.max_concurrency + self.max_queue:
                 raise AgyQueueFullError(
-                    f"Antigravity CLI queue is full ({self.max_concurrency} active, {self.max_queue} waiting)"
+                    f"Antigravity queue is full "
+                    f"({self.max_concurrency} active, {self.max_queue} waiting)"
                 )
-            self._queued_requests += 1
+            self._queued += 1
+
         try:
             future = self._executor.submit(
                 self._run_queued,
                 prompt,
                 model,
-                thinking_level,
-                fallback_thinking_level,
                 use_search,
                 max(1, int(timeout_seconds)),
-                queued_monotonic,
+                queued_at,
             )
         except Exception:
             with self._state_lock:
-                self._queued_requests = max(0, self._queued_requests - 1)
+                self._queued = max(0, self._queued - 1)
             raise
-        future.add_done_callback(self._release_cancelled_queue_slot)
+        future.add_done_callback(self._release_cancelled_slot)
         return future
 
-    def _release_cancelled_queue_slot(self, future: Future) -> None:
-        """Release capacity when a queued future is cancelled before it starts."""
-
-        if not future.cancelled():
-            return
-        with self._state_lock:
-            self._queued_requests = max(0, self._queued_requests - 1)
-
-    @staticmethod
-    def _is_transient_refusal(response: str, prompt: str = "") -> bool:
-        normalized = " ".join((response or "").strip().lower().split())
-        normalized_prompt = " ".join((prompt or "").strip().lower().split())
-        if normalized and normalized in normalized_prompt:
-            return False
-        return (
-            normalized.startswith("i'm having a hard time fulfilling your request.")
-            and "something else instead?" in normalized
-        ) or normalized in {
-            "sorry, something went wrong. please try your request again.",
-            "i encountered an error doing what you asked. could you try again?",
-            "i seem to be encountering an error. can i try something else for you?",
-        }
+    def _release_cancelled_slot(self, future: Future[dict[str, Any]]) -> None:
+        if future.cancelled():
+            with self._state_lock:
+                self._queued = max(0, self._queued - 1)
 
     def _run_queued(
         self,
         prompt: str,
         model: str,
-        thinking_level: str,
-        fallback_thinking_level: str | None,
         use_search: bool,
         timeout_seconds: int,
-        queued_monotonic: float,
-    ) -> Dict[str, Any]:
+        queued_at: float,
+    ) -> dict[str, Any]:
         with self._state_lock:
-            self._queued_requests = max(0, self._queued_requests - 1)
-            self._active_requests += 1
-        wait_ms = max(0, int((time.monotonic() - queued_monotonic) * 1000))
+            self._queued = max(0, self._queued - 1)
+            self._active += 1
+        wait_ms = max(0, int((time.monotonic() - queued_at) * 1000))
 
         try:
-            if not self._initialized or self.runner is None:
+            runner = self.runner
+            if not runner:
                 return {
                     "success": False,
-                    "error": f"Antigravity CLI backend is unavailable: {self._last_error or 'not initialized'}",
+                    "backend_unavailable": True,
+                    "error": "Antigravity backend is unavailable",
                     "queue_wait_ms": wait_ms,
-                    "attempts": 0,
-                    "effective_thinking_level": thinking_level,
                 }
 
-            deadline = queued_monotonic + timeout_seconds
-            effective_thinking = thinking_level
-            fallback_changes_model = bool(
-                fallback_thinking_level
-                and fallback_thinking_level.lower() != thinking_level.lower()
-            )
-            max_attempts = 2 if fallback_changes_model else 1
-            last_response = ""
-
-            for attempt in range(1, max_attempts + 1):
-                remaining = int(deadline - time.monotonic())
-                if remaining <= 0:
-                    return {
-                        "success": False,
-                        "timed_out": True,
-                        "error": f"Antigravity CLI request exceeded {timeout_seconds}s budget",
-                        "queue_wait_ms": wait_ms,
-                        "attempts": attempt - 1,
-                        "effective_thinking_level": effective_thinking,
-                    }
+            deadline = queued_at + timeout_seconds
+            remaining = int(deadline - time.monotonic())
+            if remaining <= 0:
+                return {
+                    "success": False,
+                    "timed_out": True,
+                    "error": (
+                        f"Antigravity request expired in queue after "
+                        f"{timeout_seconds}s"
+                    ),
+                    "queue_wait_ms": wait_ms,
+                }
+            try:
+                result = runner.run_prompt(
+                    prompt,
+                    model=model,
+                    use_search=use_search,
+                    timeout_seconds=remaining,
+                )
+            except AgyModelSelectionError:
+                # The CLI can rotate model IDs while the service is alive.
+                # Refresh once before failing an exact-ID request.
                 try:
-                    result = self.runner.run_prompt(
-                        prompt,
-                        family=model,
-                        thinking_level=effective_thinking,
-                        use_search=use_search,
-                        timeout_seconds=remaining,
-                    )
-                except AgyCliTimeoutError as exc:
-                    self._last_error = str(exc)
-                    return {
-                        "success": False,
-                        "timed_out": True,
-                        "error": str(exc),
-                        "queue_wait_ms": wait_ms,
-                        "attempts": attempt,
-                        "effective_thinking_level": effective_thinking,
-                    }
-                except AgyCliUnavailableError as exc:
-                    with self._state_lock:
-                        self._initialized = False
-                        self._last_error = str(exc)
-                    return {
-                        "success": False,
-                        "backend_unavailable": True,
-                        "error": f"Antigravity CLI backend became unavailable: {exc}",
-                        "queue_wait_ms": wait_ms,
-                        "attempts": attempt,
-                        "effective_thinking_level": effective_thinking,
-                    }
-                except AgyModelSelectionError as exc:
-                    if model.strip().lower() not in MODEL_FAMILIES:
-                        self._last_error = str(exc)
-                        return {
-                            "success": False,
-                            "error": f"Antigravity CLI request failed: {exc}",
-                            "queue_wait_ms": wait_ms,
-                            "attempts": attempt,
-                            "effective_thinking_level": effective_thinking,
-                        }
-                    try:
-                        with self._model_refresh_lock:
-                            current_slug = self.runner.resolve_model(model, effective_thinking)
-                            if not exc.model_slug or current_slug == exc.model_slug:
-                                refreshed_models = self.runner.refresh_models()
-                                refreshed_slugs = self.runner.available_model_slugs()
-                                with self._state_lock:
-                                    self._models = refreshed_models
-                                    self._available_model_slugs = refreshed_slugs
-                        remaining = int(deadline - time.monotonic())
-                        if remaining <= 0:
-                            raise AgyCliTimeoutError(
-                                f"Antigravity CLI request exceeded {timeout_seconds}s budget during model refresh"
-                            )
-                        result = self.runner.run_prompt(
-                            prompt,
-                            family=model,
-                            thinking_level=effective_thinking,
-                            use_search=use_search,
-                            timeout_seconds=remaining,
-                        )
-                    except AgyCliUnavailableError as refresh_exc:
+                    with self._refresh_lock:
+                        models = runner.refresh_models()
                         with self._state_lock:
-                            self._initialized = False
-                            self._last_error = str(refresh_exc)
+                            self._models = list(models)
+                    if not any(
+                        candidate.lower() == model.strip().lower()
+                        for candidate in models
+                    ):
                         return {
                             "success": False,
-                            "backend_unavailable": True,
-                            "error": f"Antigravity CLI backend became unavailable: {refresh_exc}",
+                            "error": (
+                                f"Antigravity no longer exposes model {model!r}"
+                            ),
                             "queue_wait_ms": wait_ms,
-                            "attempts": attempt,
-                            "effective_thinking_level": effective_thinking,
                         }
-                    except AgyCliTimeoutError as refresh_exc:
-                        self._last_error = str(refresh_exc)
+                    remaining = int(deadline - time.monotonic())
+                    if remaining <= 0:
                         return {
                             "success": False,
                             "timed_out": True,
-                            "error": str(refresh_exc),
+                            "error": (
+                                f"Antigravity request expired during model refresh "
+                                f"after {timeout_seconds}s"
+                            ),
                             "queue_wait_ms": wait_ms,
-                            "attempts": attempt,
-                            "effective_thinking_level": effective_thinking,
                         }
-                    except AgyCliError as refresh_exc:
-                        self._last_error = str(refresh_exc)
-                        return {
-                            "success": False,
-                            "error": f"Antigravity CLI request failed: {refresh_exc}",
-                            "queue_wait_ms": wait_ms,
-                            "attempts": attempt,
-                            "effective_thinking_level": effective_thinking,
-                        }
-                except AgyCliError as exc:
-                    self._last_error = str(exc)
+                    result = runner.run_prompt(
+                        prompt,
+                        model=model,
+                        use_search=use_search,
+                        timeout_seconds=remaining,
+                    )
+                except AgyModelSelectionError as exc:
                     return {
                         "success": False,
-                        "error": f"Antigravity CLI request failed: {exc}",
+                        "error": str(exc),
                         "queue_wait_ms": wait_ms,
-                        "attempts": attempt,
-                        "effective_thinking_level": effective_thinking,
                     }
+            except AgyCliTimeoutError as exc:
+                return {
+                    "success": False,
+                    "timed_out": True,
+                    "error": str(exc),
+                    "queue_wait_ms": wait_ms,
+                }
+            except AgyCliUnavailableError as exc:
+                with self._state_lock:
+                    self._initialized = False
+                    self._last_error = str(exc)
+                return {
+                    "success": False,
+                    "backend_unavailable": True,
+                    "error": str(exc),
+                    "queue_wait_ms": wait_ms,
+                }
+            except AgyCliError as exc:
+                return {
+                    "success": False,
+                    "error": str(exc),
+                    "queue_wait_ms": wait_ms,
+                }
 
-                last_response = result.response
-                if not self._is_transient_refusal(last_response, prompt):
-                    self._last_error = None
-                    return {
-                        "success": True,
-                        "response": last_response,
-                        "queue_wait_ms": wait_ms,
-                        "attempts": attempt,
-                        "effective_thinking_level": result.effective_thinking_level,
-                        "agy_model": result.model_slug,
-                        "agy_usage": result.usage,
-                        "agy_duration_seconds": result.duration_seconds,
-                        "prompt_transport": result.prompt_transport,
-                        "prompt_chars": result.prompt_chars,
-                        "conversation_id": result.conversation_id,
-                        "agy_tools_used": list(result.tools_used),
-                        "request_logs": [],
-                    }
-
-                if attempt < max_attempts and fallback_changes_model and fallback_thinking_level:
-                    effective_thinking = fallback_thinking_level
-                    continue
-
+            with self._state_lock:
+                self._last_error = None
             return {
-                "success": False,
-                "error": "Antigravity CLI returned Gemini's transient failure response",
-                "response": last_response,
+                "success": True,
+                "response": result.response,
                 "queue_wait_ms": wait_ms,
-                "attempts": max_attempts,
-                "effective_thinking_level": effective_thinking,
+                "attempts": 1,
+                "effective_thinking_level": result.effective_thinking_level,
+                "agy_model": result.model_id,
+                "agy_usage": result.usage,
+                "agy_duration_seconds": result.duration_seconds,
+                "agy_tools_used": list(result.tools_used),
             }
         finally:
             with self._state_lock:
-                self._active_requests = max(0, self._active_requests - 1)
+                self._active = max(0, self._active - 1)
 
-    def diagnostics(self) -> Dict[str, Any]:
+    def diagnostics(self) -> dict[str, Any]:
         with self._state_lock:
-            active = self._active_requests
-            queued = self._queued_requests
-            initialized = self._initialized
-            model_map = dict(self._models)
-            model_ids = list(self._available_model_slugs)
-            last_error = self._last_error
-        models = [
-            {"family": family, "thinking_level": thinking, "model": slug}
-            for (family, thinking), slug in sorted(model_map.items())
-        ]
-        return {
-            "available": initialized,
-            "max_concurrency": self.max_concurrency,
-            "max_queue": self.max_queue,
-            "active_requests": active,
-            "active_request": active > 0,
-            "queued_requests": queued,
-            "models": models,
-            "model_ids": model_ids,
-            "last_error": last_error,
-        }
+            state = (
+                "ready"
+                if self._initialized and not self._closed
+                else "unavailable"
+                if self._last_error
+                else "cold"
+            )
+            return {
+                "state": state,
+                "available": self._initialized and not self._closed,
+                "max_concurrency": self.max_concurrency,
+                "max_queue": self.max_queue,
+                "active_requests": self._active,
+                "queued_requests": self._queued,
+                "models": list(self._models),
+                "last_error": self._last_error,
+            }

@@ -1,6 +1,8 @@
 import unittest
 
 from gemini_models import (
+    DEFAULT_MODEL,
+    DEFAULT_THINKING_LEVEL,
     model_family_from_ui,
     normalize_model,
     normalize_thinking_level,
@@ -8,32 +10,35 @@ from gemini_models import (
 )
 
 
-class ModelTests(unittest.TestCase):
-    def test_api_models_are_exact_current_families(self):
-        for model in ("flash-lite", "flash", "pro", "argon"):
-            self.assertEqual(normalize_model(model), model)
-        for unsupported in ("thinking", "fast", "gemini-flash", "gemini-3.5-flash-lite"):
+class ModelContractTests(unittest.TestCase):
+    def test_defaults(self):
+        self.assertEqual(DEFAULT_MODEL, "neon")
+        self.assertEqual(DEFAULT_THINKING_LEVEL, "Medium")
+
+    def test_models_are_exact(self):
+        self.assertEqual(normalize_model(" Neon "), "neon")
+        self.assertEqual(normalize_model("HYDROGEN"), "hydrogen")
+        for value in ("auto", "flash", "pro", "gemini-neon"):
             with self.assertRaises(ValueError):
-                normalize_model(unsupported)
+                normalize_model(value)
 
-    def test_ui_family_matching_ignores_visible_numeric_versions(self):
-        self.assertEqual(model_family_from_ui("3.5 Flash-Lite Fastest answers"), "flash-lite")
-        self.assertEqual(model_family_from_ui("3.8 Flash All-around help"), "flash")
-        self.assertEqual(model_family_from_ui("3.1 Pro Advanced reasoning"), "pro")
-        self.assertEqual(model_family_from_ui("4 Argon Complex tasks"), "argon")
-        self.assertEqual(model_family_from_ui("99.12 Argon Complex tasks"), "argon")
+    def test_ui_family_ignores_version_and_description(self):
+        self.assertEqual(model_family_from_ui("4 Hydrogen Everyday help"), "hydrogen")
+        self.assertEqual(model_family_from_ui("4 Neon Deeper analysis"), "neon")
+        self.assertEqual(model_family_from_ui("Open mode picker, Neon High"), "neon")
+        self.assertIsNone(model_family_from_ui("Auto Adapts to your needs"))
 
-    def test_unknown_thinking_level_is_rejected(self):
+    def test_thinking_levels(self):
+        for value in ("low", "Medium", " HIGH "):
+            self.assertIn(normalize_thinking_level(value), {"Low", "Medium", "High"})
         with self.assertRaises(ValueError):
             normalize_thinking_level("auto")
 
-    def test_picker_text_reports_current_thinking_level(self):
-        self.assertEqual(thinking_level_from_picker_text("Flash\nMedium"), "Medium")
-        self.assertEqual(thinking_level_from_picker_text("Open mode picker, currently Flash High"), "High")
-        self.assertEqual(thinking_level_from_picker_text("Flash"), "Low")
-        self.assertEqual(thinking_level_from_picker_text("Flash-Lite"), "Low")
-        self.assertEqual(thinking_level_from_picker_text("Pro"), "Low")
-        self.assertEqual(thinking_level_from_picker_text("Argon"), "Low")
+    def test_picker_requires_explicit_thinking_label(self):
+        self.assertEqual(thinking_level_from_picker_text("Neon High"), "High")
+        self.assertEqual(thinking_level_from_picker_text("Hydrogen Medium"), "Medium")
+        self.assertIsNone(thinking_level_from_picker_text("Neon"))
+
 
 if __name__ == "__main__":
     unittest.main()

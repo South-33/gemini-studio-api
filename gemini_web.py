@@ -15,10 +15,6 @@ from typing import Any, List, Dict, Optional, Tuple
 from urllib.parse import urlparse
 from playwright.async_api import BrowserContext, Page
 from gemini_models import model_family_from_ui, normalize_thinking_level, thinking_level_from_picker_text
-import contextvars
-
-# ContextVar to hold current request's log lines buffer
-current_request_log_buffer = contextvars.ContextVar("current_request_log_buffer", default=None)
 
 # --- Timestamped Logging (use stderr - always unbuffered) ---
 def log(msg: str, tag: str = "Core"):
@@ -26,11 +22,6 @@ def log(msg: str, tag: str = "Core"):
     ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
     formatted_msg = f"[{ts}] [{tag}] {msg}"
     print(formatted_msg, file=sys.stderr, flush=True)
-    
-    # Also append to request log buffer if active in current context
-    buf = current_request_log_buffer.get()
-    if buf is not None:
-        buf.append(formatted_msg)
 
 # Production uses a visible browser with long prompts attached as files.
 PROMPT_FILE_UPLOAD_THRESHOLD = 1500
@@ -561,6 +552,7 @@ class GeminiWebAutomation:
         "model_btn": [
             'button[aria-label^="Open mode picker" i]',
             'button[data-test-id="bard-mode-menu-button"]',
+            'button[data-test-id*="mode-menu-button" i]',
             'button[aria-label*="model" i][aria-label*="picker" i]',
         ],
         "copy_btn": [
@@ -569,6 +561,8 @@ class GeminiWebAutomation:
         "menu_item": [
             'gem-menu-item[role="menuitem"]',
             '[role="menuitem"]',
+            '[role="menuitemradio"]',
+            '[role="option"]',
             'gem-menu-item',
         ],
     }
@@ -590,7 +584,6 @@ class GeminiWebAutomation:
         self._network_failure_counts: Dict[str, int] = {}
         self._last_network_outage: Optional[Dict[str, Any]] = None
         self._current_prompt_tokens_est: int = 0  # Set per-request for stall scaling
-        self._request_log_lines: List[str] = []   # Per-request log buffer for error reports
         self._current_selected_model: Optional[str] = None
         self._current_selected_thinking_level: Optional[str] = None
 
@@ -604,7 +597,7 @@ class GeminiWebAutomation:
 
     def _empty_stall_threshold(self, backend_activity_live: bool = False) -> int:
         """Scale first-output timeout to the current request size."""
-        # Flash High can legitimately remain visually silent for several
+        # High reasoning can legitimately remain visually silent for several
         # minutes before the first reasoning/output DOM appears. We have
         # observed successful BorderClash High requests first producing output
         # after >180s, so the compact-request fast-fail window must not apply
@@ -802,10 +795,6 @@ class GeminiWebAutomation:
                 continue
             return max(0.0, now - event_time)
         return None
-
-    def get_request_log(self) -> List[str]:
-        """Return buffered log lines for the current/last request (for error reports)."""
-        return list(self._request_log_lines)
 
     async def _save_diagnostic_artifacts(self, reason: str, request_id: Optional[str] = None):
         """Save a screenshot and visible DOM summary before the page is replaced."""
@@ -1137,12 +1126,21 @@ class GeminiWebAutomation:
             if not text:
                 return None, None
 
-            # Current Gemini UI includes the thinking level in the picker label,
-            # for example "Flash Medium".
+            # The closed picker can omit the thinking level (for example, it
+            # may show only "Neon"). Prefer an explicit visible label, then
+            # use the level this worker successfully selected while the same
+            # model remains active.
             ui_thinking = thinking_level_from_picker_text(text)
-
-            # Detect model
             ui_model = model_family_from_ui(text)
+            if (
+                ui_thinking is None
+                and self._current_selected_thinking_level
+                and (
+                    self._current_selected_model is None
+                    or ui_model == self._current_selected_model
+                )
+            ):
+                ui_thinking = self._current_selected_thinking_level
 
             return ui_model, ui_thinking
         except Exception as e:
@@ -1205,7 +1203,8 @@ class GeminiWebAutomation:
 
         target_thinking = thinking_level or "Medium"
         if target_thinking and ui_thinking != target_thinking:
-            await self._set_thinking_level(target_thinking)
+            if not await self._set_thinking_level(target_thinking):
+                return False, model_family_changed
             ui_model, ui_thinking = await self._wait_for_ui_configuration(
                 model=model,
                 thinking_level=target_thinking,
@@ -1387,8 +1386,8 @@ class GeminiWebAutomation:
 
                     let uiStateHint = 'unknown';
                     if (isGoogle500) uiStateHint = 'google_500';
-                    else if (inputBox) uiStateHint = 'composer_ready';
                     else if (signInVisible) uiStateHint = 'sign_in_required';
+                    else if (inputBox) uiStateHint = 'composer_ready';
                     else if (transitionSpinner && isVisible(transitionSpinner)) uiStateHint = 'loading';
                     else if (modelPicker) uiStateHint = 'partial_ui_no_composer';
 
@@ -1627,6 +1626,7 @@ class GeminiWebAutomation:
             int(snap.get("user_query_count") or 0) == 0
             and int(snap.get("response_count") or 0) == 0
             and snap.get("input_visible")
+            and not snap.get("sign_in_visible")
             and not snap.get("error_page_500")
         )
 
@@ -1702,6 +1702,11 @@ class GeminiWebAutomation:
                     raise Exception(f"Google 500 error page during init: {snapshot.get('page_title') or self.page.url}")
 
                 if not await self._ensure_fresh_chat():
+                    snapshot = await self._capture_state_snapshot()
+                    if snapshot.get("sign_in_visible"):
+                        raise Exception(
+                            "Gemini Web authentication required in the dedicated browser profile"
+                        )
                     raise Exception("Gemini /app composer is not ready")
 
                 # Wait for input to be ready (login check)
@@ -1716,7 +1721,12 @@ class GeminiWebAutomation:
                 try:
                     await self.page.wait_for_selector(input_selector, timeout=30000)
                     await self._human_delay(500, 1000)
-                    print("[GeminiWeb] Logged in and ready")
+                    snapshot = await self._capture_state_snapshot()
+                    if snapshot.get("sign_in_visible"):
+                        raise Exception(
+                            "Gemini Web authentication required in the dedicated browser profile"
+                        )
+                    print("[GeminiWeb] Signed in and ready")
                     
                     self._attach_network_logging()
                     
@@ -1756,9 +1766,6 @@ class GeminiWebAutomation:
         if not self._initialized: 
             return {"success": False, "error": "Not initialized"}
 
-        log_buffer = []
-        self._request_log_lines = log_buffer
-        token = current_request_log_buffer.set(log_buffer)
         self._last_request_success = False
         # The finally block always cleans up an attachment path, including
         # failures during Chat reset or model selection.
@@ -2464,7 +2471,6 @@ class GeminiWebAutomation:
                     pass
             self._generation_in_progress = False
             self._request_id = None
-            current_request_log_buffer.reset(token)
 
     async def _select_model(self, model_name: str):
         """Select model from dropdown."""
@@ -2478,31 +2484,36 @@ class GeminiWebAutomation:
             btn = self.page.locator(model_selector).first
             current = await btn.inner_text()
             if self._matches_model(current, model_name):
-                return True
+                return False
             
             await btn.click()
             await self._human_delay(300, 450)
 
-            # Select from menu
-            menu_item_selector = await self._resolve_selector("menu_item")
-            if not menu_item_selector:
-                self._track_error("Model menu item selector missing", "menu_item", "select_model")
-                # Close the picker
-                await self.page.keyboard.press("Escape")
-                return False
-
-            items = self.page.locator(menu_item_selector)
-            item_count = await items.count()
-            
-            # Try to match by text first
-            for i in range(item_count):
-                item = items.nth(i)
-                text = await item.inner_text()
-                if self._matches_model(text, model_name):
-                    await item.click()
-                    print(f"[Worker {self.worker_id}] Selected model: {model_name}")
-                    await self._human_delay(300, 600)
-                    return True
+            # Prefer semantic menu/option roles, then fall back to visible
+            # buttons. Gemini changes wrapper elements more often than labels.
+            item_count = 0
+            selectors = self._selector_candidates("menu_item") + ["button"]
+            for selector in selectors:
+                items = self.page.locator(selector)
+                count = await items.count()
+                item_count += count
+                for i in range(count):
+                    item = items.nth(i)
+                    try:
+                        if not await item.is_visible():
+                            continue
+                        if (await item.get_attribute("aria-disabled") or "").lower() == "true":
+                            continue
+                        if await item.get_attribute("disabled") is not None:
+                            continue
+                        text = (await item.inner_text()).strip()
+                    except Exception:
+                        continue
+                    if self._matches_model(text, model_name):
+                        await item.click(timeout=2000)
+                        print(f"[Worker {self.worker_id}] Selected model: {model_name}")
+                        await self._human_delay(300, 600)
+                        return True
 
             # If not found at all, close menu
             await self.page.keyboard.press("Escape")
@@ -2527,7 +2538,7 @@ class GeminiWebAutomation:
                 pass
             return False
 
-    async def _set_thinking_level(self, level: str):
+    async def _set_thinking_level(self, level: str) -> bool:
         """Set Gemini Web thinking level when explicitly requested."""
         target_text = normalize_thinking_level(level)
 
@@ -2535,7 +2546,7 @@ class GeminiWebAutomation:
             model_selector = await self._resolve_selector("model_btn", require_visible=True, timeout_ms=1500)
             if not model_selector:
                 self._track_error("Model picker not found", "model_btn", "set_thinking_level")
-                return
+                return False
 
             await self.page.locator(model_selector).first.click()
             await self._human_delay(300, 450)
@@ -2581,9 +2592,10 @@ class GeminiWebAutomation:
                 candidate = option.nth(i)
                 if await candidate.is_visible():
                     await candidate.click(timeout=2000)
+                    self._current_selected_thinking_level = target_text
                     log(f"Selected thinking level: {target_text}", f"Worker {self.worker_id}")
                     await self._human_delay(250, 400)
-                    return
+                    return True
 
             raise Exception(f"No visible thinking level control found for {target_text}")
         except Exception as e:
@@ -2597,6 +2609,7 @@ class GeminiWebAutomation:
                 await self._human_delay(100, 200)
             except:
                 pass
+            return False
 
     async def _paste_image(self, image_path: str):
         """Paste an image via clipboard into Gemini Web."""
