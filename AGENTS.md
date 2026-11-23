@@ -9,6 +9,7 @@ This is the project's AGENTS.md
 - Gemini browser startup is lazy and the browser plus Playwright are fully released after idle time. Preserve the anti-background-throttling flags while the browser is warm.
 - A signed-out dedicated browser is `auth_required`, not ready. Keep Chromium open for a short manual sign-in window, then let idle cleanup release the process while preserving the dedicated profile.
 - South Server's headed Chromium must use X11 with GPU disabled. Native Wayland stalls before DevTools becomes ready in the GNOME RDP session. Keep a 1440×900 logical browser and resize only the outer X11 window to 3600×2100 with xdotool; GNOME/RDP otherwise displays Xwayland at roughly 40% size. Do not maximize against the monitor-less RDP root.
+- Prefer a live desktop X11 display, but do not depend on RDP staying connected: when no usable display exists, start a private Xvfb lazily with Chromium and stop it at browser teardown. Do not keep a permanent virtual display alive.
 - Launch the matched Playwright Chromium directly and attach over localhost CDP so the worker owns the browser PID and can cap its transient systemd app scope. The SIGTRAP root cause is the retained `Default/Preferences` file, not CDP itself.
 - Chromium moves the browser tree into `app-org.chromium.Chromium-<pid>.scope`. Keep runtime-specific stale-scope cleanup and the 2 GiB browser-scope cap; the API service cgroup alone does not own that scope.
 - Match Gemini by semantic selectors and visible labels, never generated classes or menu positions. Ignore numeric model versions.

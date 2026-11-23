@@ -77,7 +77,15 @@ For long calls, set `"async": true`. The submit request returns HTTP 202 with a 
 
 ## Ubuntu setup
 
-The host needs Python 3.14+ and `agy` if the Agy backend is wanted.
+The host needs Python 3.14+ and `agy` if the Agy backend is wanted. Gemini
+Web also uses X11 utilities for its visible RDP window and private no-RDP
+fallback. On Ubuntu, install them once:
+
+```bash
+sudo apt install xvfb x11-utils xdotool
+```
+
+Then install the Python/browser runtime:
 
 ```bash
 cd "$HOME/Gemini Studio API"
@@ -103,7 +111,9 @@ On the first Gemini request, a visible Chromium window opens. If Gemini shows a
 sign-in page, sign in once in that window and retry the request. The successful
 retry uses the same dedicated profile on later launches.
 While sign-in is required the API reports HTTP 503 and keeps that dedicated
-window open for 15 minutes.
+window open for 15 minutes when a visible desktop is available. If authentication
+expires while no desktop session exists, the private virtual display is released;
+connect RDP and retry so the sign-in window is visible.
 
 ## Run
 
@@ -125,7 +135,11 @@ systemctl --user status gemini-studio-api.service
 
 The unit starts at boot through the user systemd manager and uses `Restart=always`.
 Chromium is still lazy: when a request arrives it refreshes the current desktop
-session environment before launch. The API service is capped at 3 GiB RAM and
+session environment before launch. If no usable desktop X11 display exists (for
+example, after the RDP session has ended), the worker starts a private Xvfb only
+for Chromium's lifetime and tears it down with the browser. A live desktop
+display is always preferred so first-time or renewed Google sign-in remains
+visible when RDP is connected. The API service is capped at 3 GiB RAM and
 512 MiB swap. Chromium creates its own Linux application scope, so the worker
 detects that scope, caps it separately at 2 GiB RAM and 256 MiB swap, and
 retires stale browser processes/scopes on API startup. The browser process and

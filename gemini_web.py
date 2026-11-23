@@ -1619,6 +1619,30 @@ class GeminiWebAutomation:
         except:
             pass
 
+    def _reconcile_tracked_configuration(
+        self, snapshot: Optional[Dict[str, Any]]
+    ) -> None:
+        """Refresh tracked configuration from a snapshot without another UI query."""
+        snap = snapshot or {}
+        if not int(snap.get("model_picker_count") or 0):
+            return
+        picker_text = " ".join(
+            str(snap.get(key) or "")
+            for key in ("model_button_text", "model_button_aria_label")
+        ).strip()
+        observed_model = model_family_from_ui(picker_text)
+        if not observed_model:
+            return
+        if (
+            self._current_selected_model
+            and observed_model != self._current_selected_model
+        ):
+            self._current_selected_thinking_level = None
+        self._current_selected_model = observed_model
+        observed_thinking = thinking_level_from_picker_text(picker_text)
+        if observed_thinking:
+            self._current_selected_thinking_level = observed_thinking
+
     @staticmethod
     def _is_fresh_chat_ready(snapshot: Optional[Dict[str, Any]]) -> bool:
         snap = snapshot or {}
@@ -1630,10 +1654,14 @@ class GeminiWebAutomation:
             and not snap.get("error_page_500")
         )
 
-    async def _ensure_fresh_chat(self) -> bool:
+    async def _ensure_fresh_chat(
+        self,
+        baseline: Optional[Dict[str, Any]] = None,
+    ) -> bool:
         """Ensure the page is the current Gemini /app with an empty composer."""
-        baseline = await self._capture_state_snapshot()
+        baseline = baseline or await self._capture_state_snapshot()
         if self._is_fresh_chat_ready(baseline) and self.page.url.rstrip("/").endswith("gemini.google.com/app"):
+            self._reconcile_tracked_configuration(baseline)
             return True
 
         try:
@@ -1646,6 +1674,7 @@ class GeminiWebAutomation:
         while time.time() < deadline:
             snapshot = await self._capture_state_snapshot()
             if self._is_fresh_chat_ready(snapshot) and self.page.url.rstrip("/").endswith("gemini.google.com/app"):
+                self._reconcile_tracked_configuration(snapshot)
                 return True
             if snapshot.get("sign_in_visible"):
                 break
@@ -1666,7 +1695,7 @@ class GeminiWebAutomation:
             if snapshot.get("stop_visible"):
                 log("Ready reset refused: generation is still active", f"Worker {self.worker_id}")
                 return False
-            return await self._ensure_fresh_chat()
+            return await self._ensure_fresh_chat(snapshot)
         finally:
             self._request_id = previous_request_id
 
@@ -1701,7 +1730,7 @@ class GeminiWebAutomation:
                             continue
                     raise Exception(f"Google 500 error page during init: {snapshot.get('page_title') or self.page.url}")
 
-                if not await self._ensure_fresh_chat():
+                if not await self._ensure_fresh_chat(snapshot):
                     snapshot = await self._capture_state_snapshot()
                     if snapshot.get("sign_in_visible"):
                         raise Exception(
@@ -1720,7 +1749,6 @@ class GeminiWebAutomation:
 
                 try:
                     await self.page.wait_for_selector(input_selector, timeout=30000)
-                    await self._human_delay(500, 1000)
                     snapshot = await self._capture_state_snapshot()
                     if snapshot.get("sign_in_visible"):
                         raise Exception(
@@ -1766,6 +1794,26 @@ class GeminiWebAutomation:
         if not self._initialized: 
             return {"success": False, "error": "Not initialized"}
 
+        web_started = time.monotonic()
+        submitted_at: Optional[float] = None
+        generation_confirmed_at: Optional[float] = None
+
+        def success_payload(response: str, raw_response: str) -> Dict[str, Any]:
+            now = time.monotonic()
+            submitted = submitted_at or now
+            generation_confirmed = generation_confirmed_at or submitted
+            return {
+                "success": True,
+                "response": response,
+                "raw_response": raw_response,
+                "web_execution_ms": {
+                    "pre_send": int((submitted - web_started) * 1000),
+                    "start_confirm": int((generation_confirmed - submitted) * 1000),
+                    "response_wait": int((now - generation_confirmed) * 1000),
+                    "total": int((now - web_started) * 1000),
+                },
+            }
+
         self._last_request_success = False
         # The finally block always cleans up an attachment path, including
         # failures during Chat reset or model selection.
@@ -1810,34 +1858,25 @@ class GeminiWebAutomation:
             # In headed mode, explicitly foreground the active worker page before send.
             try:
                 await self.page.bring_to_front()
-                await self._human_delay(60, 120)
             except:
                 pass
             
             # 0. Dismiss any stuck overlays/modals (Angular Material CDK overlays block clicks)
             try:
                 await self.page.keyboard.press("Escape")
-                await self._human_delay(100, 200)
                 # Also try clicking the backdrop if it exists
                 backdrop = self.page.locator('.cdk-overlay-backdrop')
                 if await backdrop.count() > 0:
                     log("Dismissing stuck overlay", f"Worker {self.worker_id}")
                     await backdrop.first.click(force=True)
-                    await self._human_delay(200, 400)
             except:
                 pass
             
             # 1. Fresh chat
-            if not await self._ensure_fresh_chat():
+            if not await self._ensure_fresh_chat(preflight):
                 return {"success": False, "error": "Fresh chat reset not confirmed"}
 
-            await self._human_delay()
-
             # 2. Model/thinking should already be preconfigured by WorkerPool.
-            configured, _ = await self.ensure_configuration(model, thinking_level)
-            if not configured:
-                return {"success": False, "error": "Requested Gemini configuration could not be confirmed"}
-
             # 3. Enter Prompt
             input_selector = await self._resolve_selector("input", require_visible=True, timeout_ms=2000)
             if not input_selector:
@@ -1846,7 +1885,6 @@ class GeminiWebAutomation:
                 return {"success": False, "error": err}
             input_area = self.page.locator(input_selector)
             await input_area.click()
-            await self._human_delay()
             
             # 3.5 Prepare and Enter Prompt (converts long prompts to .txt file in clipboard/attachment if >= THRESHOLD)
             temp_prompt_file = None
@@ -1854,16 +1892,46 @@ class GeminiWebAutomation:
                 input_area, prompt, images, use_search=use_search
             )
             
+            prompt_len = len((filled_text or "").strip())
+
+            # Clipboard paste can make the visible text appear one event-loop
+            # turn before Gemini's composer is actually ready to accept Send.
+            # Require two consecutive ready snapshots instead of a fixed
+            # human-style sleep.
+            pre_send_snapshot = None
+            stable_ready_samples = 0
+            settle_deadline = time.monotonic() + 2.0
+            while time.monotonic() < settle_deadline:
+                candidate = await self._capture_state_snapshot()
+                candidate_input_len = int(candidate.get("input_text_len") or 0)
+                input_ready = (
+                    prompt_len == 0
+                    or candidate_input_len >= max(1, prompt_len // 2)
+                )
+                if (
+                    input_ready
+                    and candidate.get("send_visible")
+                    and not candidate.get("stop_visible")
+                    and not candidate.get("transition_state")
+                ):
+                    stable_ready_samples += 1
+                    pre_send_snapshot = candidate
+                    if stable_ready_samples >= 2:
+                        break
+                else:
+                    stable_ready_samples = 0
+                await asyncio.sleep(0.05)
+
             # Capture state BEFORE sending. These baselines drive all later
             # "did generation start?" checks; taking them after a send attempt
             # can make a real in-flight request look unsent.
-            pre_send_snapshot = await self._capture_state_snapshot()
+            if pre_send_snapshot is None:
+                pre_send_snapshot = await self._capture_state_snapshot()
             pre_send_count = await self.page.locator(copy_selector).count()
             pre_send_resp_count = int(pre_send_snapshot.get("response_count") or 0)
             pre_send_resp_len = int(pre_send_snapshot.get("last_response_len") or 0)
             pre_send_resp_sig = str(pre_send_snapshot.get("last_response_signature") or "")
             pre_send_user_query_count = int(pre_send_snapshot.get("user_query_count") or 0)
-            prompt_len = len((filled_text or "").strip())
 
             # 4. Submit once from the focused composer.
 
@@ -1891,6 +1959,7 @@ class GeminiWebAutomation:
             
             async def submit_once() -> bool:
                 """Submit exactly once using the interaction proven for this model family."""
+                nonlocal submitted_at
                 use_enter = False
                 log(
                     f"Attempting single {'Enter-key' if use_enter else 'Send-button'} submission",
@@ -1922,9 +1991,15 @@ class GeminiWebAutomation:
                                 continue
                             if use_enter:
                                 await input_area.press("Enter")
+                                submitted_at = time.monotonic()
                                 log("Single Enter-key submission dispatched", f"Worker {self.worker_id}")
                             else:
-                                await send_btn.click()
+                                # Visibility/enabled/composer stability are
+                                # already verified above. Skip Playwright's
+                                # extra geometry/actionability wait, which can
+                                # cost ~1s on GNOME RDP animations.
+                                await send_btn.click(force=True, timeout=2000)
+                                submitted_at = time.monotonic()
                                 log("Single Send-button click dispatched", f"Worker {self.worker_id}")
                             return True
                 except:
@@ -1944,68 +2019,102 @@ class GeminiWebAutomation:
                 self._track_error("Composer submission failed before dispatch", "send_btn", "send_message", snapshot)
                 return {"success": False, "error": "Composer submission failed before dispatch"}
 
-            # 4.5 Observe only. Never submit again from this tab after dispatch:
-            # Gemini can morph Send into Stop immediately, so a second click can
-            # cancel the generation that just started.
-            start_observe_seconds = 6.0
-            start_poll_seconds = UI_POLL_SECONDS
-            generation_started = False
+            async def observe_generation_start(seconds: float):
+                start_signal = ""
+                weak_start_signal = ""
+                weak_start_count = 0
+                last_snap = None
+                observe_deadline = time.time() + seconds
 
-            start_signal = ""
-            weak_start_signal = ""
-            weak_start_count = 0
-            last_snap = None
-            observe_deadline = time.time() + start_observe_seconds
+                while time.time() < observe_deadline:
+                    snap = await self._capture_state_snapshot()
+                    last_snap = snap
+                    outage = self._get_active_network_outage()
+                    if outage:
+                        outage_error, outage_diag = await self._build_network_outage_error()
+                        snap.update(outage_diag)
+                        self._track_error(
+                            outage_error,
+                            "send_btn",
+                            "verify_generation_started",
+                            snap,
+                        )
+                        return False, False, snap, {
+                            "success": False,
+                            "error": outage_error,
+                        }
+                    input_now = await get_input_text()
+                    input_now_len = len((input_now or "").strip())
+                    start_signal = start_signal_from_snapshot(snap, input_now_len)
 
-            while time.time() < observe_deadline:
-                snap = await self._capture_state_snapshot()
-                last_snap = snap
-                outage = self._get_active_network_outage()
-                if outage:
-                    outage_error, outage_diag = await self._build_network_outage_error()
-                    snap.update(outage_diag)
-                    self._track_error(outage_error, "send_btn", "verify_generation_started", snap)
-                    return {"success": False, "error": outage_error}
-                input_now = await get_input_text()
-                input_now_len = len((input_now or "").strip())
-                start_signal = start_signal_from_snapshot(snap, input_now_len)
+                    if start_signal:
+                        if start_signal in ("copy_increased", "response_increased", "stop_visible"):
+                            break
+                        if start_signal == weak_start_signal:
+                            weak_start_count += 1
+                        else:
+                            weak_start_signal = start_signal
+                            weak_start_count = 1
+                        if weak_start_count >= 3:
+                            break
+                    else:
+                        weak_start_signal = ""
+                        weak_start_count = 0
+
+                    await asyncio.sleep(UI_POLL_SECONDS)
 
                 if start_signal:
-                    if start_signal in ("copy_increased", "response_increased", "stop_visible"):
-                        break
-                    if start_signal == weak_start_signal:
-                        weak_start_count += 1
-                    else:
-                        weak_start_signal = start_signal
-                        weak_start_count = 1
-                    if weak_start_count >= 3:
-                        break
-                else:
-                    weak_start_signal = ""
-                    weak_start_count = 0
+                    log(
+                        f"Generation started (signal={start_signal})",
+                        f"Worker {self.worker_id}",
+                    )
+                    return True, False, last_snap, None
 
-                await asyncio.sleep(start_poll_seconds)
-
-            if start_signal:
-                log(f"Generation started (signal={start_signal})", f"Worker {self.worker_id}")
-                generation_started = True
-            else:
                 if last_snap is None:
                     last_snap = await self._capture_state_snapshot()
                 send_still_visible = bool(last_snap.get("send_visible"))
                 input_after = await get_input_text()
                 input_after_len = len((input_after or "").strip())
-                input_still_present = prompt_len > 0 and input_after_len >= max(1, prompt_len // 2)
+                input_still_present = (
+                    prompt_len > 0
+                    and input_after_len >= max(1, prompt_len // 2)
+                )
                 confirmed_unsent = send_still_visible and input_still_present
                 if not confirmed_unsent:
-                    log("Ambiguous start state; proceeding to response wait without resending", f"Worker {self.worker_id}")
-                    generation_started = True
+                    log(
+                        "Ambiguous start state; proceeding to response wait without resending",
+                        f"Worker {self.worker_id}",
+                    )
+                    return True, False, last_snap, None
+                return False, True, last_snap, None
+
+            # Never resend while submission state is ambiguous. A second click
+            # is allowed only after the first click is positively proven to
+            # have been a no-op: Send remains visible and the full prompt is
+            # still present with no accepted-request signal.
+            generation_started, confirmed_unsent, _, start_error = (
+                await observe_generation_start(6.0)
+            )
+            if start_error:
+                return start_error
+            if not generation_started and confirmed_unsent:
+                log(
+                    "Send click was confirmed as a no-op; retrying once",
+                    f"Worker {self.worker_id}",
+                )
+                if await submit_once():
+                    generation_started, _, _, start_error = (
+                        await observe_generation_start(6.0)
+                    )
+                    if start_error:
+                        return start_error
 
             if not generation_started:
                 snapshot = await self._capture_state_snapshot()
-                err = "Generation did not start after single send"
+                err = "Generation did not start after confirmed no-op retry"
                 self._track_error(err, "send_btn", "verify_generation_started", snapshot)
                 return {"success": False, "error": err}
+            generation_confirmed_at = time.monotonic()
             
             # Gemini can accept the request (user bubble + Stop state) while
             # retaining the full prompt as an editable draft. Clear only after
@@ -2079,6 +2188,16 @@ class GeminiWebAutomation:
                     self._track_error("Page evaluation hung in wait loop", "copy_btn", "wait_for_response_hung")
                     return {"success": False, "error": "Page evaluation hung in wait loop"}
                 except Exception as eval_err:
+                    closed_text = str(eval_err).lower()
+                    page_closed = False
+                    try:
+                        page_closed = bool(self.page and self.page.is_closed())
+                    except Exception:
+                        page_closed = True
+                    if page_closed or "target page, context or browser has been closed" in closed_text:
+                        error = "Browser context closed during response wait"
+                        log(error, f"Worker {self.worker_id}")
+                        return {"success": False, "error": error}
                     log(f"Page evaluation error in wait loop: {eval_err}", f"Worker {self.worker_id}")
                     await asyncio.sleep(0.5)
                     continue
@@ -2363,11 +2482,7 @@ class GeminiWebAutomation:
                         if recovered_text:
                             log("Recovered stalled generation via finalize path", f"Worker {self.worker_id}")
                             self._last_request_success = True
-                            return {
-                                "success": True,
-                                "response": recovered_text.strip(),
-                                "raw_response": recovered_text,
-                            }
+                            return success_payload(recovered_text.strip(), recovered_text)
 
                         error_snapshot = dict(snap)
                         try:
@@ -2429,11 +2544,7 @@ class GeminiWebAutomation:
                 f"Worker {self.worker_id}",
             )
             self._last_request_success = True
-            return {
-                "success": True,
-                "response": markdown.strip(),
-                "raw_response": markdown,
-            }
+            return success_payload(markdown.strip(), markdown)
 
         except Exception as e:
             self._generation_in_progress = False
@@ -2487,37 +2598,38 @@ class GeminiWebAutomation:
                 return False
             
             await btn.click()
-            await self._human_delay(300, 450)
 
             # Prefer semantic menu/option roles, then fall back to visible
             # buttons. Gemini changes wrapper elements more often than labels.
             item_count = 0
             selectors = self._selector_candidates("menu_item") + ["button"]
-            for selector in selectors:
-                items = self.page.locator(selector)
-                count = await items.count()
-                item_count += count
-                for i in range(count):
-                    item = items.nth(i)
-                    try:
-                        if not await item.is_visible():
+            deadline = time.monotonic() + 1.5
+            while time.monotonic() < deadline:
+                item_count = 0
+                for selector in selectors:
+                    items = self.page.locator(selector)
+                    count = await items.count()
+                    item_count += count
+                    for i in range(count):
+                        item = items.nth(i)
+                        try:
+                            if not await item.is_visible():
+                                continue
+                            if (await item.get_attribute("aria-disabled") or "").lower() == "true":
+                                continue
+                            if await item.get_attribute("disabled") is not None:
+                                continue
+                            text = (await item.inner_text()).strip()
+                        except Exception:
                             continue
-                        if (await item.get_attribute("aria-disabled") or "").lower() == "true":
-                            continue
-                        if await item.get_attribute("disabled") is not None:
-                            continue
-                        text = (await item.inner_text()).strip()
-                    except Exception:
-                        continue
-                    if self._matches_model(text, model_name):
-                        await item.click(timeout=2000)
-                        print(f"[Worker {self.worker_id}] Selected model: {model_name}")
-                        await self._human_delay(300, 600)
-                        return True
+                        if self._matches_model(text, model_name):
+                            await item.click(timeout=2000)
+                            print(f"[Worker {self.worker_id}] Selected model: {model_name}")
+                            return True
+                await asyncio.sleep(0.05)
 
             # If not found at all, close menu
             await self.page.keyboard.press("Escape")
-            await self._human_delay(100, 300)
             
             self._track_error(
                 f"Requested model family {model_name!r} not found",
@@ -2533,7 +2645,6 @@ class GeminiWebAutomation:
             # Ensure menu is closed
             try:
                 await self.page.keyboard.press("Escape")
-                await self._human_delay(100, 200)
             except:
                 pass
             return False
@@ -2549,53 +2660,57 @@ class GeminiWebAutomation:
                 return False
 
             await self.page.locator(model_selector).first.click()
-            await self._human_delay(300, 450)
 
             # Gemini's current picker nests Low/Medium/High behind a semantic
             # "Thinking level" control. Older layouts exposed the level labels
             # directly, so keep that path as a fallback. Never depend on menu
             # positions or generated class names.
             thinking_picker = None
-            for selector in (
-                "thinking-level-picker",
-                '[data-test-id="thinking-level-picker-desktop"]',
-                'gem-menu-item[value="thinking_level"]',
-            ):
-                matches = self.page.locator(selector)
-                for i in range(await matches.count()):
-                    candidate = matches.nth(i)
-                    if await candidate.is_visible():
-                        thinking_picker = candidate
+            picker_deadline = time.monotonic() + 1.5
+            while thinking_picker is None and time.monotonic() < picker_deadline:
+                for selector in (
+                    "thinking-level-picker",
+                    '[data-test-id="thinking-level-picker-desktop"]',
+                    'gem-menu-item[value="thinking_level"]',
+                ):
+                    matches = self.page.locator(selector)
+                    for i in range(await matches.count()):
+                        candidate = matches.nth(i)
+                        if await candidate.is_visible():
+                            thinking_picker = candidate
+                            break
+                    if thinking_picker is not None:
                         break
-                if thinking_picker is not None:
-                    break
 
-            if thinking_picker is None:
-                menu_items = self.page.locator("gem-menu-item")
-                for i in range(await menu_items.count()):
-                    candidate = menu_items.nth(i)
-                    if not await candidate.is_visible():
-                        continue
-                    text = (await candidate.inner_text()).strip().lower()
-                    if "thinking level" in text:
-                        thinking_picker = candidate
-                        break
+                if thinking_picker is None:
+                    menu_items = self.page.locator("gem-menu-item")
+                    for i in range(await menu_items.count()):
+                        candidate = menu_items.nth(i)
+                        if not await candidate.is_visible():
+                            continue
+                        text = (await candidate.inner_text()).strip().lower()
+                        if "thinking level" in text:
+                            thinking_picker = candidate
+                            break
+                if thinking_picker is None:
+                    await asyncio.sleep(0.05)
 
             if thinking_picker is not None:
                 await thinking_picker.click(timeout=2000)
-                await self._human_delay(150, 300)
 
             # Select by exact visible text, never by position.
-            option = self.page.get_by_text(target_text, exact=True)
-            count = await option.count()
-            for i in range(count):
-                candidate = option.nth(i)
-                if await candidate.is_visible():
-                    await candidate.click(timeout=2000)
-                    self._current_selected_thinking_level = target_text
-                    log(f"Selected thinking level: {target_text}", f"Worker {self.worker_id}")
-                    await self._human_delay(250, 400)
-                    return True
+            option_deadline = time.monotonic() + 1.5
+            while time.monotonic() < option_deadline:
+                option = self.page.get_by_text(target_text, exact=True)
+                count = await option.count()
+                for i in range(count):
+                    candidate = option.nth(i)
+                    if await candidate.is_visible():
+                        await candidate.click(timeout=2000)
+                        self._current_selected_thinking_level = target_text
+                        log(f"Selected thinking level: {target_text}", f"Worker {self.worker_id}")
+                        return True
+                await asyncio.sleep(0.05)
 
             raise Exception(f"No visible thinking level control found for {target_text}")
         except Exception as e:
@@ -2604,9 +2719,7 @@ class GeminiWebAutomation:
             # Ensure menu is closed
             try:
                 await self.page.keyboard.press("Escape")
-                await self._human_delay(100, 200)
                 await self.page.keyboard.press("Escape")
-                await self._human_delay(100, 200)
             except:
                 pass
             return False
@@ -2792,7 +2905,6 @@ class GeminiWebAutomation:
         async with GeminiWebAutomation._get_clipboard_lock():
             await self.page.evaluate("text => navigator.clipboard.writeText(text)", text)
             await input_area.press("Control+v")
-        await self._human_delay(120, 220)
 
     async def _prepare_and_enter_prompt(
         self,

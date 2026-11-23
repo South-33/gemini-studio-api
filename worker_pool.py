@@ -33,6 +33,9 @@ class WorkerPool:
         self.playwright = None
         self.browser = None
         self.browser_process: subprocess.Popen | None = None
+        self.virtual_display_process: subprocess.Popen | None = None
+        self.browser_display: str | None = None
+        self.browser_uses_virtual_display = False
         self.browser_scope_unit: str | None = None
         self.browser_profile_dir: Path | None = None
         self.context = None
@@ -55,6 +58,8 @@ class WorkerPool:
         self._worker_recreation_count = 0
         self._last_worker_recreation: Optional[Dict[str, Any]] = None
         self._last_ready_reset: Optional[Dict[str, Any]] = None
+        self._last_request_timing: Optional[Dict[str, Any]] = None
+        self._needs_ready_reset = False
 
     @property
     def worker(self) -> Optional[GeminiWebAutomation]:
@@ -117,6 +122,95 @@ class WorkerPool:
             if separator and key in wanted and value:
                 environment[key] = value
         return environment
+
+    @staticmethod
+    def _display_is_usable(environment: dict[str, str]) -> bool:
+        """Return whether Chromium can currently connect to the configured X11 display."""
+        display = environment.get("DISPLAY")
+        if not display:
+            return False
+        xdpyinfo = shutil.which("xdpyinfo")
+        if not xdpyinfo:
+            if not display.startswith(":"):
+                return True
+            number = display[1:].split(".", 1)[0]
+            return bool(number) and (Path("/tmp/.X11-unix") / f"X{number}").exists()
+        try:
+            result = subprocess.run(
+                [xdpyinfo, "-display", display],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+                check=False,
+                env=environment,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return result.returncode == 0
+
+    def _start_virtual_display(self, environment: dict[str, str]) -> dict[str, str]:
+        """Start a private Xvfb only when no live desktop X11 display exists."""
+        xvfb = shutil.which("Xvfb")
+        if not xvfb:
+            raise RuntimeError("No usable X11 display and Xvfb is not installed")
+
+        for number in range(99, 89, -1):
+            socket_path = Path("/tmp/.X11-unix") / f"X{number}"
+            lock_path = Path(f"/tmp/.X{number}-lock")
+            if socket_path.exists() or lock_path.exists():
+                continue
+            display = f":{number}"
+            candidate = dict(environment)
+            candidate["DISPLAY"] = display
+            candidate.pop("XAUTHORITY", None)
+            process = subprocess.Popen(
+                [
+                    xvfb,
+                    display,
+                    "-screen",
+                    "0",
+                    "1440x900x24",
+                    "-nolisten",
+                    "tcp",
+                    "-ac",
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    break
+                if self._display_is_usable(candidate):
+                    self.virtual_display_process = process
+                    self.browser_display = display
+                    self.browser_uses_virtual_display = True
+                    log(
+                        f"No usable desktop X11 display; using temporary Xvfb {display}",
+                        "Worker",
+                    )
+                    return candidate
+                time.sleep(0.05)
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+            try:
+                process.wait(timeout=1)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+
+        raise RuntimeError("Could not start a private Xvfb display")
+
+    def _browser_launch_environment(self) -> dict[str, str]:
+        environment = self._browser_environment()
+        self.browser_display = environment.get("DISPLAY")
+        self.browser_uses_virtual_display = False
+        if self._display_is_usable(environment):
+            return environment
+        return self._start_virtual_display(environment)
 
     @staticmethod
     def _state_dir() -> Path:
@@ -184,6 +278,41 @@ class WorkerPool:
             if unit.endswith(".scope"):
                 return unit
         return None
+
+    @staticmethod
+    def _cgroup_metrics_for_pid(pid: int) -> Dict[str, int]:
+        """Read cheap cgroup-v2 resource counters for diagnostics only."""
+        try:
+            lines = Path(f"/proc/{pid}/cgroup").read_text(encoding="utf-8").splitlines()
+            cgroup_path = next(
+                line.split("::", 1)[1]
+                for line in lines
+                if "::" in line
+            )
+            root = Path("/sys/fs/cgroup") / cgroup_path.lstrip("/")
+        except (OSError, StopIteration, IndexError):
+            return {}
+
+        metrics: Dict[str, int] = {}
+        for key, filename in (
+            ("memory_current_bytes", "memory.current"),
+            ("memory_peak_bytes", "memory.peak"),
+            ("tasks_current", "pids.current"),
+        ):
+            try:
+                metrics[key] = int((root / filename).read_text(encoding="utf-8").strip())
+            except (OSError, ValueError):
+                pass
+        try:
+            cpu_stat = (root / "cpu.stat").read_text(encoding="utf-8").splitlines()
+            for line in cpu_stat:
+                name, _, value = line.partition(" ")
+                if name == "usage_usec" and value.isdigit():
+                    metrics["cpu_usage_usec"] = int(value)
+                    break
+        except OSError:
+            pass
+        return metrics
 
     @classmethod
     def _is_profile_browser_command(cls, command: bytes) -> bool:
@@ -335,7 +464,9 @@ class WorkerPool:
             raise RuntimeError(f"Could not apply Chromium scope limits: {detail}")
         self.browser_scope_unit = scope
 
-    def _resize_browser_window_for_rdp(self) -> None:
+    def _resize_browser_window_for_rdp(
+        self, environment: dict[str, str] | None = None
+    ) -> None:
         """Compensate for GNOME RDP's Xwayland downscaling on South Server.
 
         Chromium reports a normal 1440x900 logical window in CDP, but the RDP
@@ -345,9 +476,9 @@ class WorkerPool:
         """
         process = self.browser_process
         xdotool = shutil.which("xdotool")
-        if process is None or not xdotool:
+        if process is None or not xdotool or self.browser_uses_virtual_display:
             return
-        environment = self._browser_environment()
+        environment = environment or self._browser_environment()
         try:
             search = subprocess.run(
                 [xdotool, "search", "--pid", str(process.pid)],
@@ -421,6 +552,7 @@ class WorkerPool:
         active_port = profile_dir / "DevToolsActivePort"
         active_port.unlink(missing_ok=True)
 
+        browser_environment = self._browser_launch_environment()
         command = [
             self.playwright.chromium.executable_path,
             "--no-sandbox",
@@ -436,7 +568,7 @@ class WorkerPool:
         self.browser_process = subprocess.Popen(
             command,
             cwd=profile_dir,
-            env=self._browser_environment(),
+            env=browser_environment,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -489,49 +621,68 @@ class WorkerPool:
                 break
             await asyncio.sleep(0.1)
         await asyncio.to_thread(self._configure_browser_scope)
-        await asyncio.to_thread(self._resize_browser_window_for_rdp)
+        await asyncio.to_thread(self._resize_browser_window_for_rdp, browser_environment)
         if not self.browser.contexts:
             raise RuntimeError("Chromium exposed no persistent browser context")
         self.context = self.browser.contexts[0]
         await self._grant_clipboard_permissions()
 
+    @staticmethod
+    def _is_retryable_browser_start_error(exc: Exception) -> bool:
+        text = str(exc).lower()
+        return (
+            "chromium exited during startup with code -5" in text
+            or "chromium exited before cdp attach with code -5" in text
+        )
+
     def _stop_browser_process(self) -> None:
         process = self.browser_process
         self.browser_process = None
+        virtual_display = self.virtual_display_process
+        self.virtual_display_process = None
+        self.browser_display = None
+        self.browser_uses_virtual_display = False
         scope = self.browser_scope_unit
         self.browser_scope_unit = None
         profile_dir = self.browser_profile_dir
         self.browser_profile_dir = None
         if scope:
             self._stop_user_scope(scope)
-        if process is None:
-            return
-        process_group = process.pid
-        try:
-            os.killpg(process_group, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        except OSError:
-            pass
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
+        if process is not None:
+            process_group = process.pid
             try:
-                os.killpg(process_group, 0)
-            except ProcessLookupError:
-                break
+                os.killpg(process_group, signal.SIGTERM)
+            except (ProcessLookupError, OSError):
+                pass
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                try:
+                    os.killpg(process_group, 0)
+                except (ProcessLookupError, OSError):
+                    break
+                time.sleep(0.1)
+            try:
+                os.killpg(process_group, signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+            try:
+                process.wait(timeout=2)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        if virtual_display is not None:
+            try:
+                os.killpg(virtual_display.pid, signal.SIGTERM)
+            except (ProcessLookupError, OSError):
+                pass
+            try:
+                virtual_display.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(virtual_display.pid, signal.SIGKILL)
+                except (ProcessLookupError, OSError):
+                    pass
             except OSError:
-                break
-            time.sleep(0.1)
-        try:
-            os.killpg(process_group, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        except OSError:
-            pass
-        try:
-            process.wait(timeout=2)
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+                pass
         if profile_dir:
             self._remove_profile_runtime_artifacts(profile_dir)
 
@@ -543,6 +694,7 @@ class WorkerPool:
             return False
 
         started = time.time()
+        startup_attempts = 1
         self._browser_state = "starting"
         try:
             reuse_auth_browser = bool(
@@ -563,7 +715,21 @@ class WorkerPool:
                     f"Launching Chromium ({reason}) with background throttling disabled",
                     "Worker",
                 )
-                await self._launch_browser_context()
+                try:
+                    await self._launch_browser_context()
+                except Exception as exc:
+                    if not self._is_retryable_browser_start_error(exc):
+                        raise
+                    startup_attempts = 2
+                    log(
+                        "Chromium SIGTRAP during cold start; cleaning up and retrying once",
+                        "Worker",
+                    )
+                    await self._close_browser_context(
+                        "starting",
+                        "recoverable Chromium startup SIGTRAP",
+                    )
+                    await self._launch_browser_context()
                 page = await self._replace_restored_pages()
             worker = await self._initialize_page(page)
             if not worker:
@@ -577,19 +743,31 @@ class WorkerPool:
                         "reason": reason,
                         "error": detail,
                         "duration_ms": int((time.time() - started) * 1000),
+                        "startup_attempts": startup_attempts,
                         "at_unix": int(time.time()),
                     }
                     log(detail, "Worker")
+                    if self.browser_uses_virtual_display:
+                        log(
+                            "Authentication needs a visible desktop; releasing private Xvfb",
+                            "Worker",
+                        )
+                        await self._close_browser_context(
+                            "auth_required",
+                            "authentication requires visible desktop",
+                        )
                     return False
                 raise RuntimeError(detail)
 
             self.workers = [worker]
+            self._needs_ready_reset = False
             self._browser_state = "warm"
             self._browser_start_count += 1
             self._last_browser_start = {
                 "ok": True,
                 "reason": reason,
                 "duration_ms": int((time.time() - started) * 1000),
+                "startup_attempts": startup_attempts,
                 "at_unix": int(time.time()),
             }
             log("Gemini worker ready", "Worker")
@@ -600,6 +778,7 @@ class WorkerPool:
                 "reason": reason,
                 "error": str(exc),
                 "duration_ms": int((time.time() - started) * 1000),
+                "startup_attempts": startup_attempts,
                 "at_unix": int(time.time()),
             }
             log(f"Browser warm-up failed: {exc}", "Worker")
@@ -607,12 +786,35 @@ class WorkerPool:
             return False
 
     async def _ensure_browser_ready(self, reason: str) -> bool:
-        if self.worker and self._initialized and self._browser_state != "cold":
-            self._browser_state = "warm"
-            return True
+        if self.worker and self._initialized and self._browser_state == "warm":
+            process = self.browser_process
+            page = self.worker.page
+            runtime_alive = bool(
+                process
+                and process.poll() is None
+                and self.browser
+                and self.browser.is_connected()
+                and self.context
+                and page
+                and not page.is_closed()
+            )
+            if runtime_alive:
+                return True
+
+            log(
+                f"Chromium disappeared while marked warm; recovering before {reason}",
+                "Worker",
+            )
+            await self._close_browser_context(
+                "error",
+                f"browser runtime disappeared before {reason}",
+            )
         return await self._warm_browser(reason)
 
     async def _close_browser_context(self, state: str, reason: str) -> None:
+        release_playwright = state in {"cold", "error", "stopped"} or (
+            state == "auth_required" and self.browser_uses_virtual_display
+        )
         worker = self.worker
         self.workers.clear()
         if worker:
@@ -628,9 +830,10 @@ class WorkerPool:
             finally:
                 self.browser = None
         self.context = None
-        if self.browser_process:
+        self._needs_ready_reset = False
+        if self.browser_process or self.virtual_display_process:
             await asyncio.to_thread(self._stop_browser_process)
-        if state in {"cold", "error", "stopped"} and self.playwright:
+        if release_playwright and self.playwright:
             try:
                 await self.playwright.stop()
             except Exception as exc:
@@ -737,6 +940,7 @@ class WorkerPool:
                 success = new_worker is not None
                 if success:
                     self.workers = [new_worker]
+                    self._needs_ready_reset = False
                     if old_worker:
                         try:
                             await old_worker.close()
@@ -769,6 +973,14 @@ class WorkerPool:
         worker = self.worker
         if not worker:
             return False, "Gemini worker disappeared"
+
+        target_thinking = thinking_level or "Medium"
+        if (
+            model
+            and worker._current_selected_model == model
+            and worker._current_selected_thinking_level == target_thinking
+        ):
+            return True, None
 
         ok, model_family_changed = await worker.ensure_configuration(model, thinking_level)
         if not ok:
@@ -831,6 +1043,10 @@ class WorkerPool:
         if not self._initialized:
             return {"success": False, "error": "Gemini worker pool is not ready"}
 
+        request_started = time.monotonic()
+        timing: Dict[str, Any] = {"request_id": request_id}
+        execution_started: float | None = None
+        browser_resources_before: Dict[str, int] | None = None
         queued_at = time.time()
         self._queued_requests += 1
         waiting = True
@@ -839,11 +1055,17 @@ class WorkerPool:
                 self._queued_requests -= 1
                 waiting = False
                 wait_ms = int((time.time() - queued_at) * 1000)
+                timing["queue_wait_ms"] = wait_ms
                 if wait_ms >= 250:
                     log(f"[{request_id}] Queue wait: {wait_ms}ms", "Worker")
 
                 self._active_request = True
-                if not await self._ensure_browser_ready(f"request {request_id}"):
+                phase_started = time.monotonic()
+                browser_ready = await self._ensure_browser_ready(f"request {request_id}")
+                timing["browser_ready_ms"] = int(
+                    (time.monotonic() - phase_started) * 1000
+                )
+                if not browser_ready:
                     startup_error = str(
                         (self._last_browser_start or {}).get("error")
                         or "browser could not be started"
@@ -856,9 +1078,41 @@ class WorkerPool:
                         "queue_wait_ms": wait_ms,
                         "attempts": 0,
                     }
+                browser_pid = self.browser_process.pid if self.browser_process else None
+                if browser_pid:
+                    browser_resources_before = self._cgroup_metrics_for_pid(browser_pid)
 
+                if self._needs_ready_reset:
+                    phase_started = time.monotonic()
+                    reset_ready = await self._ensure_ready_after_request(
+                        f"before request {request_id}"
+                    )
+                    timing["deferred_reset_ms"] = int(
+                        (time.monotonic() - phase_started) * 1000
+                    )
+                    if not reset_ready:
+                        browser_ready = await self._ensure_browser_ready(
+                            f"recover after failed ready reset for request {request_id}"
+                        )
+                        if not browser_ready:
+                            return {
+                                "success": False,
+                                "error": (
+                                    "Gemini request failed: previous chat could not be reset"
+                                ),
+                                "queue_wait_ms": wait_ms,
+                                "attempts": 0,
+                            }
+                    self._needs_ready_reset = False
+                else:
+                    timing["deferred_reset_ms"] = 0
+
+                phase_started = time.monotonic()
                 configured, error = await self._prepare_request_configuration(
                     model, thinking_level, request_id
+                )
+                timing["configuration_ms"] = int(
+                    (time.monotonic() - phase_started) * 1000
                 )
                 if not configured:
                     return {
@@ -872,6 +1126,7 @@ class WorkerPool:
                 native_retry_used = False
                 max_attempts = 3
                 request_deadline = time.monotonic() + REQUEST_TOTAL_BUDGET_SECONDS
+                execution_started = time.monotonic()
 
                 for attempt in range(1, max_attempts + 1):
                     remaining = request_deadline - time.monotonic()
@@ -933,17 +1188,17 @@ class WorkerPool:
                                     result = retried
 
                     response = str(result.get("response") or "")
+                    web_execution = result.get("web_execution_ms")
+                    if isinstance(web_execution, dict):
+                        timing["web_execution_ms"] = dict(web_execution)
                     retryable = self._is_retryable_response_rejection(result)
                     if result.get("success") and response.strip():
                         if not self._is_transient_gemini_refusal(response):
                             result["queue_wait_ms"] = wait_ms
                             result["attempts"] = attempt
                             result["effective_thinking_level"] = thinking_level
-                            result["ready_for_next_request"] = (
-                                await self._ensure_ready_after_request(
-                                    f"request {request_id} completed"
-                                )
-                            )
+                            self._needs_ready_reset = True
+                            result["ready_for_next_request"] = False
                             return result
                         last_error = "Gemini returned its generic transient refusal"
                     else:
@@ -982,9 +1237,10 @@ class WorkerPool:
                                 continue
                             last_error = f"Gemini request failed: {error}"
 
-                    await self._ensure_ready_after_request(
+                    recovered = await self._ensure_ready_after_request(
                         f"request {request_id} failed"
                     )
+                    self._needs_ready_reset = not recovered
                     break
 
                 log(f"[{request_id}] Request failed: {last_error}", "Worker")
@@ -996,6 +1252,26 @@ class WorkerPool:
                     "effective_thinking_level": thinking_level,
                 }
         finally:
+            if execution_started is not None:
+                timing["execution_ms"] = int(
+                    (time.monotonic() - execution_started) * 1000
+                )
+            timing["total_ms"] = int((time.monotonic() - request_started) * 1000)
+            browser_pid = self.browser_process.pid if self.browser_process else None
+            if browser_pid:
+                resources = self._cgroup_metrics_for_pid(browser_pid)
+                if resources:
+                    timing["browser_resources_after"] = resources
+                    before_cpu = (
+                        browser_resources_before or {}
+                    ).get("cpu_usage_usec")
+                    after_cpu = resources.get("cpu_usage_usec")
+                    if isinstance(before_cpu, int) and isinstance(after_cpu, int):
+                        timing["browser_cpu_ms"] = max(
+                            0,
+                            (after_cpu - before_cpu) // 1000,
+                        )
+            self._last_request_timing = timing
             if waiting:
                 self._queued_requests = max(0, self._queued_requests - 1)
             else:
@@ -1043,6 +1319,7 @@ class WorkerPool:
     def get_diagnostics(self) -> Dict[str, Any]:
         worker = self.worker
         idle_for = max(0, int(time.time() - self._last_activity))
+        browser_pid = self.browser_process.pid if self.browser_process else None
         return {
             "initialized": self._initialized,
             "parallel_capacity": 1,
@@ -1056,14 +1333,23 @@ class WorkerPool:
             "last_browser_start": self._last_browser_start,
             "last_browser_stop": self._last_browser_stop,
             "browser_channel": "playwright-chromium-cdp",
-            "browser_pid": self.browser_process.pid if self.browser_process else None,
+            "browser_pid": browser_pid,
+            "browser_display": self.browser_display,
+            "browser_virtual_display": self.browser_uses_virtual_display,
             "browser_scope_unit": self.browser_scope_unit,
+            "browser_resources": (
+                self._cgroup_metrics_for_pid(browser_pid)
+                if browser_pid
+                else {}
+            ),
             "profile_state_present": self._profile_dir().is_dir(),
             "runtime_profile_active": bool(self.browser_profile_dir),
             "startup_pages_closed": self._startup_pages_closed,
             "worker_recreation_count": self._worker_recreation_count,
             "last_worker_recreation": self._last_worker_recreation,
             "last_ready_reset": self._last_ready_reset,
+            "last_request_timing": self._last_request_timing,
+            "needs_ready_reset": self._needs_ready_reset,
             "last_activity_unix": int(self._last_activity),
             "workers": [{
                 "worker_id": 1,

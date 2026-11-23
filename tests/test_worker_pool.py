@@ -50,6 +50,35 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(WorkerPool._is_profile_browser_command(nul_argv))
         self.assertFalse(WorkerPool._is_profile_browser_command(child))
 
+    def test_only_sigtrap_browser_start_is_retryable(self):
+        self.assertTrue(
+            WorkerPool._is_retryable_browser_start_error(
+                RuntimeError("Chromium exited before CDP attach with code -5")
+            )
+        )
+        self.assertTrue(
+            WorkerPool._is_retryable_browser_start_error(
+                RuntimeError("Chromium exited during startup with code -5")
+            )
+        )
+        self.assertFalse(
+            WorkerPool._is_retryable_browser_start_error(
+                RuntimeError("Chromium did not publish a DevTools endpoint")
+            )
+        )
+
+    async def test_auth_required_virtual_display_releases_playwright(self):
+        pool = WorkerPool()
+        pool.browser_uses_virtual_display = True
+        pool.virtual_display_process = SimpleNamespace(pid=4321)
+        pool.playwright = SimpleNamespace(stop=AsyncMock())
+        with patch.object(pool, "_stop_browser_process") as stop_browser:
+            await pool._close_browser_context("auth_required", "test")
+
+        stop_browser.assert_called_once()
+        self.assertIsNone(pool.playwright)
+        self.assertEqual(pool._browser_state, "auth_required")
+
     async def test_auth_required_browser_is_eventually_released(self):
         pool = WorkerPool(idle_browser_seconds=60, idle_poll_seconds=0.01)
         await pool.init()
@@ -102,6 +131,50 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
                     (profile / "Default" / "Cookies").read_text(encoding="utf-8"),
                     "auth",
                 )
+
+    def test_live_display_is_preferred_over_virtual_display(self):
+        pool = WorkerPool()
+        environment = {"DISPLAY": ":7"}
+        with (
+            patch.object(pool, "_browser_environment", return_value=environment),
+            patch.object(pool, "_display_is_usable", return_value=True),
+            patch.object(pool, "_start_virtual_display") as start_virtual,
+        ):
+            result = pool._browser_launch_environment()
+
+        self.assertIs(result, environment)
+        self.assertEqual(pool.browser_display, ":7")
+        self.assertFalse(pool.browser_uses_virtual_display)
+        start_virtual.assert_not_called()
+
+    def test_missing_display_starts_private_xvfb(self):
+        pool = WorkerPool()
+        process = SimpleNamespace(pid=4321, poll=lambda: None)
+        with (
+            patch.object(pool, "_browser_environment", return_value={"DISPLAY": ":stale"}),
+            patch.object(pool, "_display_is_usable", side_effect=[False, True]),
+            patch("worker_pool.shutil.which", return_value="/usr/bin/Xvfb"),
+            patch("worker_pool.Path.exists", return_value=False),
+            patch("worker_pool.subprocess.Popen", return_value=process) as popen,
+        ):
+            result = pool._browser_launch_environment()
+
+        self.assertEqual(result["DISPLAY"], ":99")
+        self.assertEqual(pool.browser_display, ":99")
+        self.assertTrue(pool.browser_uses_virtual_display)
+        self.assertIs(pool.virtual_display_process, process)
+        command = popen.call_args.args[0]
+        self.assertEqual(command[:2], ["/usr/bin/Xvfb", ":99"])
+        self.assertIn("-nolisten", command)
+        self.assertIn("-ac", command)
+
+    def test_rdp_resize_skips_private_virtual_display(self):
+        pool = WorkerPool()
+        pool.browser_process = SimpleNamespace(pid=123)
+        pool.browser_uses_virtual_display = True
+        with patch("worker_pool.subprocess.run") as run:
+            pool._resize_browser_window_for_rdp({"DISPLAY": ":99"})
+        run.assert_not_called()
 
     def test_rdp_resize_targets_largest_browser_window(self):
         pool = WorkerPool()
@@ -160,6 +233,40 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(pool._initialized)
         pool._close_browser_context.assert_awaited_once_with("error", "test")
         await pool.close()
+
+    async def test_dead_warm_browser_is_relaunched_before_request(self):
+        pool = WorkerPool()
+        await pool.init()
+        worker = FakeWorker([])
+        worker.page = SimpleNamespace(is_closed=lambda: False)
+        pool.workers = [worker]
+        pool._browser_state = "warm"
+        pool.browser_process = SimpleNamespace(poll=lambda: -5)
+        pool.browser = SimpleNamespace(is_connected=lambda: True)
+        pool.context = SimpleNamespace()
+        pool._close_browser_context = AsyncMock()
+        pool._warm_browser = AsyncMock(return_value=True)
+
+        self.assertTrue(await pool._ensure_browser_ready("request r1"))
+        pool._close_browser_context.assert_awaited_once_with(
+            "error", "browser runtime disappeared before request r1"
+        )
+        pool._warm_browser.assert_awaited_once_with("request r1")
+        await pool.close()
+
+    async def test_tracked_configuration_skips_redundant_ui_verification(self):
+        pool = WorkerPool()
+        worker = FakeWorker([])
+        worker._current_selected_model = "neon"
+        worker._current_selected_thinking_level = "Medium"
+        worker.ensure_configuration = AsyncMock(return_value=(True, False))
+        pool.workers = [worker]
+
+        ok, error = await pool._prepare_request_configuration("neon", "Medium", "r1")
+
+        self.assertTrue(ok)
+        self.assertIsNone(error)
+        worker.ensure_configuration.assert_not_awaited()
 
     async def test_init_is_truly_lazy(self):
         pool = WorkerPool()
@@ -223,6 +330,57 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
             pool.send_message("b", model="neon", thinking_level="Medium"),
         )
         self.assertEqual(max_active, 1)
+        await pool.close()
+
+    async def test_successful_cleanup_is_deferred_until_next_request(self):
+        pool = WorkerPool()
+        await pool.init()
+        worker = FakeWorker([
+            {"success": True, "response": "one"},
+            {"success": True, "response": "two"},
+        ])
+        pool.workers = [worker]
+        pool._browser_state = "warm"
+        pool._ensure_browser_ready = AsyncMock(return_value=True)
+        pool._prepare_request_configuration = AsyncMock(return_value=(True, None))
+        pool._ensure_ready_after_request = AsyncMock(return_value=True)
+
+        first = await pool.send_message(
+            "a", model="neon", thinking_level="Medium", request_id="r1"
+        )
+        self.assertTrue(first["success"])
+        self.assertTrue(pool._needs_ready_reset)
+        pool._ensure_ready_after_request.assert_not_awaited()
+
+        second = await pool.send_message(
+            "b", model="neon", thinking_level="Medium", request_id="r2"
+        )
+        self.assertTrue(second["success"])
+        pool._ensure_ready_after_request.assert_awaited_once_with("before request r2")
+        self.assertTrue(pool._needs_ready_reset)
+        await pool.close()
+
+    async def test_failed_deferred_reset_recovers_browser_before_request(self):
+        pool = WorkerPool()
+        await pool.init()
+        worker = FakeWorker([{"success": True, "response": "ok"}])
+        pool.workers = [worker]
+        pool._browser_state = "warm"
+        pool._needs_ready_reset = True
+        pool._ensure_browser_ready = AsyncMock(side_effect=[True, True])
+        pool._ensure_ready_after_request = AsyncMock(return_value=False)
+        pool._prepare_request_configuration = AsyncMock(return_value=(True, None))
+
+        result = await pool.send_message(
+            "next", model="neon", thinking_level="Medium", request_id="r2"
+        )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(
+            pool._ensure_browser_ready.await_args_list[1].args[0],
+            "recover after failed ready reset for request r2",
+        )
+        self.assertTrue(pool._needs_ready_reset)
         await pool.close()
 
 

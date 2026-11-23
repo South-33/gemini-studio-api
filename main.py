@@ -434,6 +434,10 @@ async def finish_async_job(
         trace["response_chars"] = len(content)
         trace["attempts"] = result.get("attempts")
         trace["queue_wait_ms"] = result.get("queue_wait_ms")
+        if backend == "gemini" and worker_pool:
+            worker_timing = getattr(worker_pool, "_last_request_timing", None)
+            if worker_timing and worker_timing.get("request_id") == job["request_id"]:
+                trace["worker_timing_ms"] = dict(worker_timing)
     except asyncio.CancelledError:
         task.cancel()
         raise
@@ -448,6 +452,9 @@ async def finish_async_job(
         job["finished_at"] = finished
         job["finished_unix"] = time.time()
         trace["finished_at"] = finished
+        started_unix = trace.get("started_unix")
+        if isinstance(started_unix, (int, float)):
+            trace["duration_ms"] = int((time.time() - started_unix) * 1000)
         prune_async_jobs()
 
 
@@ -579,6 +586,7 @@ async def chat_completions(request: Request):
     prompt_tokens_est = estimate_text_tokens(prompt) + (
         len(image_paths) * IMAGE_TOKEN_ESTIMATE
     )
+    started_unix = time.time()
     trace = {
         "request_id": request_id,
         "project": source["project"],
@@ -589,6 +597,7 @@ async def chat_completions(request: Request):
         "image_count": len(image_paths),
         "prompt_chars": prompt_chars,
         "status": "started",
+        "started_unix": started_unix,
         "started_at": datetime.now(timezone.utc).isoformat(),
     }
     recent_requests.append(trace)
@@ -647,6 +656,7 @@ async def chat_completions(request: Request):
         cleanup_files(image_paths)
         trace["status"] = "cancelled"
         trace["finished_at"] = datetime.now(timezone.utc).isoformat()
+        trace["duration_ms"] = int((time.time() - started_unix) * 1000)
         raise
     finally:
         cleanup_files(image_paths)
@@ -655,6 +665,11 @@ async def chat_completions(request: Request):
     trace["attempts"] = result.get("attempts")
     trace["effective_thinking_level"] = result.get("effective_thinking_level")
     trace["finished_at"] = datetime.now(timezone.utc).isoformat()
+    trace["duration_ms"] = int((time.time() - started_unix) * 1000)
+    if backend == "gemini" and worker_pool:
+        worker_timing = getattr(worker_pool, "_last_request_timing", None)
+        if worker_timing and worker_timing.get("request_id") == request_id:
+            trace["worker_timing_ms"] = dict(worker_timing)
 
     if not result.get("success"):
         error = str(result.get("error") or "request failed")
