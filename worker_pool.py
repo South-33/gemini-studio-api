@@ -9,11 +9,13 @@ import signal
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-from playwright.async_api import Page, async_playwright
 
 from gemini_web import GeminiWebAutomation, log
+
+if TYPE_CHECKING:
+    from playwright.async_api import Page
 
 REQUEST_TOTAL_BUDGET_SECONDS = 480
 BROWSER_CONNECT_TIMEOUT_SECONDS = 15
@@ -710,6 +712,8 @@ class WorkerPool:
                 log(f"Rechecking Gemini authentication ({reason})", "Worker")
             else:
                 if self.playwright is None:
+                    from playwright.async_api import async_playwright
+
                     self.playwright = await async_playwright().start()
                 log(
                     f"Launching Chromium ({reason}) with background throttling disabled",

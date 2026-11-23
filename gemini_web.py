@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import base64
 import math
@@ -11,10 +13,12 @@ import uuid
 from collections import deque
 from datetime import datetime
 from pathlib import Path
-from typing import Any, List, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, List, Dict, Optional, Tuple
 from urllib.parse import urlparse
-from playwright.async_api import BrowserContext, Page
 from gemini_models import model_family_from_ui, normalize_thinking_level, thinking_level_from_picker_text
+
+if TYPE_CHECKING:
+    from playwright.async_api import BrowserContext, Page
 
 # --- Timestamped Logging (use stderr - always unbuffered) ---
 def log(msg: str, tag: str = "Core"):
