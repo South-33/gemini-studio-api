@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import shutil
 import signal
 import subprocess
-import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -24,6 +22,8 @@ BROWSER_SCOPE_MEMORY_HIGH = "1536M"
 BROWSER_SCOPE_MEMORY_MAX = "2G"
 BROWSER_SCOPE_SWAP_MAX = "256M"
 BROWSER_SCOPE_TASKS_MAX = "512"
+RDP_X11_WINDOW_WIDTH = 3600
+RDP_X11_WINDOW_HEIGHT = 2100
 
 
 class WorkerPool:
@@ -35,7 +35,6 @@ class WorkerPool:
         self.browser_process: subprocess.Popen | None = None
         self.browser_scope_unit: str | None = None
         self.browser_profile_dir: Path | None = None
-        self.browser_cdp_session = None
         self.context = None
         self.workers: List[GeminiWebAutomation] = []
         self._request_lock = asyncio.Lock()
@@ -80,7 +79,7 @@ class WorkerPool:
             "--disable-blink-features=AutomationControlled",
             "--ozone-platform=x11",
             "--disable-gpu",
-            "--window-size=1280,720",
+            "--window-size=1440,900",
             "--disable-background-mode",
             "--disable-background-timer-throttling",
             "--disable-backgrounding-occluded-windows",
@@ -124,18 +123,54 @@ class WorkerPool:
         return Path(__file__).resolve().parent / ".browser_session"
 
     @classmethod
-    def _auth_state_path(cls) -> Path:
-        return cls._state_dir() / "auth.json"
+    def _profile_dir(cls) -> Path:
+        return cls._state_dir() / "profile"
+
+    @staticmethod
+    def _remove_profile_runtime_artifacts(profile_dir: Path) -> None:
+        for name in (
+            "DevToolsActivePort",
+            "SingletonCookie",
+            "SingletonLock",
+            "SingletonSocket",
+        ):
+            path = profile_dir / name
+            try:
+                if path.is_dir() and not path.is_symlink():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
 
     @classmethod
-    def _new_runtime_profile(cls) -> Path:
+    def _prepare_profile_dir(cls) -> Path:
         state_dir = cls._state_dir()
         state_dir.mkdir(mode=0o700, exist_ok=True)
         try:
             state_dir.chmod(0o700)
         except OSError:
             pass
-        return Path(tempfile.mkdtemp(prefix="runtime-", dir=state_dir))
+        profile = cls._profile_dir()
+        profile.mkdir(mode=0o700, exist_ok=True)
+        try:
+            profile.chmod(0o700)
+        except OSError:
+            pass
+        cls._remove_profile_runtime_artifacts(profile)
+        # Chromium 158/159 on this Ubuntu host crashes with SIGTRAP on the
+        # second profile launch if Default/Preferences from the prior run is
+        # retained. The credential/session databases relaunch cleanly. Let
+        # Chromium regenerate only this preference file on each cold start.
+        try:
+            (profile / "Default" / "Preferences").unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise RuntimeError(f"Could not reset Chromium Preferences: {exc}") from exc
+        return profile
 
     @staticmethod
     def _scope_for_pid(pid: int) -> str | None:
@@ -151,13 +186,13 @@ class WorkerPool:
         return None
 
     @classmethod
-    def _is_runtime_browser_command(cls, command: bytes) -> bool:
+    def _is_profile_browser_command(cls, command: bytes) -> bool:
         normalized = command.replace(b"\0", b" ")
-        profile_prefix = f"--user-data-dir={cls._state_dir() / 'runtime-'}".encode()
-        return profile_prefix in normalized and b" --type=" not in normalized
+        profile_arg = f"--user-data-dir={cls._profile_dir()}".encode()
+        return profile_arg in normalized and b" --type=" not in normalized
 
     @classmethod
-    def _runtime_browser_pids(cls) -> list[int]:
+    def _profile_browser_pids(cls) -> list[int]:
         pids: list[int] = []
         proc = Path("/proc")
         if not proc.exists():
@@ -169,7 +204,7 @@ class WorkerPool:
                 command = (entry / "cmdline").read_bytes()
             except OSError:
                 continue
-            if not cls._is_runtime_browser_command(command):
+            if not cls._is_profile_browser_command(command):
                 continue
             pids.append(int(entry.name))
         return pids
@@ -209,7 +244,7 @@ class WorkerPool:
     @classmethod
     def _cleanup_stale_browser_processes(cls) -> None:
         cleaned = 0
-        initial = cls._runtime_browser_pids()
+        initial = cls._profile_browser_pids()
         for pid in initial:
             scope = cls._scope_for_pid(pid)
             if scope:
@@ -223,10 +258,10 @@ class WorkerPool:
                 pass
 
         deadline = time.monotonic() + 6
-        remaining = cls._runtime_browser_pids()
+        remaining = cls._profile_browser_pids()
         while remaining and time.monotonic() < deadline:
             time.sleep(0.1)
-            remaining = cls._runtime_browser_pids()
+            remaining = cls._profile_browser_pids()
 
         for pid in remaining:
             try:
@@ -235,99 +270,32 @@ class WorkerPool:
             except (ProcessLookupError, PermissionError, OSError):
                 pass
 
-        if not cls._runtime_browser_pids():
-            state_dir = cls._state_dir()
-            for runtime_dir in state_dir.glob("runtime-*"):
-                if runtime_dir.is_dir():
-                    shutil.rmtree(runtime_dir, ignore_errors=True)
+        deadline = time.monotonic() + 3
+        remaining = cls._profile_browser_pids()
+        while remaining and time.monotonic() < deadline:
+            time.sleep(0.1)
+            remaining = cls._profile_browser_pids()
+        if remaining:
+            raise RuntimeError(
+                f"Could not retire stale Chromium process(es): {remaining}"
+            )
+
+        state_dir = cls._state_dir()
+        cls._remove_profile_runtime_artifacts(cls._profile_dir())
+        # Remove runtime directories left by the retired clone-based design.
+        for runtime_dir in state_dir.glob("runtime-*"):
+            if runtime_dir.is_dir():
+                shutil.rmtree(runtime_dir, ignore_errors=True)
         if cleaned:
-            log(f"Retired {cleaned} stale Chromium runtime(s)", "Worker")
-
-    @staticmethod
-    def _is_google_cookie(cookie: dict[str, Any]) -> bool:
-        domain = str(cookie.get("domain") or "").lstrip(".").lower()
-        return domain == "google.com" or domain.endswith(".google.com")
-
-    @staticmethod
-    def _cookie_param(cookie: dict[str, Any]) -> dict[str, Any]:
-        result = {
-            key: cookie[key]
-            for key in (
-                "name",
-                "value",
-                "domain",
-                "path",
-                "secure",
-                "httpOnly",
-                "sameSite",
-            )
-            if key in cookie
-        }
-        expires = cookie.get("expires")
-        if isinstance(expires, (int, float)) and expires > 0:
-            result["expires"] = expires
-        return result
-
-    async def _load_auth_state(self) -> None:
-        auth_state = self._auth_state_path()
-        if not auth_state.is_file() or not self.browser_cdp_session:
-            return
-        try:
-            payload = json.loads(auth_state.read_text(encoding="utf-8"))
-            cookies = payload.get("cookies") if isinstance(payload, dict) else None
-            if not isinstance(cookies, list):
-                raise ValueError("auth cookie file has no cookies array")
-            await self.browser_cdp_session.send(
-                "Storage.setCookies",
-                {"cookies": cookies},
-            )
-            log(f"Loaded {len(cookies)} saved Gemini auth cookie(s)", "Worker")
-        except Exception as exc:
-            log(f"Saved Gemini authentication state could not be loaded: {exc}", "Worker")
-
-    async def _save_auth_state(self) -> None:
-        if not self.browser_cdp_session:
-            return
-        auth_state = self._auth_state_path()
-        auth_state.parent.mkdir(mode=0o700, exist_ok=True)
-        temporary = auth_state.with_suffix(".tmp")
-        try:
-            response = await self.browser_cdp_session.send(
-                "Storage.getCookies",
-            )
-            cookies = [
-                self._cookie_param(cookie)
-                for cookie in response.get("cookies", [])
-                if isinstance(cookie, dict) and self._is_google_cookie(cookie)
-            ]
-            temporary.write_text(
-                json.dumps({"cookies": cookies}, separators=(",", ":")),
-                encoding="utf-8",
-            )
-            temporary.chmod(0o600)
-            os.replace(temporary, auth_state)
-            log(f"Saved {len(cookies)} Gemini auth cookie(s)", "Worker")
-        finally:
-            try:
-                temporary.unlink(missing_ok=True)
-            except OSError:
-                pass
+            log(f"Retired {cleaned} stale Chromium process(es)", "Worker")
 
     async def _grant_clipboard_permissions(self) -> None:
-        if not self.browser_cdp_session:
-            raise RuntimeError("Chromium browser CDP session is unavailable")
-        for permission in (
-            {"name": "clipboard-read"},
-            {"name": "clipboard-write", "allowWithoutSanitization": True},
-        ):
-            await self.browser_cdp_session.send(
-                "Browser.setPermission",
-                {
-                    "permission": permission,
-                    "setting": "granted",
-                    "origin": "https://gemini.google.com",
-                },
-            )
+        if not self.context:
+            raise RuntimeError("Chromium browser context is unavailable")
+        await self.context.grant_permissions(
+            ["clipboard-read", "clipboard-write"],
+            origin="https://gemini.google.com",
+        )
 
     def _configure_browser_scope(self) -> None:
         process = self.browser_process
@@ -338,6 +306,11 @@ class WorkerPool:
             # Chromium normally moves itself into an app scope on this host.
             # If it remains in the API service cgroup, the service-level
             # MemoryMax/TasksMax limits already provide containment.
+            self.browser_scope_unit = None
+            return
+        if not scope.startswith("app-org.chromium.Chromium-"):
+            # Never mutate an enclosing DevSpace/terminal/service scope if
+            # Chromium has not moved into its own desktop application scope.
             self.browser_scope_unit = None
             return
         result = subprocess.run(
@@ -362,6 +335,79 @@ class WorkerPool:
             raise RuntimeError(f"Could not apply Chromium scope limits: {detail}")
         self.browser_scope_unit = scope
 
+    def _resize_browser_window_for_rdp(self) -> None:
+        """Compensate for GNOME RDP's Xwayland downscaling on South Server.
+
+        Chromium reports a normal 1440x900 logical window in CDP, but the RDP
+        compositor displays the X11 surface at roughly 40% of that size. Resize
+        only the outer X11 window; Chromium keeps the same logical page size,
+        avoiding the memory cost of rendering a giant viewport.
+        """
+        process = self.browser_process
+        xdotool = shutil.which("xdotool")
+        if process is None or not xdotool:
+            return
+        environment = self._browser_environment()
+        try:
+            search = subprocess.run(
+                [xdotool, "search", "--pid", str(process.pid)],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+                env=environment,
+            )
+            if search.returncode != 0:
+                return
+            best_window: str | None = None
+            best_area = 0
+            for window in dict.fromkeys(search.stdout.split()):
+                geometry = subprocess.run(
+                    [xdotool, "getwindowgeometry", "--shell", window],
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                    check=False,
+                    env=environment,
+                )
+                if geometry.returncode != 0:
+                    continue
+                values: dict[str, int] = {}
+                for line in geometry.stdout.splitlines():
+                    key, separator, value = line.partition("=")
+                    if separator and value.isdigit():
+                        values[key] = int(value)
+                area = values.get("WIDTH", 0) * values.get("HEIGHT", 0)
+                if area > best_area:
+                    best_window = window
+                    best_area = area
+            if not best_window:
+                return
+            subprocess.run(
+                [xdotool, "windowmove", best_window, "10", "10"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+                check=False,
+                env=environment,
+            )
+            subprocess.run(
+                [
+                    xdotool,
+                    "windowsize",
+                    best_window,
+                    str(RDP_X11_WINDOW_WIDTH),
+                    str(RDP_X11_WINDOW_HEIGHT),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+                check=False,
+                env=environment,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return
+
     async def _launch_browser_context(self) -> None:
         """Launch Chromium directly, then attach Playwright over local CDP.
 
@@ -370,7 +416,7 @@ class WorkerPool:
             raise RuntimeError("Playwright is not initialized")
 
         await asyncio.to_thread(self._cleanup_stale_browser_processes)
-        profile_dir = self._new_runtime_profile()
+        profile_dir = self._prepare_profile_dir()
         self.browser_profile_dir = profile_dir
         active_port = profile_dir / "DevToolsActivePort"
         active_port.unlink(missing_ok=True)
@@ -443,11 +489,10 @@ class WorkerPool:
                 break
             await asyncio.sleep(0.1)
         await asyncio.to_thread(self._configure_browser_scope)
+        await asyncio.to_thread(self._resize_browser_window_for_rdp)
         if not self.browser.contexts:
             raise RuntimeError("Chromium exposed no persistent browser context")
         self.context = self.browser.contexts[0]
-        self.browser_cdp_session = await self.browser.new_browser_cdp_session()
-        await self._load_auth_state()
         await self._grant_clipboard_permissions()
 
     def _stop_browser_process(self) -> None:
@@ -460,8 +505,6 @@ class WorkerPool:
         if scope:
             self._stop_user_scope(scope)
         if process is None:
-            if profile_dir:
-                shutil.rmtree(profile_dir, ignore_errors=True)
             return
         process_group = process.pid
         try:
@@ -490,10 +533,10 @@ class WorkerPool:
         except (OSError, subprocess.TimeoutExpired):
             pass
         if profile_dir:
-            shutil.rmtree(profile_dir, ignore_errors=True)
+            self._remove_profile_runtime_artifacts(profile_dir)
 
     async def _warm_browser(self, reason: str) -> bool:
-        """Launch Chromium on demand with a disposable profile and saved auth."""
+        """Launch Chromium on demand with the dedicated persistent profile."""
         if self.worker and self.context and self._browser_state == "warm":
             return True
         if not self._initialized:
@@ -541,7 +584,6 @@ class WorkerPool:
                 raise RuntimeError(detail)
 
             self.workers = [worker]
-            await self._save_auth_state()
             self._browser_state = "warm"
             self._browser_start_count += 1
             self._last_browser_start = {
@@ -585,7 +627,6 @@ class WorkerPool:
                 log(f"Browser close warning: {exc}", "Worker")
             finally:
                 self.browser = None
-        self.browser_cdp_session = None
         self.context = None
         if self.browser_process:
             await asyncio.to_thread(self._stop_browser_process)
@@ -1017,7 +1058,7 @@ class WorkerPool:
             "browser_channel": "playwright-chromium-cdp",
             "browser_pid": self.browser_process.pid if self.browser_process else None,
             "browser_scope_unit": self.browser_scope_unit,
-            "auth_state_present": self._auth_state_path().is_file(),
+            "profile_state_present": self._profile_dir().is_dir(),
             "runtime_profile_active": bool(self.browser_profile_dir),
             "startup_pages_closed": self._startup_pages_closed,
             "worker_recreation_count": self._worker_recreation_count,

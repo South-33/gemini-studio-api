@@ -88,17 +88,22 @@ python3 -m venv .venv
 ```
 
 Playwright uses its matching Chromium build and dedicated state under
-`.browser_session/`. Each browser launch gets a fresh disposable runtime
-profile; only Google-domain authentication cookies are retained between
-launches in the ignored `.browser_session/auth.json` file. The normal Chrome
-profile is never automated.
+`.browser_session/profile/`. That dedicated Chromium profile is reused across
+browser launches so Google can refresh its normal login state over time. The
+normal Chrome profile is never automated.
+
+Chromium 158/159 on this Ubuntu host has one verified relaunch defect: keeping
+`Default/Preferences` from the prior run makes the next launch crash with an
+FD-ownership SIGTRAP. Before each cold start the worker removes only that
+generated preference file plus transient lock/DevTools files. Cookies, account
+databases, local storage, IndexedDB, and the rest of the dedicated profile stay
+in place. Six consecutive close/relaunch cycles passed with this workaround.
 
 On the first Gemini request, a visible Chromium window opens. If Gemini shows a
 sign-in page, sign in once in that window and retry the request. The successful
-retry saves the Google authentication cookies with owner-only file permissions.
+retry uses the same dedicated profile on later launches.
 While sign-in is required the API reports HTTP 503 and keeps that dedicated
-window open for 15 minutes. Later launches use a new runtime profile and restore
-those cookies before opening Gemini.
+window open for 15 minutes.
 
 ## Run
 
@@ -123,9 +128,14 @@ Chromium is still lazy: when a request arrives it refreshes the current desktop
 session environment before launch. The API service is capped at 3 GiB RAM and
 512 MiB swap. Chromium creates its own Linux application scope, so the worker
 detects that scope, caps it separately at 2 GiB RAM and 256 MiB swap, and
-retires stale runtime scopes on API startup. Browser runtime profiles are
-discarded after shutdown because repeated reuse of one Chromium profile is
-unstable on this host. Journald owns process
+retires stale browser processes/scopes on API startup. The browser process and
+Playwright are fully released after 60 seconds without requests, while the
+dedicated profile stays on disk for the next request. Chromium starts with a
+1440×900 logical page; South Server's GNOME RDP session downscales Xwayland
+windows, so the worker expands only the outer X11 surface to 3600×2100. That
+produces a normal large on-screen browser while keeping the logical page and
+browser memory bounded. Do not use desktop maximize: the RDP virtual root has
+no stable monitor bounds and previously caused a host-memory spike. Journald owns process
 logs; the project does not maintain a second supervisor or log-rotation system.
 
 ## Reliability behavior
