@@ -83,8 +83,6 @@ async def lifespan(_: Starlette):
             await worker_pool.close()
 
 
-
-
 def estimate_text_tokens(text: str) -> int:
     if not text:
         return 0

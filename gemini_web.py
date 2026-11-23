@@ -1237,12 +1237,18 @@ class GeminiWebAutomation:
         return max(by_chars, by_words)
 
     @staticmethod
-    def _response_poll_seconds(snapshot: Dict[str, Any]) -> float:
-        """Poll slowly while Gemini is only thinking, then react quickly to output."""
+    def _response_poll_seconds(
+        snapshot: Dict[str, Any], elapsed_seconds: float = 0.0
+    ) -> float:
+        """React quickly to normal output, but back off during long empty generations."""
         phase = str(snapshot.get("phase") or "idle_or_unknown")
         if phase == "thinking_only":
             return THINKING_POLL_SECONDS
         if bool(snapshot.get("stop_visible")) and int(snapshot.get("response_body_len") or 0) == 0:
+            if elapsed_seconds >= 30.0:
+                return 2.0
+            if elapsed_seconds >= 10.0:
+                return 1.0
             return PREFILL_POLL_SECONDS
         return UI_POLL_SECONDS
 
@@ -1884,8 +1890,7 @@ class GeminiWebAutomation:
                 self._track_error(err, "input", "send_message")
                 return {"success": False, "error": err}
             input_area = self.page.locator(input_selector)
-            await input_area.click()
-            
+
             # 3.5 Prepare and Enter Prompt (converts long prompts to .txt file in clipboard/attachment if >= THRESHOLD)
             temp_prompt_file = None
             filled_text, temp_prompt_file = await self._prepare_and_enter_prompt(
@@ -1965,18 +1970,10 @@ class GeminiWebAutomation:
                     f"Attempting single {'Enter-key' if use_enter else 'Send-button'} submission",
                     f"Worker {self.worker_id}",
                 )
-                try:
-                    await self.page.bring_to_front()
-                except:
-                    pass
-
-                # Ensure any pending attachment upload spinner has cleared and Send is active.
-                await self._wait_for_attachment_upload_complete(15.0)
-
-                try:
-                    await input_area.click()
-                except:
-                    pass
+                # Text-only requests already proved Send is stable above. Only
+                # attachments need a second readiness check for upload completion.
+                if temp_prompt_file or images:
+                    await self._wait_for_attachment_upload_complete(15.0)
 
                 try:
                     # Verify Gemini considers the request sendable, then submit
@@ -2497,7 +2494,9 @@ class GeminiWebAutomation:
 
                     last_wait_log = now
                         
-                await asyncio.sleep(self._response_poll_seconds(page_snapshot))
+                await asyncio.sleep(
+                    self._response_poll_seconds(page_snapshot, elapsed_float)
+                )
             
             if not copy_btn:
                 log(f"Timeout after {max_wait}s waiting for response", f"Worker {self.worker_id}")
