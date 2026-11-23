@@ -37,6 +37,22 @@ class GeminiConfigurationTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
+    def test_fresh_snapshot_reconciles_tracked_model_without_extra_ui_query(self):
+        worker = GeminiWebAutomation(worker_id=1)
+        worker._current_selected_model = "neon"
+        worker._current_selected_thinking_level = "High"
+
+        worker._reconcile_tracked_configuration(
+            {
+                "model_picker_count": 1,
+                "model_button_text": "Hydrogen",
+                "model_button_aria_label": "Open mode picker",
+            }
+        )
+
+        self.assertEqual(worker._current_selected_model, "hydrogen")
+        self.assertIsNone(worker._current_selected_thinking_level)
+
     async def test_closed_picker_can_omit_reasoning_label(self):
         worker = GeminiWebAutomation(worker_id=1)
         worker.page = _Page()
