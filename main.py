@@ -18,8 +18,11 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import JSONResponse
+from starlette.applications import Starlette
+from starlette.exceptions import HTTPException
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
+from starlette.routing import Route
 
 from agy_pool import AgyPool, AgyQueueFullError, REQUEST_BUDGET_SECONDS
 from gemini_models import (
@@ -57,7 +60,7 @@ def log(message: str, tag: str = "API") -> None:
 
 
 @asynccontextmanager
-async def lifespan(_: FastAPI):
+async def lifespan(_: Starlette):
     global worker_pool, agy_pool
 
     try:
@@ -80,7 +83,6 @@ async def lifespan(_: FastAPI):
             await worker_pool.close()
 
 
-app = FastAPI(title="Gemini Studio API", lifespan=lifespan)
 
 
 def estimate_text_tokens(text: str) -> int:
@@ -458,7 +460,6 @@ async def finish_async_job(
         prune_async_jobs()
 
 
-@app.get("/v1/models")
 async def list_models() -> dict[str, Any]:
     return {
         "data": [
@@ -472,7 +473,6 @@ async def list_models() -> dict[str, Any]:
     }
 
 
-@app.get("/v1/backends")
 async def list_backends() -> dict[str, Any]:
     if agy_pool and not agy_pool.is_ready():
         await asyncio.to_thread(agy_pool.init)
@@ -489,7 +489,6 @@ async def list_backends() -> dict[str, Any]:
     }
 
 
-@app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     try:
         body = await request.json()
@@ -704,7 +703,6 @@ async def chat_completions(request: Request):
     )
 
 
-@app.get("/v1/chat/completions/{request_id}")
 async def get_chat_completion(request_id: str):
     prune_async_jobs()
     job = async_jobs.get(request_id)
@@ -713,7 +711,6 @@ async def get_chat_completion(request_id: str):
     return async_job_response(job)
 
 
-@app.get("/health")
 async def health(response: Response) -> dict[str, Any]:
     browser = worker_pool.get_diagnostics() if worker_pool else {}
     ready = bool(
@@ -733,7 +730,6 @@ async def health(response: Response) -> dict[str, Any]:
     }
 
 
-@app.get("/v1/diagnostics")
 async def diagnostics() -> dict[str, Any]:
     browser = (
         await worker_pool.get_live_diagnostics()
@@ -755,3 +751,60 @@ async def diagnostics() -> dict[str, Any]:
             for request_id, job in async_jobs.items()
         },
     }
+
+def _as_http_response(value: Any) -> Response:
+    return value if isinstance(value, Response) else JSONResponse(value)
+
+
+async def _models_http(_: Request) -> Response:
+    return _as_http_response(await list_models())
+
+
+async def _backends_http(_: Request) -> Response:
+    return _as_http_response(await list_backends())
+
+
+async def _chat_http(request: Request) -> Response:
+    return _as_http_response(await chat_completions(request))
+
+
+async def _chat_status_http(request: Request) -> Response:
+    return _as_http_response(
+        await get_chat_completion(str(request.path_params["request_id"]))
+    )
+
+
+async def _health_http(_: Request) -> Response:
+    response = Response()
+    payload = await health(response)
+    return JSONResponse(payload, status_code=response.status_code)
+
+
+async def _diagnostics_http(_: Request) -> Response:
+    return _as_http_response(await diagnostics())
+
+
+async def _http_exception_handler(_: Request, exc: HTTPException) -> Response:
+    return JSONResponse(
+        {"detail": exc.detail},
+        status_code=exc.status_code,
+        headers=exc.headers,
+    )
+
+
+app = Starlette(
+    routes=[
+        Route("/v1/models", _models_http, methods=["GET"]),
+        Route("/v1/backends", _backends_http, methods=["GET"]),
+        Route("/v1/chat/completions", _chat_http, methods=["POST"]),
+        Route(
+            "/v1/chat/completions/{request_id}",
+            _chat_status_http,
+            methods=["GET"],
+        ),
+        Route("/health", _health_http, methods=["GET"]),
+        Route("/v1/diagnostics", _diagnostics_http, methods=["GET"]),
+    ],
+    lifespan=lifespan,
+    exception_handlers={HTTPException: _http_exception_handler},
+)

@@ -5,7 +5,7 @@ A small OpenAI-style API for two local execution paths:
 - **Gemini Web** is the default. It drives a dedicated signed-in Gemini browser profile.
 - **Agy** is explicit. It runs the local Antigravity CLI with exact model IDs from `agy models`.
 
-The service is optimized for occasional agent calls. FastAPI stays resident,
+The service is optimized for occasional agent calls. A small Starlette API stays resident,
 but Chromium and Playwright are started only when Gemini Web receives work and
 are closed after 60 idle seconds.
 

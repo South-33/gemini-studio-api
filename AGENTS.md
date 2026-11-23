@@ -1,7 +1,7 @@
 This is the project's AGENTS.md
 
 - Production is South Server: Ubuntu, user `southserver`, with a systemd user service from `ops/gemini-studio-api.service`.
-- Keep the service small: one FastAPI process, one serialized Gemini Web worker, and one bounded explicit Agy pool. Do not add provider frameworks, browser worker fan-out, or an in-process supervisor.
+- Keep the service small: one Starlette API process, one serialized Gemini Web worker, and one bounded explicit Agy pool. Do not add provider frameworks, browser worker fan-out, or an in-process supervisor.
 - Backend omission means Gemini Web. Its contract is exactly `hydrogen` or `neon` with `Low`, `Medium`, or `High`; defaults are `neon` and `Medium`.
 - Agy is selected only with `backend: "agy"`. It accepts exact IDs from `agy models`; do not translate Gemini Web aliases into Agy IDs or apply Gemini `thinking_level` to Agy.
 - Keep Gemini and Agy failure domains separate. Never silently replay a request through the other backend.

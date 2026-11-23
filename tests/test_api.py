@@ -1,4 +1,5 @@
 import concurrent.futures
+import json
 import unittest
 
 import main
@@ -131,6 +132,49 @@ class ApiContractTests(unittest.IsolatedAsyncioTestCase):
         payload = await main.list_models()
         self.assertEqual([item["id"] for item in payload["data"]], ["hydrogen", "neon"])
         self.assertEqual(payload["default"], {"model": "neon", "thinking_level": "Medium"})
+
+    def test_starlette_route_surface_matches_supported_api(self):
+        routes = {route.path for route in main.app.routes}
+        self.assertEqual(
+            routes,
+            {
+                "/v1/models",
+                "/v1/backends",
+                "/v1/chat/completions",
+                "/v1/chat/completions/{request_id}",
+                "/health",
+                "/v1/diagnostics",
+            },
+        )
+
+    async def test_health_http_propagates_unready_status(self):
+        self.gemini.get_diagnostics = lambda: {
+            "browser_state": "error",
+            "active_request": False,
+            "queued_requests": 0,
+        }
+        response = await main._health_http(None)
+        self.assertEqual(response.status_code, 503)
+        self.assertIn(b'"ready":false', response.body)
+
+    async def test_starlette_wrapper_json_encodes_endpoint_payload(self):
+        response = await main._models_http(FakeRequest(None))
+        self.assertEqual(response.status_code, 200)
+        payload = json.loads(response.body)
+        self.assertEqual(payload["default"]["model"], "neon")
+
+    async def test_http_exception_handler_preserves_json_detail_and_headers(self):
+        response = await main._http_exception_handler(
+            FakeRequest(None),
+            main.HTTPException(
+                status_code=429,
+                detail="busy",
+                headers={"Retry-After": "5"},
+            ),
+        )
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(response.headers["retry-after"], "5")
+        self.assertEqual(json.loads(response.body), {"detail": "busy"})
 
 
 if __name__ == "__main__":
