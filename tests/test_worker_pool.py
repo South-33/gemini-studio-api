@@ -1,5 +1,6 @@
 import asyncio
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -360,6 +361,58 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(second_started.is_set())
         self.assertFalse(pool._active_request)
         await pool.close()
+
+    async def test_cancelled_startup_waits_for_profile_cleanup_thread(self):
+        pool = WorkerPool()
+        pool.playwright = object()
+        loop = asyncio.get_running_loop()
+        started = asyncio.Event()
+        release = threading.Event()
+        finished = threading.Event()
+
+        def cleanup():
+            loop.call_soon_threadsafe(started.set)
+            release.wait(5)
+            finished.set()
+
+        with patch.object(pool, "_cleanup_stale_browser_processes", cleanup):
+            launch = asyncio.create_task(pool._launch_browser_context())
+            await asyncio.wait_for(started.wait(), timeout=2)
+            try:
+                launch.cancel()
+                await asyncio.sleep(0)
+                self.assertFalse(launch.done())
+            finally:
+                release.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await launch
+        self.assertTrue(finished.is_set())
+
+    async def test_shutdown_waits_for_in_progress_idle_teardown(self):
+        pool = WorkerPool(idle_browser_seconds=1, idle_poll_seconds=0.05)
+        await pool.init()
+        pool._browser_state = "warm"
+        pool._last_activity = time.time() - 2
+        started = asyncio.Event()
+        release = asyncio.Event()
+        order = []
+
+        async def close_context(state, reason):
+            if state == "cold":
+                started.set()
+                await release.wait()
+            order.append(state)
+
+        pool._close_browser_context = close_context
+        await asyncio.wait_for(started.wait(), timeout=2)
+        shutdown = asyncio.create_task(pool.close())
+        try:
+            await asyncio.sleep(0)
+            self.assertFalse(shutdown.done())
+        finally:
+            release.set()
+            await asyncio.wait_for(shutdown, timeout=2)
+        self.assertEqual(order, ["cold", "stopped"])
 
     async def test_retry_opens_blank_tab_before_closing_failed_tab(self):
         pool = WorkerPool()
