@@ -51,7 +51,7 @@ class GeminiConfigurationTests(unittest.IsolatedAsyncioTestCase):
     def test_fresh_chat_requires_empty_stable_composer(self):
         ready = {"input_visible": True}
         self.assertTrue(GeminiWebAutomation._is_fresh_chat_ready(ready))
-        for key in ("input_text_len", "stop_visible", "transition_state"):
+        for key in ("input_text_len", "attachment_count", "stop_visible", "transition_state"):
             with self.subTest(key=key):
                 self.assertFalse(GeminiWebAutomation._is_fresh_chat_ready({**ready, key: 1}))
 

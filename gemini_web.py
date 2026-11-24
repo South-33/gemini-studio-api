@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import math
 import os
 import sys
@@ -1281,6 +1280,7 @@ class GeminiWebAutomation:
             "response_visible": False,
             "response_copy_count": 0,
             "input_copy_count": 0,
+            "attachment_count": 0,
             "user_query_count": 0,
             "empty_chat_visible": False,
             "transition_state": False,
@@ -1427,6 +1427,7 @@ class GeminiWebAutomation:
                         copy_count: document.querySelectorAll('button[aria-label="Copy"]').length,
                         response_copy_count: responseCopyButtons.length,
                         input_copy_count: inputCopyButtons.length,
+                        attachment_count: document.querySelectorAll('mat-basic-chip button[aria-label^="close " i]').length,
                         user_query_count: userQueries.length,
                         empty_chat_visible: !!emptyChat,
                         transition_state: !!(transitionSpinner && isVisible(transitionSpinner)),
@@ -1672,6 +1673,7 @@ class GeminiWebAutomation:
             int(snap.get("user_query_count") or 0) == 0
             and int(snap.get("response_count") or 0) == 0
             and int(snap.get("input_text_len") or 0) == 0
+            and int(snap.get("attachment_count") or 0) == 0
             and snap.get("input_visible")
             and not snap.get("stop_visible")
             and not snap.get("transition_state")
@@ -2015,8 +2017,9 @@ class GeminiWebAutomation:
                 )
                 # Text-only requests already proved Send is stable above. Only
                 # attachments need a second readiness check for upload completion.
-                if temp_prompt_file or images:
-                    await self._wait_for_attachment_upload_complete(15.0)
+                attachments = ([temp_prompt_file] if temp_prompt_file else []) + list(images or [])
+                if attachments and not await self._wait_for_attachment_upload_complete(15.0, attachments):
+                    return False
 
                 try:
                     # Verify Gemini considers the request sendable, then submit
@@ -2753,141 +2756,30 @@ class GeminiWebAutomation:
                 pass
             return False
 
-    async def _paste_image(self, image_path: str):
-        """Paste an image via clipboard into Gemini Web."""
-        try:
-            print(f"[Worker {self.worker_id}] Pasting image: {image_path}")
-            
-            with open(image_path, 'rb') as f:
-                image_data = f.read()
-            
-            base64_image = base64.b64encode(image_data).decode('utf-8')
-            
-            ext = image_path.split('.')[-1].lower()
-            mime_map = {
-                'png': 'image/png',
-                'jpg': 'image/jpeg',
-                'jpeg': 'image/jpeg',
-                'gif': 'image/gif',
-                'webp': 'image/webp'
-            }
-            mime_type = mime_map.get(ext, 'image/png')
-            
-            # Focus input first
-            input_selector = await self._resolve_selector("input", require_visible=True, timeout_ms=2000)
-            if not input_selector:
-                raise Exception("Input selector not found for image paste")
-
-            input_area = self.page.locator(input_selector)
-            await input_area.click()
-            await asyncio.sleep(0.1)
-            
-            # Write image to clipboard
-            await self.page.evaluate(f'''
-                async () => {{
-                    const base64 = "{base64_image}";
-                    const mimeType = "{mime_type}";
-                    const byteCharacters = atob(base64);
-                    const byteNumbers = new Array(byteCharacters.length);
-                    for (let i = 0; i < byteCharacters.length; i++) {{
-                        byteNumbers[i] = byteCharacters.charCodeAt(i);
-                    }}
-                    const byteArray = new Uint8Array(byteNumbers);
-                    const blob = new Blob([byteArray], {{ type: mimeType }});
-                    const item = new ClipboardItem({{ [mimeType]: blob }});
-                    await navigator.clipboard.write([item]);
-                }}
-            ''')
-            
-            await self.page.keyboard.press("Control+v")
-            await asyncio.sleep(1.0)
-            print(f"[Worker {self.worker_id}] Image pasted")
-        except Exception as e:
-            print(f"[Worker {self.worker_id}] Image paste warning: {e}")
-
-    async def _visible_attachment_file_names(self, file_paths: List[str]) -> List[str]:
-        """Return expected attachment filenames that are visibly rendered in Gemini."""
-        expected_names = [os.path.basename(path) for path in file_paths if path]
-        if not expected_names:
-            return []
-
-        try:
-            return await self.page.evaluate(
-                """
-                (expectedNames) => {
-                    const isVisible = (el) => {
-                        if (!el || !(el instanceof HTMLElement)) return false;
-                        const style = window.getComputedStyle(el);
-                        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-                        const rect = el.getBoundingClientRect();
-                        return rect.width > 0 && rect.height > 0;
-                    };
-
-                    const visibleElements = Array.from(document.querySelectorAll('body *')).filter(isVisible);
-                    return expectedNames.filter((name) => visibleElements.some((el) => {
-                        const values = [
-                            el.innerText || '',
-                            el.getAttribute('aria-label') || '',
-                            el.getAttribute('title') || '',
-                        ];
-                        return values.some((value) => value.includes(name));
-                    }));
-                }
-                """,
-                expected_names,
-            )
-        except Exception as e:
-            log(f"Attachment visibility check failed: {e}", f"Worker {self.worker_id}")
-            return []
-
     async def _wait_for_attachment_upload_complete(
         self,
-        max_timeout_seconds: float = 30.0,
-        expected_file_paths: Optional[List[str]] = None,
+        max_timeout_seconds: float,
+        expected_file_paths: List[str],
     ) -> bool:
-        """Wait until attachments are visibly present and the Send button is ready."""
-        log("Waiting for Send button to become enabled...", f"Worker {self.worker_id}")
-        start = time.time()
-        deadline = start + max_timeout_seconds
-        expected_names = [os.path.basename(path) for path in (expected_file_paths or []) if path]
-
-        while time.time() < deadline:
-            attachments_ready = True
-            if expected_names:
-                visible_names = await self._visible_attachment_file_names(expected_file_paths or [])
-                attachments_ready = all(name in visible_names for name in expected_names)
-
-            send_selector = await self._resolve_selector("send_btn", require_visible=True, timeout_ms=500)
-            if send_selector:
-                send_btn = self.page.locator(send_selector).first
-                if await send_btn.count() > 0 and await send_btn.is_visible():
-                    try:
-                        disabled_attr = await send_btn.get_attribute("disabled")
-                        aria_disabled = await send_btn.get_attribute("aria-disabled")
-                        is_disabled = await send_btn.is_disabled()
-                        if attachments_ready and disabled_attr is None and aria_disabled != "true" and not is_disabled:
-                            elapsed = round(time.time() - start, 2)
-                            if expected_names:
-                                log(
-                                    f"Attachment visible and Send button ready ({elapsed}s): {expected_names}",
-                                    f"Worker {self.worker_id}",
-                                )
-                            else:
-                                log(f"Send button enabled & ready ({elapsed}s)", f"Worker {self.worker_id}")
+        """Confirm all uploaded attachments and an enabled Send control."""
+        expected_count = len(expected_file_paths)
+        deadline = time.monotonic() + max_timeout_seconds
+        while time.monotonic() < deadline:
+            # Attachment names may exist only in a hover tooltip. Each
+            # composer attachment has a dedicated close control, even when
+            # the control is hidden until hover.
+            count = await self.page.locator('mat-basic-chip button[aria-label^="close " i]').count()
+            if count == expected_count:
+                send_selector = await self._resolve_selector("send_btn", require_visible=True, timeout_ms=500)
+                if send_selector:
+                    send_btn = self.page.locator(send_selector).first
+                    if await send_btn.is_visible() and not await send_btn.is_disabled():
+                        if (await send_btn.get_attribute("aria-disabled") or "").lower() != "true":
+                            log(f"Confirmed {expected_count} attachments and enabled Send", f"Worker {self.worker_id}")
                             return True
-                    except Exception:
-                        pass
-
             await asyncio.sleep(UI_POLL_SECONDS)
 
-        elapsed = round(time.time() - start, 2)
-        if expected_names:
-            log(
-                f"Attachment confirmation timed out ({elapsed}s): {expected_names}",
-                f"Worker {self.worker_id}",
-            )
-        else:
-            log(f"Send button ready wait timeout ({elapsed}s), proceeding to send attempt", f"Worker {self.worker_id}")
+        log(f"Could not confirm {expected_count} attachments and enabled Send", f"Worker {self.worker_id}")
         return False
 
     async def _upload_file_attachment(self, file_paths: List[str]) -> bool:
@@ -2895,7 +2787,10 @@ class GeminiWebAutomation:
         if not file_paths:
             return True
         try:
-            log(f"Uploading {len(file_paths)} file attachment(s): {file_paths}", f"Worker {self.worker_id}")
+            if await self.page.locator('mat-basic-chip button[aria-label^="close " i]').count():
+                log("Refusing upload into a composer with existing attachments", f"Worker {self.worker_id}")
+                return False
+            log(f"Uploading {len(file_paths)} file attachment(s)", f"Worker {self.worker_id}")
 
             file_input = self.page.locator('input[type="file"][accept*=".txt"]').first
             if await file_input.count() == 0:
@@ -2921,11 +2816,6 @@ class GeminiWebAutomation:
             log(f"Error uploading file attachments: {e}", f"Worker {self.worker_id}")
             return False
 
-    @staticmethod
-    def _needs_search_hint(prompt: str, use_search: bool = False) -> bool:
-        """Only explicit caller intent may add a transport-level Search instruction."""
-        return bool(use_search)
-
     async def _paste_text_into_input(self, input_area, text: str) -> None:
         """Enter text through Gemini's normal clipboard-paste interaction."""
         await input_area.click()
@@ -2942,77 +2832,45 @@ class GeminiWebAutomation:
         images: Optional[List[str]] = None,
         use_search: bool = False,
     ) -> Tuple[str, Optional[str]]:
-        """
-        Enter prompt into Gemini Web UI.
-        If len(prompt) >= PROMPT_FILE_UPLOAD_THRESHOLD, converts the prompt to a
-        .txt attachment to prevent DOM contenteditable freezing.
-        Returns tuple of (entered_text_or_empty, created_temp_file_path).
-        """
+        """Enter text and upload all attachments once, or fail without sending."""
         prompt_str = (prompt or "").strip()
-        needs_search_hint = self._needs_search_hint(prompt_str, use_search)
-        should_file_upload = len(prompt_str) >= PROMPT_FILE_UPLOAD_THRESHOLD
-
-        if should_file_upload:
-            temp_file_path = None
-            handed_off = False
-            try:
-                log(
-                    f"Prompt length ({len(prompt_str)} chars) >= threshold ({PROMPT_FILE_UPLOAD_THRESHOLD}). "
-                    f"Converting prompt to text file in clipboard/attachment to prevent UI freeze...",
-                    f"Worker {self.worker_id}"
-                )
+        temp_file_path = None
+        handed_off = False
+        try:
+            file_paths = list(images or [])
+            entered_prompt = prompt_str
+            if len(prompt_str) >= PROMPT_FILE_UPLOAD_THRESHOLD:
                 with tempfile.NamedTemporaryFile(
                     mode="w", encoding="utf-8", prefix="gemini_prompt_",
                     suffix=".txt", delete=False,
                 ) as f:
                     temp_file_path = f.name
                     f.write(prompt_str)
+                file_paths.insert(0, temp_file_path)
+                entered_prompt = (
+                    "Use Google Search for this request and read the attached prompt."
+                    if use_search else ""
+                )
+            elif use_search:
+                entered_prompt = f"Use Google Search for this request.\n\n{prompt_str}"
 
-                file_paths = [temp_file_path]
-                if images:
-                    file_paths.extend(images)
-                uploaded = await self._upload_file_attachment(file_paths)
+            if file_paths and not await self._upload_file_attachment(file_paths):
+                # An ambiguous partial upload must not fall back to sending
+                # only text or adding duplicate files to the same composer.
+                raise RuntimeError("Gemini attachment upload could not be confirmed")
 
-                if uploaded:
-                    log("Prompt .txt file attached cleanly & ready to send.", f"Worker {self.worker_id}")
-                    short_input_text = ""
-                    if needs_search_hint:
-                        short_input_text = "Use Google Search for this request and read the attached prompt."
-                        try:
-                            await input_area.fill(short_input_text)
-                            log(f"Typed search command into input box: '{short_input_text}'", f"Worker {self.worker_id}")
-                        except Exception as fe:
-                            log(f"Failed to fill search command: {fe}", f"Worker {self.worker_id}")
-                    else:
-                        try:
-                            await input_area.fill("")
-                        except Exception:
-                            pass
-                    await self._human_delay(200, 400)
-                    handed_off = True
-                    return short_input_text, temp_file_path
-                else:
-                    log("File upload failed, falling back to direct text fill...", f"Worker {self.worker_id}")
-            except Exception as e:
-                log(f"Prompt file attachment failed ({e}), falling back to direct text fill...", f"Worker {self.worker_id}")
-            finally:
-                if temp_file_path and not handed_off:
-                    try:
-                        os.remove(temp_file_path)
-                    except OSError:
-                        pass
-
-        # Direct editor path for short prompts or attachment fallback.
-        if images:
-            for img_path in images:
-                await self._paste_image(img_path)
-                await self._human_delay(200, 500)
-
-        entered_prompt = prompt_str
-        if use_search:
-            entered_prompt = f"Use Google Search for this request.\n\n{prompt_str}"
-        await self._paste_text_into_input(input_area, entered_prompt)
-        return entered_prompt, None
+            if entered_prompt:
+                await self._paste_text_into_input(input_area, entered_prompt)
+            else:
+                await input_area.fill("")
+            handed_off = True
+            return entered_prompt, temp_file_path
+        finally:
+            if temp_file_path and not handed_off:
+                try:
+                    os.remove(temp_file_path)
+                except OSError:
+                    pass
 
     async def close(self):
         self._initialized = False
