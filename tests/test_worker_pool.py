@@ -43,6 +43,24 @@ class FakeWorker:
 
 
 class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
+    def test_browser_cleanup_reaps_parent_before_waiting_for_empty_group(self):
+        process = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            start_new_session=True,
+        )
+        pool = WorkerPool()
+        pool.browser_process = process
+        started = time.monotonic()
+        try:
+            pool._stop_browser_process()
+            self.assertLess(time.monotonic() - started, 2)
+            self.assertIsNotNone(process.returncode)
+            self.assertIsNone(pool.browser_process)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+
     def test_profile_browser_detection_handles_chromium_rewritten_argv(self):
         prefix = f"--user-data-dir={WorkerPool._profile_dir()}"
         rewritten = f"/chrome --no-sandbox {prefix} --remote-debugging-port=0".encode()

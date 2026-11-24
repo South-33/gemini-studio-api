@@ -731,15 +731,19 @@ class WorkerPool:
                 pass
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline:
+                # Reap the parent before probing the group: a zombie keeps
+                # its group visible even after all browser work has stopped.
+                process.poll()
                 try:
                     os.killpg(process_group, 0)
                 except (ProcessLookupError, OSError):
                     break
                 time.sleep(0.1)
-            try:
-                os.killpg(process_group, signal.SIGKILL)
-            except (ProcessLookupError, OSError):
-                pass
+            else:
+                try:
+                    os.killpg(process_group, signal.SIGKILL)
+                except (ProcessLookupError, OSError):
+                    pass
             try:
                 process.wait(timeout=2)
             except (OSError, subprocess.TimeoutExpired):
