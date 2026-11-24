@@ -73,7 +73,7 @@ Useful endpoints:
 - `GET /health` — lightweight service health
 - `GET /v1/diagnostics` — browser/Agy state and recent request metadata
 
-For long calls, set `"async": true`. The submit request returns HTTP 202 with a `request_id`; poll `GET /v1/chat/completions/{request_id}`.
+For long calls, set `"async": true`. The submit request returns HTTP 202 with a `request_id`; poll `GET /v1/chat/completions/{request_id}`. Disconnecting a synchronous Gemini request cancels its work, so a short client timeout can discard a valid slow response.
 
 ## Ubuntu setup
 
@@ -154,7 +154,11 @@ logs; the project does not maintain a second supervisor or log-rotation system.
 
 ## Reliability behavior
 
-Gemini Web uses one serialized browser worker. Each request starts from a clean chat, selects the requested visible model and thinking labels, submits once, and returns only the text obtained from Gemini's Copy control. Recognized transient Gemini failures can retry on a fresh tab, but retries keep the same model and thinking level requested by the caller.
+Gemini Web uses one serialized browser worker. Between requests it prefers the native New Chat control, with page navigation as a fallback. It verifies a clean composer and the requested model and thinking level before submission. Model-family changes replace the managed tab and recheck the configuration.
+
+Images and long prompts (1,500 characters or more) use the native file-upload control. All attachments must be confirmed before submission. Responses come only from Gemini's Copy control, after clearing the clipboard.
+
+Each generation attempt submits once. Recognized transient failures can retry with the same model and thinking level; all generation attempts and recovery share a 480-second budget, separate from queue wait and initial browser setup. Cancellation completes browser cleanup before the next request takes ownership.
 
 Selectors prefer stable accessibility labels, roles, and visible text. Numeric model version labels are ignored. The current authenticated Gemini UI is the authority when Google changes the page.
 
@@ -167,3 +171,8 @@ Agy uses a bounded process pool. Each request runs in a sterile workspace with c
 .venv/bin/python -m unittest discover -s tests -v
 curl -fsS http://127.0.0.1:8000/health
 ```
+
+Use `GET /v1/diagnostics` to distinguish queue wait, browser startup, configuration,
+and generation time. On the service host, use `journalctl --user -u
+gemini-studio-api.service` for process logs. Local experiment records, when present,
+are under `logs/verification/`; failure diagnostics are under `logs/errors/`.
