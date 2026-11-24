@@ -359,7 +359,7 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(pool._active_request)
         await pool.close()
 
-    async def test_retry_closes_failed_tab_before_creating_replacement(self):
+    async def test_retry_opens_blank_tab_before_closing_failed_tab(self):
         pool = WorkerPool()
         old_worker = FakeWorker([])
         order = []
@@ -367,17 +367,26 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
         async def close_old():
             order.append("close_old")
 
+        replacement_page = object()
+
         async def new_page():
             order.append("new_page")
-            return object()
+            return replacement_page
+
+        async def initialize(page):
+            self.assertIs(page, replacement_page)
+            order.append("initialize")
+            return FakeWorker([])
 
         old_worker.close = close_old
         pool.workers = [old_worker]
         pool.context = SimpleNamespace(new_page=new_page)
-        pool._initialize_page = AsyncMock(return_value=FakeWorker([]))
+        pool._initialize_page = initialize
 
-        self.assertTrue(await pool._recreate_worker("retry", close_old_first=True))
-        self.assertEqual(order[:2], ["close_old", "new_page"])
+        self.assertTrue(
+            await pool._recreate_worker("retry", close_old_before_init=True)
+        )
+        self.assertEqual(order, ["new_page", "close_old", "initialize"])
 
 
     async def test_retry_continues_when_failed_tab_close_raises(self):
@@ -393,7 +402,7 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
         replacement = FakeWorker([])
         pool._initialize_page = AsyncMock(return_value=replacement)
 
-        self.assertTrue(await pool._recreate_worker("retry", close_old_first=True))
+        self.assertTrue(await pool._recreate_worker("retry", close_old_before_init=True))
         self.assertIs(pool.worker, replacement)
 
     def test_active_request_reports_zero_idle_seconds(self):

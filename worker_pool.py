@@ -977,7 +977,7 @@ class WorkerPool:
         return None
 
     async def _recreate_worker(
-        self, reason: str, *, close_old_first: bool = False
+        self, reason: str, *, close_old_before_init: bool = False
     ) -> bool:
         """Replace a failed tab once; never refresh a healthy idle tab."""
         async with self._recovery_lock:
@@ -986,7 +986,12 @@ class WorkerPool:
                 if not self.context:
                     raise RuntimeError("browser context is unavailable")
                 old_worker = self.worker
-                if close_old_first and old_worker:
+                # Keep at least one browser target alive: opening a blank tab before
+                # closing the poisoned tab avoids Chrome exiting its last window.
+                # The replacement is not navigated until the old Gemini tab is gone,
+                # so retries still avoid two fully loaded Gemini pages in memory.
+                new_page = await self.context.new_page()
+                if close_old_before_init and old_worker:
                     try:
                         await old_worker.close()
                     except Exception as exc:
@@ -994,7 +999,6 @@ class WorkerPool:
                     finally:
                         self.workers.clear()
                         old_worker = None
-                new_page = await self.context.new_page()
                 new_worker = await self._initialize_page(new_page)
                 success = new_worker is not None
                 if success:
@@ -1303,7 +1307,7 @@ class WorkerPool:
                         )
                         ready = await self._recreate_worker(
                             f"retry {attempt + 1}/{max_attempts} for request {request_id}",
-                            close_old_first=True,
+                            close_old_before_init=True,
                         )
                         if ready:
                             configured, error = await self._prepare_request_configuration(
