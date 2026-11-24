@@ -121,6 +121,40 @@ class GeminiConfigurationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(model, "hydrogen")
         self.assertIsNone(thinking)
 
+    async def test_thinking_selection_is_tracked_for_newly_confirmed_family(self):
+        worker = GeminiWebAutomation()
+        worker._current_selected_model = "neon"
+        worker._current_selected_thinking_level = "Medium"
+        visible_family = "Neon"
+
+        async def inner_text():
+            return visible_family
+
+        async def select_model(model):
+            nonlocal visible_family
+            visible_family = model.capitalize()
+            return True
+
+        async def select_thinking(level):
+            worker._current_selected_thinking_level = level
+            return True
+
+        async def settle(**kwargs):
+            return await worker._get_current_ui_model_and_thinking()
+
+        button = SimpleNamespace(inner_text=inner_text, get_attribute=AsyncMock(return_value="Open mode picker"))
+        worker.page = SimpleNamespace(locator=Mock(return_value=SimpleNamespace(first=button)))
+        worker._resolve_selector = AsyncMock(return_value="button")
+        worker._select_model = AsyncMock(side_effect=select_model)
+        worker._set_thinking_level = AsyncMock(side_effect=select_thinking)
+        worker._wait_for_ui_configuration = AsyncMock(side_effect=settle)
+
+        # The picker omits the level, so the successful click must belong to
+        # the confirmed Hydrogen family rather than the previous Neon family.
+        self.assertEqual(await worker.ensure_configuration("hydrogen", "Low"), (True, True))
+        self.assertEqual(worker._current_selected_model, "hydrogen")
+        self.assertEqual(worker._current_selected_thinking_level, "Low")
+
 
 if __name__ == "__main__":
     unittest.main()

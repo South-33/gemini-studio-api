@@ -1196,15 +1196,22 @@ class GeminiWebAutomation:
                 )
                 return False, model_family_changed
 
+        # Bind subsequent thinking selections to the family just confirmed by
+        # the UI, not the previous family. Hydrogen may omit its closed-picker
+        # thinking label even after a successful selection.
+        self._current_selected_model = ui_model
+        self._current_selected_thinking_level = ui_thinking
         target_thinking = thinking_level or "Medium"
         if target_thinking and ui_thinking != target_thinking:
             if not await self._set_thinking_level(target_thinking):
+                self._reset_model_tracking()
                 return False, model_family_changed
             ui_model, ui_thinking = await self._wait_for_ui_configuration(
                 model=model,
                 thinking_level=target_thinking,
             )
             if ui_thinking != target_thinking:
+                self._reset_model_tracking()
                 self._track_error(
                     f"Requested thinking {target_thinking!r} but Gemini UI is {ui_thinking or 'unknown'!r}",
                     "thinking_level",
@@ -1213,6 +1220,7 @@ class GeminiWebAutomation:
                 return False, model_family_changed
 
         if model and (not ui_model or not self._matches_model(ui_model, model)):
+            self._reset_model_tracking()
             return False, model_family_changed
 
         self._current_selected_model = ui_model
