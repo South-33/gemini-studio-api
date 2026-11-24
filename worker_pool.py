@@ -383,9 +383,12 @@ class WorkerPool:
 
     @classmethod
     def _is_profile_browser_command(cls, command: bytes) -> bool:
-        normalized = command.replace(b"\0", b" ")
         profile_arg = f"--user-data-dir={cls._profile_dir()}".encode()
-        return profile_arg in normalized and b" --type=" not in normalized
+        args = command.rstrip(b"\0").split(b"\0")
+        if len(args) > 1:
+            return profile_arg in args and not any(arg.startswith(b"--type=") for arg in args)
+        # Chromium may rewrite argv into a single space-separated string.
+        return b" " + profile_arg + b" " in args[0] + b" " and b" --type=" not in args[0]
 
     @classmethod
     def _profile_browser_pids(cls) -> list[int]:
@@ -397,10 +400,15 @@ class WorkerPool:
             if not entry.name.isdigit():
                 continue
             try:
+                if entry.stat().st_uid != os.getuid():
+                    continue
                 command = (entry / "cmdline").read_bytes()
+                # Chromium rewrites argv on this host. The profile argument
+                # alone cannot distinguish Chrome from a diagnostic command.
+                executable = (entry / "exe").readlink().name
             except OSError:
                 continue
-            if not cls._is_profile_browser_command(command):
+            if executable != "chrome" or not cls._is_profile_browser_command(command):
                 continue
             pids.append(int(entry.name))
         return pids
@@ -443,7 +451,7 @@ class WorkerPool:
         initial = cls._profile_browser_pids()
         for pid in initial:
             scope = cls._scope_for_pid(pid)
-            if scope:
+            if scope == f"app-org.chromium.Chromium-{pid}.scope":
                 cls._stop_user_scope(scope)
                 cleaned += 1
                 continue

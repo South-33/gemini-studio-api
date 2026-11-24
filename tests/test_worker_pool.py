@@ -1,4 +1,6 @@
 import asyncio
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -50,6 +52,20 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(WorkerPool._is_profile_browser_command(rewritten))
         self.assertTrue(WorkerPool._is_profile_browser_command(nul_argv))
         self.assertFalse(WorkerPool._is_profile_browser_command(child))
+        self.assertFalse(WorkerPool._is_profile_browser_command(rewritten.replace(prefix.encode(), (prefix + "-other").encode())))
+        self.assertFalse(WorkerPool._is_profile_browser_command(nul_argv.replace(prefix.encode(), (prefix + "-other").encode())))
+
+    def test_profile_browser_scan_ignores_non_browser_executable(self):
+        # A shell or diagnostic program can mention the profile without owning it.
+        process = subprocess.Popen([
+            sys.executable, "-c", "import time; time.sleep(30)",
+            f"--user-data-dir={WorkerPool._profile_dir()}",
+        ])
+        try:
+            self.assertNotIn(process.pid, WorkerPool._profile_browser_pids())
+        finally:
+            process.terminate()
+            process.wait(timeout=5)
 
     def test_only_sigtrap_browser_start_is_retryable(self):
         self.assertTrue(
