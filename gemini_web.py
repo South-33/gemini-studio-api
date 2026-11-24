@@ -502,19 +502,7 @@ class GeminiWebAutomation:
                         await asyncio.sleep(UI_POLL_SECONDS)
                         continue
                     copy_button = copy_buttons.first
-                    async with GeminiWebAutomation._get_clipboard_lock():
-                        try:
-                            await self.page.evaluate("navigator.clipboard.writeText('')")
-                        except Exception:
-                            pass
-                        await copy_button.click()
-                        markdown = ""
-                        clipboard_deadline = time.time() + 1.5
-                        while time.time() < clipboard_deadline:
-                            markdown = await self.page.evaluate("navigator.clipboard.readText()")
-                            if markdown and markdown.strip():
-                                break
-                            await asyncio.sleep(CLIPBOARD_POLL_SECONDS)
+                    markdown = await self._copy_response_markdown(copy_button, timeout_seconds=1.5)
                     self._generation_in_progress = False
                     if markdown and markdown.strip():
                         log(
@@ -527,6 +515,9 @@ class GeminiWebAutomation:
                             "raw_response": markdown,
                             "native_retry": True,
                         }
+                    # A completed retry with failed clipboard extraction is
+                    # not another generation to wait for. Let the pool recover.
+                    return None
                 except Exception as exc:
                     self._generation_in_progress = False
                     log(f"[{self._request_id}] Native Gemini retry extraction failed: {exc}", f"Worker {self.worker_id}")
@@ -1477,6 +1468,22 @@ class GeminiWebAutomation:
 
         return snapshot
 
+    async def _copy_response_markdown(self, copy_button, timeout_seconds: float = 1.0) -> str:
+        """Accept clipboard content only after a successful clear and Copy action."""
+        async with GeminiWebAutomation._get_clipboard_lock():
+            try:
+                await self.page.evaluate("navigator.clipboard.writeText('')")
+                await copy_button.click()
+                deadline = time.monotonic() + timeout_seconds
+                while time.monotonic() < deadline:
+                    markdown = await self.page.evaluate("navigator.clipboard.readText()")
+                    if markdown and markdown.strip():
+                        return markdown
+                    await asyncio.sleep(CLIPBOARD_POLL_SECONDS)
+            except Exception as exc:
+                log(f"Clipboard copy failed: {type(exc).__name__}", f"Worker {self.worker_id}")
+        return ""
+
     async def _extract_latest_via_copy(self, copy_selector: str, pre_send_count: int) -> Optional[str]:
         """Try extracting response markdown via latest copy button."""
         try:
@@ -1489,10 +1496,7 @@ class GeminiWebAutomation:
             if not await copy_btn.is_visible():
                 return None
 
-            async with GeminiWebAutomation._get_clipboard_lock():
-                await copy_btn.click()
-                await self._human_delay(100, 200)
-                markdown = await self.page.evaluate("navigator.clipboard.readText()")
+            markdown = await self._copy_response_markdown(copy_btn)
 
             if markdown and markdown.strip():
                 return markdown.strip()
@@ -2541,23 +2545,7 @@ class GeminiWebAutomation:
                 return {"success": False, "error": f"Timeout after {max_wait}s waiting for response"}
 
             # 6. Extraction via Copy Button (with lock to prevent clipboard race condition)
-            async with GeminiWebAutomation._get_clipboard_lock():
-                clipboard_cleared = False
-                try:
-                    await self.page.evaluate("navigator.clipboard.writeText('')")
-                    clipboard_cleared = True
-                except Exception:
-                    pass
-                await copy_btn.click()
-                if not clipboard_cleared:
-                    await asyncio.sleep(SEND_VERIFY_POLL_SECONDS)
-                markdown = ""
-                clipboard_deadline = time.time() + 1.0
-                while time.time() < clipboard_deadline:
-                    markdown = await self.page.evaluate("navigator.clipboard.readText()")
-                    if markdown and markdown.strip():
-                        break
-                    await asyncio.sleep(CLIPBOARD_POLL_SECONDS)
+            markdown = await self._copy_response_markdown(copy_btn)
             
             self._generation_in_progress = False
             
