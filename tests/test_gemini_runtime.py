@@ -1,7 +1,9 @@
 import asyncio
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 from gemini_web import GeminiWebAutomation
 
@@ -80,6 +82,17 @@ class ClipboardTests(unittest.IsolatedAsyncioTestCase):
         worker.page = SimpleNamespace(locator=Mock(return_value=buttons), evaluate=AsyncMock(side_effect=evaluate))
         self.assertIsNone(await worker._extract_latest_via_copy("button", 0))
         button.click.assert_not_awaited()
+
+
+class PromptAttachmentTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cancelled_upload_removes_unclaimed_prompt_file(self):
+        worker = GeminiWebAutomation()
+        worker._upload_file_attachment = AsyncMock(side_effect=asyncio.CancelledError)
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("gemini_web.tempfile.gettempdir", return_value=directory):
+                with self.assertRaises(asyncio.CancelledError):
+                    await worker._prepare_and_enter_prompt(None, "x" * 2000)
+            self.assertEqual(list(Path(directory).rglob("*.txt")), [])
 
 
 if __name__ == "__main__":

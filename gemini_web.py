@@ -2954,18 +2954,18 @@ class GeminiWebAutomation:
 
         if should_file_upload:
             temp_file_path = None
+            handed_off = False
             try:
                 log(
                     f"Prompt length ({len(prompt_str)} chars) >= threshold ({PROMPT_FILE_UPLOAD_THRESHOLD}). "
                     f"Converting prompt to text file in clipboard/attachment to prevent UI freeze...",
                     f"Worker {self.worker_id}"
                 )
-                temp_dir = os.path.join(tempfile.gettempdir(), "gemini_prompt_files")
-                os.makedirs(temp_dir, exist_ok=True)
-                temp_file_path = os.path.join(
-                    temp_dir, f"prompt_{self.worker_id}_{int(time.time()*1000)}.txt"
-                )
-                with open(temp_file_path, "w", encoding="utf-8") as f:
+                with tempfile.NamedTemporaryFile(
+                    mode="w", encoding="utf-8", prefix="gemini_prompt_",
+                    suffix=".txt", delete=False,
+                ) as f:
+                    temp_file_path = f.name
                     f.write(prompt_str)
 
                 file_paths = [temp_file_path]
@@ -2989,23 +2989,18 @@ class GeminiWebAutomation:
                         except Exception:
                             pass
                     await self._human_delay(200, 400)
+                    handed_off = True
                     return short_input_text, temp_file_path
                 else:
                     log("File upload failed, falling back to direct text fill...", f"Worker {self.worker_id}")
-                    if os.path.exists(temp_file_path):
-                        try:
-                            os.remove(temp_file_path)
-                        except Exception:
-                            pass
-                    temp_file_path = None
             except Exception as e:
                 log(f"Prompt file attachment failed ({e}), falling back to direct text fill...", f"Worker {self.worker_id}")
-                if temp_file_path and os.path.exists(temp_file_path):
+            finally:
+                if temp_file_path and not handed_off:
                     try:
                         os.remove(temp_file_path)
-                    except Exception:
+                    except OSError:
                         pass
-                temp_file_path = None
 
         # Direct editor path for short prompts or attachment fallback.
         if images:
