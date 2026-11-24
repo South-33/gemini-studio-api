@@ -68,6 +68,21 @@ class WorkerPool:
     def worker(self) -> Optional[GeminiWebAutomation]:
         return self.workers[0] if self.workers else None
 
+    @staticmethod
+    async def _run_browser_thread(operation, *args):
+        """Finish filesystem/process mutations before cancellation releases the lock."""
+        task = asyncio.create_task(asyncio.to_thread(operation, *args))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # Cancelling to_thread does not stop its underlying thread. A stale
+            # profile cleanup must not overlap the next request's browser launch.
+            try:
+                await task
+            except Exception as exc:
+                log(f"Cancelled browser operation warning: {exc}", "Worker")
+            raise
+
     async def init(self, cleanup_stale_browser: bool = False) -> bool:
         """Initialize the pool without starting Chrome.
 
@@ -75,7 +90,7 @@ class WorkerPool:
         when a request arrives keeps the resident service small.
         """
         if cleanup_stale_browser:
-            await asyncio.to_thread(self._cleanup_stale_browser_processes)
+            await self._run_browser_thread(self._cleanup_stale_browser_processes)
         self._initialized = True
         self._last_activity = time.time()
         self._idle_task = asyncio.create_task(self._idle_watchdog())
@@ -593,7 +608,7 @@ class WorkerPool:
         if self.playwright is None:
             raise RuntimeError("Playwright is not initialized")
 
-        await asyncio.to_thread(self._cleanup_stale_browser_processes)
+        await self._run_browser_thread(self._cleanup_stale_browser_processes)
         profile_dir = self._prepare_profile_dir()
         self.browser_profile_dir = profile_dir
         active_port = profile_dir / "DevToolsActivePort"
@@ -667,8 +682,8 @@ class WorkerPool:
             if scope and scope.startswith("app-org.chromium.Chromium-"):
                 break
             await asyncio.sleep(0.1)
-        await asyncio.to_thread(self._configure_browser_scope)
-        await asyncio.to_thread(self._resize_browser_window_for_rdp, browser_environment)
+        await self._run_browser_thread(self._configure_browser_scope)
+        await self._run_browser_thread(self._resize_browser_window_for_rdp, browser_environment)
         if not self.browser.contexts:
             raise RuntimeError("Chromium exposed no persistent browser context")
         self.context = self.browser.contexts[0]
@@ -881,7 +896,7 @@ class WorkerPool:
         self.context = None
         self._needs_ready_reset = False
         if self.browser_process or self.virtual_display_process:
-            await asyncio.to_thread(self._stop_browser_process)
+            await self._run_browser_thread(self._stop_browser_process)
         if release_playwright and self.playwright:
             try:
                 await self.playwright.stop()
@@ -1133,6 +1148,8 @@ class WorkerPool:
             async with self._request_guard(request_id):
                 self._queued_requests -= 1
                 waiting = False
+                if not self._initialized:
+                    return {"success": False, "error": "Gemini worker pool is not ready"}
                 wait_ms = int((time.time() - queued_at) * 1000)
                 timing["queue_wait_ms"] = wait_ms
                 if wait_ms >= 250:
@@ -1478,19 +1495,22 @@ class WorkerPool:
 
     async def close(self) -> None:
         self._initialized = False
-        if self._idle_task:
-            self._idle_task.cancel()
-            try:
-                await self._idle_task
-            except asyncio.CancelledError:
-                pass
-            finally:
-                self._idle_task = None
-        await self._close_browser_context("stopped", "pool shutdown")
-        if self.playwright:
-            try:
-                await self.playwright.stop()
-            except Exception as exc:
-                log(f"Playwright close warning: {exc}", "Worker")
-            finally:
-                self.playwright = None
+        # An idle teardown (or cancelled request) can already own the runtime.
+        # Let it finish rather than interrupting it halfway through cleanup.
+        async with self._request_lock:
+            if self._idle_task:
+                self._idle_task.cancel()
+                try:
+                    await self._idle_task
+                except asyncio.CancelledError:
+                    pass
+                finally:
+                    self._idle_task = None
+            await self._close_browser_context("stopped", "pool shutdown")
+            if self.playwright:
+                try:
+                    await self.playwright.stop()
+                except Exception as exc:
+                    log(f"Playwright close warning: {exc}", "Worker")
+                finally:
+                    self.playwright = None
