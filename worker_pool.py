@@ -92,7 +92,12 @@ class WorkerPool:
             "--disable-background-timer-throttling",
             "--disable-backgrounding-occluded-windows",
             "--disable-renderer-backgrounding",
-            "--disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling,BatterySaverModeAvailability",
+            # Chrome 159's D-Bus Secret Portal provider blocks the first
+            # encrypted-cookie load for ~25s on this GNOME/systemd session.
+            # This pinned profile uses the compatible Freedesktop provider;
+            # revalidate before Chromium upgrades because portal encryption can
+            # make this feature unsafe to disable once enabled upstream.
+            "--disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling,BatterySaverModeAvailability,DbusSecretPortal",
         ]
 
     @staticmethod

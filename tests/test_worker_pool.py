@@ -96,6 +96,8 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
         args = WorkerPool._browser_args()
         self.assertIn("--ozone-platform=x11", args)
         self.assertIn("--disable-gpu", args)
+        disabled = next(arg for arg in args if arg.startswith("--disable-features="))
+        self.assertIn("DbusSecretPortal", disabled.split("=", 1)[1].split(","))
         self.assertIn("--window-size=1440,900", args)
         self.assertNotIn("--start-maximized", args)
         self.assertNotIn("--disable-crashpad-for-testing", args)
