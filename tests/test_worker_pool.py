@@ -493,6 +493,52 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
         ])
         await pool.close()
 
+    async def test_native_retry_shares_generation_budget(self):
+        pool = WorkerPool(idle_browser_seconds=0)
+        await pool.init()
+        worker = FakeWorker([{"success": True, "response": TRANSIENT}])
+        retry_started = asyncio.Event()
+
+        async def native_retry():
+            retry_started.set()
+            await asyncio.Future()
+
+        worker.retry_last_response_native = native_retry
+        pool.workers = [worker]
+        pool._ensure_browser_ready = AsyncMock(return_value=True)
+        pool._prepare_request_configuration = AsyncMock(return_value=(True, None))
+        with patch("worker_pool.REQUEST_TOTAL_BUDGET_SECONDS", 0.05):
+            result = await asyncio.wait_for(pool.send_message("review", request_id="native-timeout"), timeout=1)
+        self.assertTrue(retry_started.is_set())
+        self.assertFalse(result["success"])
+        self.assertIn("budget exhausted", result["error"])
+        self.assertIsNone(pool.worker)
+        self.assertFalse(pool._active_request)
+        await pool.close()
+
+    async def test_tab_retry_recovery_shares_generation_budget(self):
+        pool = WorkerPool(idle_browser_seconds=0)
+        await pool.init()
+        worker = FakeWorker([{"success": False, "error": "Stalled generation: no output"}])
+        recovery_started = asyncio.Event()
+
+        async def recreate(*args, **kwargs):
+            recovery_started.set()
+            await asyncio.Future()
+
+        pool.workers = [worker]
+        pool._ensure_browser_ready = AsyncMock(return_value=True)
+        pool._prepare_request_configuration = AsyncMock(return_value=(True, None))
+        pool._recreate_worker = recreate
+        with patch("worker_pool.REQUEST_TOTAL_BUDGET_SECONDS", 0.05):
+            result = await asyncio.wait_for(pool.send_message("review", request_id="recovery-timeout"), timeout=1)
+        self.assertTrue(recovery_started.is_set())
+        self.assertFalse(result["success"])
+        self.assertIn("budget exhausted", result["error"])
+        self.assertIsNone(pool.worker)
+        self.assertFalse(pool._active_request)
+        await pool.close()
+
     async def test_requests_are_serialized(self):
         pool = WorkerPool()
         await pool.init()

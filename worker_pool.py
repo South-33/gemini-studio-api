@@ -1226,124 +1226,119 @@ class WorkerPool:
                 last_error = "unknown"
                 native_retry_used = False
                 max_attempts = 3
-                request_deadline = time.monotonic() + REQUEST_TOTAL_BUDGET_SECONDS
                 execution_started = time.monotonic()
+                # All generation attempts and in-place or fresh-tab recovery
+                # share one budget. Retire the browser if it expires mid-operation.
+                budget = asyncio.timeout(REQUEST_TOTAL_BUDGET_SECONDS)
+                try:
+                    async with budget:
+                        for attempt in range(1, max_attempts + 1):
+                            worker = self.worker
+                            if not worker:
+                                last_error = "Gemini worker disappeared"
+                                break
 
-                for attempt in range(1, max_attempts + 1):
-                    remaining = request_deadline - time.monotonic()
-                    if remaining <= 0:
-                        last_error = (
-                            f"Gemini request budget exhausted after "
-                            f"{REQUEST_TOTAL_BUDGET_SECONDS}s"
-                        )
-                        break
-
-                    worker = self.worker
-                    if not worker:
-                        last_error = "Gemini worker disappeared"
-                        break
-
-                    try:
-                        result = await asyncio.wait_for(
-                            worker.send_message(
-                                prompt,
-                                model,
-                                thinking_level,
-                                use_search,
-                                images,
-                                request_id=request_id,
-                            ),
-                            timeout=remaining,
-                        )
-                    except asyncio.TimeoutError:
-                        result = {
-                            "success": False,
-                            "error": (
-                                f"Gemini request budget exhausted after "
-                                f"{REQUEST_TOTAL_BUDGET_SECONDS}s"
-                            ),
-                        }
-                    except Exception as exc:
-                        result = {"success": False, "error": str(exc)}
-
-                    if (
-                        not native_retry_used
-                        and result.get("success")
-                        and self._is_transient_gemini_refusal(
-                            str(result.get("response") or "")
-                        )
-                    ):
-                        native_retry_used = True
-                        native_retry = getattr(worker, "retry_last_response_native", None)
-                        if callable(native_retry):
                             try:
-                                retried = await native_retry()
+                                result = await worker.send_message(
+                                    prompt,
+                                    model,
+                                    thinking_level,
+                                    use_search,
+                                    images,
+                                    request_id=request_id,
+                                )
                             except Exception as exc:
+                                result = {"success": False, "error": str(exc)}
+
+                            if (
+                                not native_retry_used
+                                and result.get("success")
+                                and self._is_transient_gemini_refusal(
+                                    str(result.get("response") or "")
+                                )
+                            ):
+                                native_retry_used = True
+                                native_retry = getattr(worker, "retry_last_response_native", None)
+                                if callable(native_retry):
+                                    try:
+                                        retried = await native_retry()
+                                    except Exception as exc:
+                                        log(
+                                            f"[{request_id}] Native retry failed "
+                                            f"({type(exc).__name__}); using fresh-tab recovery",
+                                            "Worker",
+                                        )
+                                    else:
+                                        if retried is not None:
+                                            result = retried
+
+                            response = str(result.get("response") or "")
+                            web_execution = result.get("web_execution_ms")
+                            if isinstance(web_execution, dict):
+                                timing["web_execution_ms"] = dict(web_execution)
+                            retryable = self._is_retryable_response_rejection(result)
+                            if result.get("success") and response.strip():
+                                if not self._is_transient_gemini_refusal(response):
+                                    result["queue_wait_ms"] = wait_ms
+                                    result["attempts"] = attempt
+                                    result["effective_thinking_level"] = thinking_level
+                                    self._needs_ready_reset = True
+                                    result["ready_for_next_request"] = False
+                                    return result
+                                last_error = "Gemini returned its generic transient refusal"
+                            else:
+                                last_error = str(result.get("error") or "Empty response")
+
+                            if attempt < max_attempts and retryable:
+                                reason = (
+                                    "transient_refusal"
+                                    if self._is_transient_gemini_refusal(response)
+                                    else "transient_generation_failure"
+                                )
+                                try:
+                                    await worker._save_diagnostic_artifacts(
+                                        reason, request_id=request_id
+                                    )
+                                except Exception as exc:
+                                    log(
+                                        f"[{request_id}] Diagnostics failed "
+                                        f"({type(exc).__name__}); continuing recovery",
+                                        "Worker",
+                                    )
+
                                 log(
-                                    f"[{request_id}] Native retry failed "
-                                    f"({type(exc).__name__}); using fresh-tab recovery",
+                                    f"[{request_id}] Transient Gemini failure; "
+                                    f"recreating tab before retry {attempt + 1}/{max_attempts}",
                                     "Worker",
                                 )
-                            else:
-                                if retried is not None:
-                                    result = retried
+                                ready = await self._recreate_worker(
+                                    f"retry {attempt + 1}/{max_attempts} for request {request_id}",
+                                    close_old_before_init=True,
+                                )
+                                if ready:
+                                    configured, error = await self._prepare_request_configuration(
+                                        model, thinking_level, request_id
+                                    )
+                                    if configured:
+                                        continue
+                                    last_error = f"Gemini request failed: {error}"
 
-                    response = str(result.get("response") or "")
-                    web_execution = result.get("web_execution_ms")
-                    if isinstance(web_execution, dict):
-                        timing["web_execution_ms"] = dict(web_execution)
-                    retryable = self._is_retryable_response_rejection(result)
-                    if result.get("success") and response.strip():
-                        if not self._is_transient_gemini_refusal(response):
-                            result["queue_wait_ms"] = wait_ms
-                            result["attempts"] = attempt
-                            result["effective_thinking_level"] = thinking_level
-                            self._needs_ready_reset = True
-                            result["ready_for_next_request"] = False
-                            return result
-                        last_error = "Gemini returned its generic transient refusal"
-                    else:
-                        last_error = str(result.get("error") or "Empty response")
-
-                    if attempt < max_attempts and retryable:
-                        reason = (
-                            "transient_refusal"
-                            if self._is_transient_gemini_refusal(response)
-                            else "transient_generation_failure"
-                        )
-                        try:
-                            await worker._save_diagnostic_artifacts(
-                                reason, request_id=request_id
+                            recovered = await self._ensure_ready_after_request(
+                                f"request {request_id} failed"
                             )
-                        except Exception as exc:
-                            log(
-                                f"[{request_id}] Diagnostics failed "
-                                f"({type(exc).__name__}); continuing recovery",
-                                "Worker",
-                            )
+                            self._needs_ready_reset = not recovered
+                            break
 
-                        log(
-                            f"[{request_id}] Transient Gemini failure; "
-                            f"recreating tab before retry {attempt + 1}/{max_attempts}",
-                            "Worker",
-                        )
-                        ready = await self._recreate_worker(
-                            f"retry {attempt + 1}/{max_attempts} for request {request_id}",
-                            close_old_before_init=True,
-                        )
-                        if ready:
-                            configured, error = await self._prepare_request_configuration(
-                                model, thinking_level, request_id
-                            )
-                            if configured:
-                                continue
-                            last_error = f"Gemini request failed: {error}"
-
-                    recovered = await self._ensure_ready_after_request(
-                        f"request {request_id} failed"
+                except TimeoutError:
+                    if not budget.expired():
+                        raise
+                    last_error = (
+                        f"Gemini request budget exhausted after "
+                        f"{REQUEST_TOTAL_BUDGET_SECONDS}s"
                     )
-                    self._needs_ready_reset = not recovered
-                    break
+                    await self._close_browser_context(
+                        "stopped", f"request {request_id} budget exhausted"
+                    )
 
                 log(f"[{request_id}] Request failed: {last_error}", "Worker")
                 return {
