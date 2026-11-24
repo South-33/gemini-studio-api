@@ -2,6 +2,7 @@ import asyncio
 import concurrent.futures
 import json
 import unittest
+from unittest.mock import AsyncMock, patch
 
 import main
 
@@ -181,6 +182,47 @@ class ApiContractTests(unittest.IsolatedAsyncioTestCase):
             if job.get("status") == "ok":
                 break
         self.assertEqual(job["status"], "ok")
+
+    async def test_shutdown_cancels_async_jobs_before_closing_backends(self):
+        started = asyncio.Event()
+        cleaned = asyncio.Event()
+        lock = asyncio.Lock()
+        calls = []
+
+        async def send_message(prompt, **kwargs):
+            async with lock:
+                calls.append(prompt)
+                started.set()
+                try:
+                    await asyncio.Future()
+                finally:
+                    await asyncio.sleep(0)
+                    cleaned.set()
+
+        async def close():
+            self.assertTrue(cleaned.is_set())
+            self.assertEqual(calls, ["first"])
+            self.assertTrue(all(job.get("finished_at") for job in main.async_jobs.values()))
+
+        self.gemini.init = AsyncMock()
+        self.gemini.send_message = send_message
+        self.gemini.close = close
+        self.agy.close = lambda: None
+        with patch.object(main, "WorkerPool", return_value=self.gemini), patch.object(
+            main, "AgyPool", return_value=self.agy
+        ):
+            async with main.lifespan(main.app):
+                for prompt in ("first", "second"):
+                    await main.chat_completions(FakeRequest({
+                        "async": True,
+                        "request_id": prompt,
+                        "messages": [{"role": "user", "content": prompt}],
+                    }))
+                    if prompt == "first":
+                        await started.wait()
+
+        for job in main.async_jobs.values():
+            self.assertEqual(job["status"], "failed")
 
     async def test_gemini_accepts_hydrogen_high(self):
         await main.chat_completions(

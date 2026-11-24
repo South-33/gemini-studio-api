@@ -77,6 +77,18 @@ async def lifespan(_: Starlette):
     try:
         yield
     finally:
+        # Cancel all queued and active jobs before closing their backends.
+        # Cancel backend tasks, not finalizers: even a job that has not started
+        # yet must run its finalizer to release temporary attachments.
+        jobs = list(async_jobs.values())
+        for job in jobs:
+            task = job.get("_task")
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(
+            *(job["_finalizer"] for job in jobs if "_finalizer" in job),
+            return_exceptions=True,
+        )
         if agy_pool:
             agy_pool.close()
         if worker_pool:
@@ -459,6 +471,10 @@ async def finish_async_job(
         task.cancel()
         with suppress(asyncio.CancelledError):
             await task
+        job["status"] = "failed"
+        job["error"] = "Request cancelled"
+        trace["status"] = "cancelled"
+        trace["error"] = job["error"]
         raise
     except Exception as exc:
         job["status"] = "error"
@@ -467,6 +483,7 @@ async def finish_async_job(
         trace["error"] = str(exc)
     finally:
         cleanup_files(image_paths)
+        job.pop("_task", None)
         finished = datetime.now(timezone.utc).isoformat()
         job["finished_at"] = finished
         job["finished_unix"] = time.time()
@@ -649,6 +666,7 @@ async def chat_completions(request: Request):
             "backend": backend,
             "status": "started",
             "started_at": trace["started_at"],
+            "_task": task,
         }
         async_jobs[request_id] = job
         job["_finalizer"] = asyncio.create_task(
