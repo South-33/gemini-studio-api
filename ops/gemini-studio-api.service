@@ -7,7 +7,7 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 WorkingDirectory=%h/Gemini Studio API
-ExecStart="%h/Gemini Studio API/.venv/bin/python" -m uvicorn main:app --host 127.0.0.1 --port 8000 --no-access-log
+ExecStart="%h/Gemini Studio API/.venv/bin/python" -m uvicorn main:app --host 127.0.0.1 --port 8000 --no-access-log --timeout-graceful-shutdown 15
 Environment=PYTHONUNBUFFERED=1
 Environment=GEMINI_IDLE_SECONDS=60
 Restart=always

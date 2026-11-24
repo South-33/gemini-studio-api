@@ -1825,6 +1825,7 @@ class GeminiWebAutomation:
             }
 
         self._last_request_success = False
+        request_cancelled = False
         # The finally block always cleans up an attachment path, including
         # failures during Chat reset or model selection.
         temp_prompt_file = None
@@ -2549,6 +2550,9 @@ class GeminiWebAutomation:
             self._last_request_success = True
             return success_payload(markdown.strip(), markdown)
 
+        except asyncio.CancelledError:
+            request_cancelled = True
+            raise
         except Exception as e:
             self._generation_in_progress = False
             log(f"Error: {e}", f"Worker {self.worker_id}")
@@ -2578,7 +2582,7 @@ class GeminiWebAutomation:
                     os.remove(temp_prompt_file)
                 except Exception:
                     pass
-            if not self._last_request_success:
+            if not self._last_request_success and not request_cancelled:
                 try:
                     await self._save_diagnostic_artifacts("failed")
                 except:

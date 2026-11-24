@@ -8,6 +8,7 @@ import shutil
 import signal
 import subprocess
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -150,6 +151,46 @@ class WorkerPool:
             return False
         return result.returncode == 0
 
+    @staticmethod
+    def _remove_stale_x11_artifacts(lock_path: Path, socket_path: Path) -> bool:
+        """Remove this user's dead private-Xvfb artifacts, never a live display."""
+        existing = [path for path in (lock_path, socket_path) if path.exists()]
+        if not existing:
+            return True
+
+        uid = os.getuid() if hasattr(os, "getuid") else None
+        if uid is None:
+            return False
+        try:
+            if any(path.lstat().st_uid != uid for path in existing):
+                return False
+        except OSError:
+            return False
+
+        if lock_path.exists():
+            try:
+                lock_pid = int(lock_path.read_text(encoding="utf-8").strip())
+            except (OSError, ValueError):
+                lock_pid = None
+            if lock_pid and lock_pid > 0:
+                try:
+                    os.kill(lock_pid, 0)
+                except ProcessLookupError:
+                    pass
+                except (PermissionError, OSError):
+                    return False
+                else:
+                    return False
+
+        for path in (lock_path, socket_path):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                return False
+        return not lock_path.exists() and not socket_path.exists()
+
     def _start_virtual_display(self, environment: dict[str, str]) -> dict[str, str]:
         """Start a private Xvfb only when no live desktop X11 display exists."""
         xvfb = shutil.which("Xvfb")
@@ -159,12 +200,16 @@ class WorkerPool:
         for number in range(99, 89, -1):
             socket_path = Path("/tmp/.X11-unix") / f"X{number}"
             lock_path = Path(f"/tmp/.X{number}-lock")
-            if socket_path.exists() or lock_path.exists():
-                continue
             display = f":{number}"
             candidate = dict(environment)
             candidate["DISPLAY"] = display
             candidate.pop("XAUTHORITY", None)
+            if socket_path.exists() or lock_path.exists():
+                if self._display_is_usable(candidate):
+                    continue
+                if not self._remove_stale_x11_artifacts(lock_path, socket_path):
+                    continue
+                log(f"Removed stale private Xvfb artifacts for {display}", "Worker")
             process = subprocess.Popen(
                 [
                     xvfb,
@@ -931,7 +976,9 @@ class WorkerPool:
             pass
         return None
 
-    async def _recreate_worker(self, reason: str) -> bool:
+    async def _recreate_worker(
+        self, reason: str, *, close_old_first: bool = False
+    ) -> bool:
         """Replace a failed tab once; never refresh a healthy idle tab."""
         async with self._recovery_lock:
             success = False
@@ -939,6 +986,14 @@ class WorkerPool:
                 if not self.context:
                     raise RuntimeError("browser context is unavailable")
                 old_worker = self.worker
+                if close_old_first and old_worker:
+                    try:
+                        await old_worker.close()
+                    except Exception as exc:
+                        log(f"Failed-worker close warning: {exc}", "Worker")
+                    finally:
+                        self.workers.clear()
+                        old_worker = None
                 new_page = await self.context.new_page()
                 new_worker = await self._initialize_page(new_page)
                 success = new_worker is not None
@@ -1007,6 +1062,22 @@ class WorkerPool:
             return False, "Requested Gemini configuration did not persist across tab recreation"
         return True, None
 
+    @asynccontextmanager
+    async def _request_guard(self, request_id: str | None):
+        """Serialize requests and finish cancellation teardown before handoff."""
+        async with self._request_lock:
+            try:
+                yield
+            except asyncio.CancelledError:
+                log(f"[{request_id}] Request cancelled; closing browser runtime", "Worker")
+                try:
+                    await self._close_browser_context(
+                        "stopped", f"request cancelled {request_id}"
+                    )
+                except Exception as exc:
+                    log(f"Cancelled-request cleanup warning: {exc}", "Worker")
+                raise
+
     @staticmethod
     def _is_transient_gemini_refusal(response: str) -> bool:
         normalized = " ".join((response or "").strip().lower().split())
@@ -1055,7 +1126,7 @@ class WorkerPool:
         self._queued_requests += 1
         waiting = True
         try:
-            async with self._request_lock:
+            async with self._request_guard(request_id):
                 self._queued_requests -= 1
                 waiting = False
                 wait_ms = int((time.time() - queued_at) * 1000)
@@ -1231,7 +1302,8 @@ class WorkerPool:
                             "Worker",
                         )
                         ready = await self._recreate_worker(
-                            f"retry {attempt + 1}/{max_attempts} for request {request_id}"
+                            f"retry {attempt + 1}/{max_attempts} for request {request_id}",
+                            close_old_first=True,
                         )
                         if ready:
                             configured, error = await self._prepare_request_configuration(
@@ -1322,7 +1394,11 @@ class WorkerPool:
 
     def get_diagnostics(self) -> Dict[str, Any]:
         worker = self.worker
-        idle_for = max(0, int(time.time() - self._last_activity))
+        idle_for = (
+            0
+            if self._active_request or self._queued_requests
+            else max(0, int(time.time() - self._last_activity))
+        )
         browser_pid = self.browser_process.pid if self.browser_process else None
         return {
             "initialized": self._initialized,

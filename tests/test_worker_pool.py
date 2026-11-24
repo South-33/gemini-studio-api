@@ -147,6 +147,37 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(pool.browser_uses_virtual_display)
         start_virtual.assert_not_called()
 
+
+    def test_stale_private_xvfb_artifacts_are_removed_when_owned(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            lock_path = root / ".X99-lock"
+            socket_path = root / "X99"
+            lock_path.write_text("999999", encoding="utf-8")
+            socket_path.write_text("stale", encoding="utf-8")
+
+            with patch("worker_pool.os.kill", side_effect=ProcessLookupError):
+                self.assertTrue(
+                    WorkerPool._remove_stale_x11_artifacts(lock_path, socket_path)
+                )
+            self.assertFalse(lock_path.exists())
+            self.assertFalse(socket_path.exists())
+
+    def test_live_private_xvfb_artifacts_are_preserved(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            lock_path = root / ".X99-lock"
+            socket_path = root / "X99"
+            lock_path.write_text("12345", encoding="utf-8")
+            socket_path.write_text("live", encoding="utf-8")
+
+            with patch("worker_pool.os.kill", return_value=None):
+                self.assertFalse(
+                    WorkerPool._remove_stale_x11_artifacts(lock_path, socket_path)
+                )
+            self.assertTrue(lock_path.exists())
+            self.assertTrue(socket_path.exists())
+
     def test_missing_display_starts_private_xvfb(self):
         pool = WorkerPool()
         process = SimpleNamespace(pid=4321, poll=lambda: None)
@@ -275,6 +306,101 @@ class WorkerPoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(pool.context)
         self.assertEqual(pool._browser_state, "stopped")
         await pool.close()
+
+
+    async def test_cancelled_request_cleans_browser_before_queued_handoff(self):
+        pool = WorkerPool(idle_browser_seconds=0)
+        await pool.init()
+        first_entered = asyncio.Event()
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+        second_started = asyncio.Event()
+        calls = 0
+
+        async def wait_for_browser(_reason):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                first_entered.set()
+                await asyncio.Future()
+            second_started.set()
+            return False
+
+        async def close_browser(_state, _reason):
+            cleanup_started.set()
+            await release_cleanup.wait()
+
+        pool._ensure_browser_ready = wait_for_browser
+        pool._close_browser_context = close_browser
+
+        first = asyncio.create_task(
+            pool.send_message(
+                "first", model="neon", thinking_level="Medium", request_id="first"
+            )
+        )
+        await first_entered.wait()
+        second = asyncio.create_task(
+            pool.send_message(
+                "second", model="neon", thinking_level="Medium", request_id="second"
+            )
+        )
+        await asyncio.sleep(0)
+
+        first.cancel()
+        await cleanup_started.wait()
+        await asyncio.sleep(0.01)
+        self.assertFalse(second_started.is_set())
+
+        release_cleanup.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await first
+        await second
+        self.assertTrue(second_started.is_set())
+        self.assertFalse(pool._active_request)
+        await pool.close()
+
+    async def test_retry_closes_failed_tab_before_creating_replacement(self):
+        pool = WorkerPool()
+        old_worker = FakeWorker([])
+        order = []
+
+        async def close_old():
+            order.append("close_old")
+
+        async def new_page():
+            order.append("new_page")
+            return object()
+
+        old_worker.close = close_old
+        pool.workers = [old_worker]
+        pool.context = SimpleNamespace(new_page=new_page)
+        pool._initialize_page = AsyncMock(return_value=FakeWorker([]))
+
+        self.assertTrue(await pool._recreate_worker("retry", close_old_first=True))
+        self.assertEqual(order[:2], ["close_old", "new_page"])
+
+
+    async def test_retry_continues_when_failed_tab_close_raises(self):
+        pool = WorkerPool()
+        old_worker = FakeWorker([])
+
+        async def close_old():
+            raise RuntimeError("page already gone")
+
+        old_worker.close = close_old
+        pool.workers = [old_worker]
+        pool.context = SimpleNamespace(new_page=AsyncMock(return_value=object()))
+        replacement = FakeWorker([])
+        pool._initialize_page = AsyncMock(return_value=replacement)
+
+        self.assertTrue(await pool._recreate_worker("retry", close_old_first=True))
+        self.assertIs(pool.worker, replacement)
+
+    def test_active_request_reports_zero_idle_seconds(self):
+        pool = WorkerPool()
+        pool._last_activity = time.time() - 3600
+        pool._active_request = True
+        self.assertEqual(pool.get_diagnostics()["idle_for_seconds"], 0)
 
     async def test_retry_keeps_same_model_and_thinking(self):
         pool = WorkerPool()

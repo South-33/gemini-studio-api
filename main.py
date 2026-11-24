@@ -14,7 +14,7 @@ import tempfile
 import time
 import uuid
 from collections import deque
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 from typing import Any
 
@@ -394,6 +394,23 @@ async def run_backend(
     return await asyncio.wrap_future(future)
 
 
+async def wait_for_client_disconnect(request: Request) -> bool:
+    """Wait for ASGI http.disconnect after the JSON body has been consumed."""
+    receive = getattr(request, "receive", None)
+    if not callable(receive):
+        return False
+    while True:
+        try:
+            message = await receive()
+        except Exception:
+            return False
+        message_type = message.get("type")
+        if message_type == "http.disconnect":
+            return True
+        if message_type != "http.request":
+            return False
+
+
 async def finish_async_job(
     *,
     job: dict[str, Any],
@@ -440,6 +457,8 @@ async def finish_async_job(
                 trace["worker_timing_ms"] = dict(worker_timing)
     except asyncio.CancelledError:
         task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
         raise
     except Exception as exc:
         job["status"] = "error"
@@ -646,16 +665,43 @@ async def chat_completions(request: Request):
         )
         return async_job_response(job)
 
+    disconnect_task: asyncio.Task[bool] | None = None
     try:
-        result = await task
+        if backend != "gemini":
+            result = await task
+        else:
+            disconnect_task = asyncio.create_task(wait_for_client_disconnect(request))
+            done, _ = await asyncio.wait(
+                {task, disconnect_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if task in done:
+                result = await task
+            elif disconnect_task.result():
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+                trace["status"] = "cancelled"
+                trace["error"] = "Client disconnected"
+                trace["finished_at"] = datetime.now(timezone.utc).isoformat()
+                trace["duration_ms"] = int((time.time() - started_unix) * 1000)
+                log(f"[{request_id}] Client disconnected; Gemini work cancelled")
+                return JSONResponse({"detail": "Client disconnected"}, status_code=499)
+            else:
+                result = await task
     except asyncio.CancelledError:
         task.cancel()
-        cleanup_files(image_paths)
+        with suppress(asyncio.CancelledError):
+            await task
         trace["status"] = "cancelled"
         trace["finished_at"] = datetime.now(timezone.utc).isoformat()
         trace["duration_ms"] = int((time.time() - started_unix) * 1000)
         raise
     finally:
+        if disconnect_task is not None and not disconnect_task.done():
+            disconnect_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await disconnect_task
         cleanup_files(image_paths)
 
     trace["queue_wait_ms"] = result.get("queue_wait_ms")
