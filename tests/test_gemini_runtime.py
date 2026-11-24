@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -26,6 +27,19 @@ class GeminiRuntimeTests(unittest.TestCase):
 
 
 class ClipboardTests(unittest.IsolatedAsyncioTestCase):
+    async def test_selector_resolution_propagates_request_cancellation(self):
+        worker = GeminiWebAutomation()
+        locator = SimpleNamespace(count=AsyncMock(side_effect=asyncio.CancelledError))
+        worker.page = SimpleNamespace(locator=Mock(return_value=SimpleNamespace(first=locator)))
+        with self.assertRaises(asyncio.CancelledError):
+            await worker._resolve_selector("input")
+
+    async def test_stalled_copy_propagates_request_cancellation(self):
+        worker = GeminiWebAutomation()
+        worker.page = SimpleNamespace(locator=Mock(return_value=SimpleNamespace(count=AsyncMock(side_effect=asyncio.CancelledError))))
+        with self.assertRaises(asyncio.CancelledError):
+            await worker._extract_latest_via_copy("button", 0)
+
     async def test_copy_waits_for_fresh_markdown_and_preserves_raw_text(self):
         worker = GeminiWebAutomation()
         events = []

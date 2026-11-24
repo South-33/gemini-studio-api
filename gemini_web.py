@@ -1036,7 +1036,7 @@ class GeminiWebAutomation:
                         f"[{self._request_id}] Net response status={status} url={url[:140]}",
                         f"Worker {self.worker_id}",
                     )
-            except:
+            except Exception:
                 pass
 
         def on_request_failed(request):
@@ -1066,7 +1066,7 @@ class GeminiWebAutomation:
                         f"[{self._request_id}] Net request failed: {error_text or 'unknown'} url={url[:140]} count={count}",
                         f"Worker {self.worker_id}",
                     )
-            except:
+            except Exception:
                 pass
 
         self.page.on("response", on_response)
@@ -1096,7 +1096,7 @@ class GeminiWebAutomation:
                     if await locator.count() == 0:
                         continue
                 return selector
-            except:
+            except Exception:
                 continue
 
         return ""
@@ -1298,7 +1298,7 @@ class GeminiWebAutomation:
 
         try:
             snapshot["url"] = self.page.url
-        except:
+        except Exception:
             pass
 
         try:
@@ -1451,7 +1451,7 @@ class GeminiWebAutomation:
 
         try:
             snapshot["network_events"] = list(self._recent_network_events)[-8:]
-        except:
+        except Exception:
             pass
 
         try:
@@ -1463,7 +1463,7 @@ class GeminiWebAutomation:
                     "error": issue.get("error"),
                     "count": issue.get("count"),
                 }
-        except:
+        except Exception:
             pass
 
         return snapshot
@@ -1501,7 +1501,7 @@ class GeminiWebAutomation:
             if markdown and markdown.strip():
                 return markdown.strip()
             return None
-        except:
+        except Exception:
             return None
 
     async def _attempt_finalize_stalled_response(
@@ -1517,7 +1517,7 @@ class GeminiWebAutomation:
             if markdown:
                 return markdown
             return None
-        except:
+        except Exception:
             return None
 
     async def _recover_from_google_500_page(self, reason: str) -> bool:
@@ -1630,7 +1630,7 @@ class GeminiWebAutomation:
                 }
                 """
             )
-        except:
+        except Exception:
             pass
 
     def _reconcile_tracked_configuration(
@@ -1899,7 +1899,7 @@ class GeminiWebAutomation:
             # In headed mode, explicitly foreground the active worker page before send.
             try:
                 await self.page.bring_to_front()
-            except:
+            except Exception:
                 pass
             
             # 0. Dismiss any stuck overlays/modals (Angular Material CDK overlays block clicks)
@@ -1910,7 +1910,7 @@ class GeminiWebAutomation:
                 if await backdrop.count() > 0:
                     log("Dismissing stuck overlay", f"Worker {self.worker_id}")
                     await backdrop.first.click(force=True)
-            except:
+            except Exception:
                 pass
             
             # 1. Fresh chat
@@ -1994,7 +1994,7 @@ class GeminiWebAutomation:
             async def get_input_text():
                 try:
                     return await input_area.inner_text()
-                except:
+                except Exception:
                     return ""
             
             async def submit_once() -> bool:
@@ -2034,7 +2034,7 @@ class GeminiWebAutomation:
                                 submitted_at = time.monotonic()
                                 log("Single Send-button click dispatched", f"Worker {self.worker_id}")
                             return True
-                except:
+                except Exception:
                     pass
 
                 return False
@@ -2522,7 +2522,7 @@ class GeminiWebAutomation:
                             for key, value in refreshed_snapshot.items():
                                 if key in ("network_events", "network_outage"):
                                     error_snapshot[key] = value
-                        except:
+                        except Exception:
                             pass
                         self._track_error(stall_reason, "copy_btn", "wait_for_response_stalled", error_snapshot)
                         return {"success": False, "error": stall_reason}
@@ -2572,7 +2572,7 @@ class GeminiWebAutomation:
             log(f"Error: {e}", f"Worker {self.worker_id}")
             try:
                 snapshot = await self._capture_state_snapshot()
-            except:
+            except Exception:
                 snapshot = {}
             if self._is_network_outage_error_text(str(e)):
                 current_url = ""
@@ -2599,7 +2599,7 @@ class GeminiWebAutomation:
             if not self._last_request_success and not request_cancelled:
                 try:
                     await self._save_diagnostic_artifacts("failed")
-                except:
+                except Exception:
                     pass
             self._generation_in_progress = False
             self._request_id = None
@@ -2666,7 +2666,7 @@ class GeminiWebAutomation:
             # Ensure menu is closed
             try:
                 await self.page.keyboard.press("Escape")
-            except:
+            except Exception:
                 pass
             return False
 
@@ -2741,7 +2741,7 @@ class GeminiWebAutomation:
             try:
                 await self.page.keyboard.press("Escape")
                 await self.page.keyboard.press("Escape")
-            except:
+            except Exception:
                 pass
             return False
 
