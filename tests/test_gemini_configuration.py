@@ -1,5 +1,6 @@
 import unittest
-from unittest.mock import AsyncMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
 
 from gemini_web import GeminiWebAutomation
 
@@ -24,6 +25,36 @@ class _Page:
 
 
 class GeminiConfigurationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_completed_chat_prefers_native_reset_without_navigation(self):
+        worker = GeminiWebAutomation()
+        ready = {"input_visible": True, "model_picker_count": 1,
+                 "model_button_text": "Neon"}
+        control = SimpleNamespace(is_visible=AsyncMock(return_value=True), click=AsyncMock())
+        page = SimpleNamespace(url=worker.CHAT_URL, locator=Mock(return_value=SimpleNamespace(first=control)), goto=AsyncMock())
+        worker.page = page
+        worker._capture_state_snapshot = AsyncMock(return_value=ready)
+        self.assertTrue(await worker._ensure_fresh_chat({"response_count": 1, "input_visible": True}))
+        control.click.assert_awaited_once()
+        page.goto.assert_not_awaited()
+        self.assertEqual(worker._current_selected_model, "neon")
+
+    async def test_native_reset_falls_back_to_navigation_if_not_confirmed(self):
+        worker = GeminiWebAutomation()
+        control = SimpleNamespace(is_visible=AsyncMock(return_value=True), click=AsyncMock())
+        worker.page = SimpleNamespace(url=worker.CHAT_URL, locator=Mock(return_value=SimpleNamespace(first=control)), goto=AsyncMock())
+        worker._capture_state_snapshot = AsyncMock(return_value={"input_visible": True})
+        with patch("gemini_web.NEW_CHAT_CONTROL_CONFIRM_SECONDS", 0):
+            self.assertTrue(await worker._ensure_fresh_chat({"response_count": 1, "input_visible": True}))
+        control.click.assert_awaited_once()
+        worker.page.goto.assert_awaited_once()
+
+    def test_fresh_chat_requires_empty_stable_composer(self):
+        ready = {"input_visible": True}
+        self.assertTrue(GeminiWebAutomation._is_fresh_chat_ready(ready))
+        for key in ("input_text_len", "stop_visible", "transition_state"):
+            with self.subTest(key=key):
+                self.assertFalse(GeminiWebAutomation._is_fresh_chat_ready({**ready, key: 1}))
+
     def test_signed_out_composer_is_not_ready(self):
         self.assertFalse(
             GeminiWebAutomation._is_fresh_chat_ready(

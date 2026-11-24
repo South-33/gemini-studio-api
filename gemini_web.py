@@ -1659,7 +1659,10 @@ class GeminiWebAutomation:
         return bool(
             int(snap.get("user_query_count") or 0) == 0
             and int(snap.get("response_count") or 0) == 0
+            and int(snap.get("input_text_len") or 0) == 0
             and snap.get("input_visible")
+            and not snap.get("stop_visible")
+            and not snap.get("transition_state")
             and not snap.get("sign_in_visible")
             and not snap.get("error_page_500")
         )
@@ -1673,6 +1676,29 @@ class GeminiWebAutomation:
         if self._is_fresh_chat_ready(baseline) and self.page.url.rstrip("/").endswith("gemini.google.com/app"):
             self._reconcile_tracked_configuration(baseline)
             return True
+
+        # Preserve the loaded app and its selected configuration after a
+        # completed response. Navigation remains the recovery path when the
+        # native control is unavailable or cannot confirm an empty chat.
+        if (baseline.get("response_count") and not baseline.get("stop_visible")
+                and not baseline.get("error_page_500") and not baseline.get("sign_in_visible")
+                and urlparse(self.page.url).hostname == "gemini.google.com"):
+            try:
+                control = self.page.locator(
+                    'a[aria-label="New chat"]:visible, button[aria-label="New chat"]:visible, '
+                    '[data-test-id="new-chat-button"]:visible'
+                ).first
+                if await control.is_visible():
+                    await control.click(timeout=2000)
+                    deadline = time.monotonic() + NEW_CHAT_CONTROL_CONFIRM_SECONDS
+                    while time.monotonic() < deadline:
+                        snapshot = await self._capture_state_snapshot()
+                        if self._is_fresh_chat_ready(snapshot) and self.page.url.rstrip("/").endswith("gemini.google.com/app"):
+                            self._reconcile_tracked_configuration(snapshot)
+                            return True
+                        await asyncio.sleep(UI_POLL_SECONDS)
+            except Exception as exc:
+                log(f"Native New Chat reset unavailable: {type(exc).__name__}", f"Worker {self.worker_id}")
 
         try:
             await self.page.goto("https://gemini.google.com/app", wait_until="domcontentloaded", timeout=30000)
